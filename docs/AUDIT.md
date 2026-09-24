@@ -82,3 +82,21 @@ No Rust toolchain was present in the environment. Installed rustup stable:
    target GGUF; carried into `ModelDims::qwen25_15b()` with that caveat.
 4. **Layer-27 trace, `result_norm`, completed diagnostic outputs:** UNKNOWN
    in the handoff and remain UNKNOWN; no values were reconstructed.
+
+## 6. Separation addendum (2026-09-24)
+
+After the initial foundation commit, ForgeCore was audited for separation
+from RAMforge and the workspace was normalized:
+
+- The temporary RAMforge reference checkout used during the Phase 1 audit
+  was deleted. No RAMforge working copy remains on disk.
+- The project directory was renamed to the canonical `forgeCore/`.
+- Audit result: ForgeCore has zero Cargo dependencies, no workspace
+  references to RAMforge, no submodules, no symlinks, no build scripts,
+  no test fixtures from RAMforge, and no scripts or commands that assume
+  a RAMforge checkout exists. The only remaining `RAMforge` mentions are
+  historical provenance notes in doc comments (`model.rs`, `quant.rs`),
+  this audit record, the README, and the verbatim `docs/handoff/`
+  package — all documentation-only, none runtime/build.
+- All validation (`fmt`, `test`, `clippy -D warnings`, release build)
+  passes from inside `forgeCore/` with no RAMforge present.

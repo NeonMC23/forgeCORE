@@ -93,8 +93,9 @@ pub struct BlockSpec {
 
 /// Block geometry for a format.
 ///
-/// The K-quant geometries come from the RAMforge source-level format table
-/// (verified in-repo values). The `Q5_0` geometry is recorded from the GGML
+/// The K-quant geometries were cross-checked against the historical RAMforge
+/// source-level format table during the initial audit (documentation
+/// provenance only, not a code dependency). The `Q5_0` geometry is recorded from the GGML
 /// block layout (2-byte scale, 4-byte high bits, 16-byte nibbles) and must
 /// be re-verified against GGML headers when its decoder is implemented.
 pub const fn block_spec(format: QuantFormat) -> BlockSpec {

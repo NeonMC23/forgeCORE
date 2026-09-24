@@ -40,7 +40,8 @@ use crate::shape::{MatrixF32, MatrixShape};
 
 /// Fixed diagnostic prompt recorded for the Qwen2.5 investigation.
 ///
-/// Provenance: RAMforge handoff (`QWEN25_CORRECTNESS_INVESTIGATION.md`).
+/// Historical provenance only (documentation, not a code dependency):
+/// the RAMforge handoff (`QWEN25_CORRECTNESS_INVESTIGATION.md`).
 /// These IDs are valid only for the recorded Qwen2.5 tokenizer; they are
 /// kept here so future real-model validation fixtures can reference them.
 pub const QWEN25_DIAGNOSTIC_PROMPT: &str = "hi, what's 2+2=?";
@@ -131,7 +132,8 @@ impl ModelDims {
 
     /// Recorded Qwen2.5-1.5B skeleton dimensions.
     ///
-    /// Provenance: RAMforge handoff. `vocab_size`, `hidden_size`, and
+    /// Historical provenance only (documentation, not a code dependency):
+    /// the RAMforge handoff. `vocab_size`, `hidden_size`, and
     /// `num_layers` were asserted by the recorded diagnostic; the remaining
     /// values are recorded model configuration that must be re-verified
     /// against the target GGUF's metadata before real-model use.
