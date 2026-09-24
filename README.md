@@ -68,8 +68,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ## Known limitations
 
 - F32 reference path only; no optimized kernels yet (by design).
-- Quantization decoders exist for F16, BF16, Q4_0, Q8_0 only; Q4_K,
-  Q5_K, Q6_K, Q8_K, Q5_0 return explicit unsupported errors.
+- Quantization decoders exist for F16, BF16, Q4_0, Q8_0, Q6_K only;
+  Q4_K, Q5_K, Q8_K, Q5_0 return explicit unsupported errors.
 - No GGUF loading, tokenizer, sampling, or generation loop yet.
 - No comparison against llama.cpp has been performed; no compatibility
   claim is made.

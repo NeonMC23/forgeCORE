@@ -101,7 +101,10 @@ with token id as the tie-break.
   `value = (nibble - 8) * scale`.
 - Q8_0: F16 scale + 32 signed bytes, `value = q * scale`.
 - F16/BF16: 2 bytes per value, bit-exact decode to F32.
-- Formats without a reviewed decoder (Q4_K, Q5_0, Q5_K, Q6_K, Q8_K)
+- Q6_K: 210-byte blocks of 256 values: 128 low-nibble bytes, 64 high-bit
+  bytes, 16 int8 scales, then the F16 super-scale `d`;
+  `value = d * scale * (six_bit_quant - 32)`.
+- Formats without a reviewed decoder (Q4_K, Q5_0, Q5_K, Q8_K)
   return explicit unsupported errors — never approximations.
 - **Q5_0 geometry `(32 values, 22 bytes)` is recorded from the GGML
   block layout and must be re-verified against GGML headers when its
