@@ -1,10 +1,47 @@
 # Licensing and attribution
 
-## Upstream: llama.cpp / ggml
+Three separate things live under (or next to) this repository, with
+three separate statuses:
 
-ForgeCore dynamically links a pinned upstream build (tag `v0.5.0`,
-commit `7fe450e19305b828c199d602c23a8337aaa1f03b`, repo
-`https://github.com/ggml-org/llama.cpp`). Upstream is MIT-licensed:
+1. **ForgeCore's own source code and documentation** — license
+   **undecided** (see below).
+2. **Upstream llama.cpp / ggml libraries** — MIT-licensed;
+   dynamically linked, never vendored (see below).
+3. **Test GGUF fixture** — no `.gguf` binary is committed in this
+   repository; only the generator script, which is ForgeCore's own
+   code (see below).
+
+## 1. This repository (ForgeCore) — license undecided
+
+No license has been chosen for ForgeCore: there is no `LICENSE` file
+at the repository root and no `license` field in any `Cargo.toml`
+manifest. Nothing in this repository grants any permission to copy,
+modify, or redistribute its contents.
+
+This covers all Rust sources (including the `reference/` validation
+oracles and the hand-written `forge-sys` declarations), all
+documentation, all scripts, and the GGUF generator script
+(`scripts/make-tiny-gguf.py`). Provenance comments in
+`reference/quant.rs` cite the upstream files the decoders were
+validated against; that code is original Rust written in this
+repository and contains no copied upstream source text.
+
+## 2. Upstream llama.cpp / ggml — MIT, dynamically linked, not vendored
+
+ForgeCore dynamically links a pinned upstream build:
+
+- repo: `https://github.com/ggml-org/llama.cpp`
+- tag `v0.5.0`, commit `7fe450e19305b828c199d602c23a8337aaa1f03b`
+  (same pin as `scripts/setup-native.sh` and `docs/PIVOT.md`)
+
+The upstream native sources are **not** vendored or copied into this
+repository: they are cloned and built externally under
+`$FORGE_LLAMA_DIR` (see `docs/NATIVE.md`), and only the resulting
+shared libraries (`libggml`, `libggml-base`, `libggml-cpu`, `libllama`)
+are linked at build time.
+
+Upstream's root `LICENSE` file reads (verified against the pinned
+checkout):
 
 ```text
 MIT License
@@ -12,30 +49,31 @@ MIT License
 Copyright (c) 2023-2026 The ggml authors
 ```
 
-(from the `LICENSE` file at the repository root; the standard MIT
-permission/conditions text follows). An additional bundled notice,
-`licenses/LICENSE-jsonhpp` (MIT, Copyright (c) 2013-2025 Niels
-Lohmann), covers a third-party header used inside upstream's own
-sources.
+followed by the standard MIT permission/conditions text. A further
+bundled notice, upstream `licenses/LICENSE-jsonhpp`, reads:
 
-**What this means for ForgeCore:**
+```text
+MIT License
 
-- No upstream source is copied into this tree. The `forge-sys`
-  declarations are hand-written signatures against the pinned headers,
-  and the native tree is built outside the repo (`docs/NATIVE.md`).
-- The MIT license permits dynamic linking with no source-disclosure
-  duty, but **distributions of ForgeCore (or products embedding it)
-  must reproduce the upstream copyright and permission notices** above.
-  Keep this file and the exact revision in `docs/PIVOT.md` with any
-  distribution.
-- If upstream source is ever reused verbatim in this tree (not
-  currently the case), its notices must be preserved alongside it.
+Copyright (c) 2013-2025 Niels Lohmann
+```
 
-## This repository (ForgeCore)
+The MIT license text conditions its permission on including the
+copyright notice and permission notice with copies of the software;
+any distribution that includes the upstream libraries must therefore
+reproduce the notices above. If upstream source text is ever copied
+into this tree (not currently the case), its notices must be kept
+alongside it.
 
-ForgeCore's own license is **undecided**: there is currently no
-`LICENSE` file at the repository root. Until the owner chooses one,
-treat all files under this root as all-rights-reserved to the owner
-and do not redistribute. Choosing a license compatible with dynamic
-linking to MIT code (e.g. MIT/Apache-2.0, which impose no additional
-duties here) is recommended but is the owner's call.
+## 3. Test GGUF fixture — no binary in the repo
+
+No `*.gguf` file is committed anywhere in this repository (verified by
+filename search). The repository contains only the deterministic
+generator, `scripts/make-tiny-gguf.py`, which is ForgeCore's own code
+and falls under section 1 (undecided).
+
+Generated fixtures are written outside the repository (to
+`$FORGE_LLAMA_DIR/models/`, see `docs/NATIVE.md`). A generated fixture
+contains only synthetic content — seeded random F32 weights and made-up
+token strings — and no upstream code or data. If a fixture binary is
+ever committed to the repository, this section must be revisited.
