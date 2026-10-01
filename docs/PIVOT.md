@@ -102,22 +102,28 @@ Public API (no raw pointers anywhere):
 | `Backend::{open_cpu, open_device}` | Owned backend handle; `set_cpu_threads` on CPU |
 | `Tensor::{from_f32, empty, to_vec_f32}` | Owned tensor + storage; ggml `ne` order, ≤4 dims |
 | `runtime::{add, matmul}` | One-node ggml graphs on a shared backend (F32) |
-| `Model::{load, n_params, vocab_size}` | Owned `llama_model` (CPU load; GPU offload later) |
+| `Model::{load, load_with_options, …}` | Owned `llama_model` (CPU load; `ModelOptions` is `#[non_exhaustive]` for future offload); metadata: `n_params`, `vocab_size`, `description`, `size_bytes`, `n_ctx_train`, `n_embd`, `n_layer`, `n_head`, `n_head_kv` |
+| `Context::{open, decode, logits}` | Owned `llama_context` (+ model share); `ContextOptions` is `#[non_exhaustive]` (CPU: `n_ctx`, `n_threads`) |
+| `BatchBuilder` / `Batch` | Owned token/position/sequence/logits-flag arrays; immutable view for decode |
+| `Logits::{values, n_vocab}` | Owned `n_vocab`-float copy per decoded batch index |
 | `DType` | Safe `ggml_type` mirror with explicit unknown-id errors |
 | `reference::{quant, ops, convert, shape, checkpoint}` | Frozen validation oracles (never executed) |
 
-`Backend`, `Tensor`, and `Model` are `!Send + !Sync` (raw handles) and
-free their allocations on drop. All fallible operations return
-`Result<T, Error>`.
+`Backend`, `Tensor`, `Model`, `Context`, and `Batch` are `!Send +
+!Sync` (raw handles) and free their allocations on drop. All fallible
+operations return `Result<T, Error>`, with per-domain constructors
+(`backend`/`model`/`context`/`batch`/`decode`/`logits` plus
+`unsupported`/`invalid`/`native`).
 
 ## 5. FFI boundary
 
 `forge-sys` is the only crate that talks to C. Rules:
 
-- Opaque structs cross as pointers only; the two `#[repr(C)]` structs
-  (`ggml_init_params`, `llama_model_params`) were layout-audited
-  against gcc on x86_64 (`sizeof` 24/80; every field offset checked)
-  with committed regression tests in `forge-sys`.
+- Opaque structs cross as pointers only; the four `#[repr(C)]`
+  structs (`ggml_init_params`, `llama_model_params`, `llama_batch`,
+  `llama_context_params`) were layout-audited against gcc on x86_64
+  (`sizeof` 24/80/56/160; every field offset checked) with
+  committed regression tests in `forge-sys`.
 - Every `unsafe` block in `forge-core` carries a `// SAFETY:` comment;
   every nullable C return is checked; C strings are copied out
   immediately.
@@ -169,10 +175,20 @@ Rust 1.98.1, CMake 4.1.2, upstream `v0.5.0` @ `7fe450e1`.
   reports `n_params=1176 vocab_size=32`, matching the hand-counted
   parameter total exactly.
 
+Phase-1 CPU inference (same day, Rust 1.99.0, same pin): 81
+passed — +7 lib units (batch validation, option defaults), +9
+`cpu_decode` (metadata, context open/validation, decode success,
+native KV-error propagation, logits copy/determinism/invalid
+index), +2 `forge-sys` layout. C probes confirmed: decode codes
+(`0`/`1`/`2`/`-1`), out-of-window positions rejected gracefully
+(not aborts), `llama_get_logits_ith` NULL on invalid index in
+Release while Debug aborts, positive index = batch token position.
+`fmt`/`clippy -D warnings`/`release` clean.
+
 ## 9. Roadmap (out of this milestone)
 
-`llama_context` + batching/decode bindings, KV-cache control,
-`n_gpu_layers` offload paths, F16/I8 host transfer, quantized matmul
+Text tokenization, sampling/generation, `n_gpu_layers` offload paths,
+KV-cache control, F16/I8 host transfer, quantized matmul
 cross-validation against `reference/quant`, streaming execution, and
 residency/multi-device policy — all as extensions of the
-`Backend`/`Tensor`/`Model` handles defined here.
+`Backend`/`Tensor`/`Model`/`Context`/`Batch` handles defined here.

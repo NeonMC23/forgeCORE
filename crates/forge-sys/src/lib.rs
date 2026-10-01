@@ -36,6 +36,7 @@ opaque! {
     ggml_backend_buffer,
     llama_model,
     llama_vocab,
+    llama_context,
 }
 
 /// `ggml_backend_t` — pointer to an opaque backend instance.
@@ -128,6 +129,78 @@ pub struct llama_model_params {
 pub type ggml_log_callback =
     Option<unsafe extern "C" fn(level: c_int, text: *const c_char, user_data: *mut c_void)>;
 
+/// `ggml_backend_sched_eval_callback` (`ggml-backend.h`). Only carried
+/// inside [`llama_context_params`], never called from Rust.
+pub type ggml_sched_eval_callback =
+    Option<unsafe extern "C" fn(t: *mut ggml_tensor, ask: bool, user_data: *mut c_void) -> bool>;
+
+/// `ggml_abort_callback` (`ggml.h`). Only carried inside
+/// [`llama_context_params`], never installed from Rust.
+pub type ggml_abort_callback = Option<unsafe extern "C" fn(data: *mut c_void) -> bool>;
+
+/// `struct llama_batch` (`llama.h`).
+///
+/// Always built by `forge-core` from owned `Vec`s whose storage
+/// outlives every decode call; the struct itself is a by-value view.
+/// `embd` stays NULL (token batches only); `seq_id` entries point at
+/// `forge-core`-owned sequence ids.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct llama_batch {
+    pub n_tokens: c_int,
+    pub token: *mut c_int,
+    pub embd: *mut f32,
+    pub pos: *mut c_int,
+    pub n_seq_id: *mut c_int,
+    pub seq_id: *mut *mut c_int,
+    pub logits: *mut i8,
+}
+
+/// `struct llama_context_params` (`llama.h`). Construct via
+/// [`llama_context_default_params`], never by hand. Pointer-typed
+/// fields the phase-1 API does not use keep their upstream defaults.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct llama_context_params {
+    pub n_ctx: u32,
+    pub n_batch: u32,
+    pub n_ubatch: u32,
+    pub n_seq_max: u32,
+    pub n_rs_seq: u32,
+    pub n_outputs_max: u32,
+    pub n_outputs_max_per_seq: u32,
+    pub n_threads: c_int,
+    pub n_threads_batch: c_int,
+    pub ctx_type: c_int,
+    pub rope_scaling_type: c_int,
+    pub pooling_type: c_int,
+    pub attention_type: c_int,
+    pub flash_attn_type: c_int,
+    pub rope_freq_base: f32,
+    pub rope_freq_scale: f32,
+    pub yarn_ext_factor: f32,
+    pub yarn_attn_factor: f32,
+    pub yarn_beta_fast: f32,
+    pub yarn_beta_slow: f32,
+    pub yarn_orig_ctx: u32,
+    pub defrag_thold: f32,
+    pub cb_eval: ggml_sched_eval_callback,
+    pub cb_eval_user_data: *mut c_void,
+    pub type_k: c_int,
+    pub type_v: c_int,
+    pub abort_callback: ggml_abort_callback,
+    pub abort_callback_data: *mut c_void,
+    pub embeddings: bool,
+    pub offload_kqv: bool,
+    pub no_perf: bool,
+    pub op_offload: bool,
+    pub swa_full: bool,
+    pub kv_unified: bool,
+    pub samplers: *mut c_void,
+    pub n_samplers: usize,
+    pub ctx_other: *mut llama_context,
+}
+
 // ---------------------------------------------------------------------------
 // extern "C" declarations
 // ---------------------------------------------------------------------------
@@ -213,6 +286,25 @@ unsafe extern "C" {
     pub fn llama_model_get_vocab(model: *const llama_model) -> *const llama_vocab;
     pub fn llama_vocab_n_tokens(vocab: *const llama_vocab) -> i32;
     pub fn llama_log_set(log_callback: ggml_log_callback, user_data: *mut c_void);
+
+    // -- llama.h: context / batch / decode / logits -------------------------
+    pub fn llama_context_default_params() -> llama_context_params;
+    pub fn llama_init_from_model(
+        model: *mut llama_model,
+        params: llama_context_params,
+    ) -> *mut llama_context;
+    pub fn llama_free(ctx: *mut llama_context);
+    pub fn llama_decode(ctx: *mut llama_context, batch: llama_batch) -> c_int;
+    pub fn llama_get_logits_ith(ctx: *mut llama_context, i: c_int) -> *mut f32;
+
+    // -- llama.h: model metadata --------------------------------------------
+    pub fn llama_model_desc(model: *const llama_model, buf: *mut c_char, buf_size: usize) -> c_int;
+    pub fn llama_model_size(model: *const llama_model) -> u64;
+    pub fn llama_model_n_ctx_train(model: *const llama_model) -> c_int;
+    pub fn llama_model_n_embd(model: *const llama_model) -> c_int;
+    pub fn llama_model_n_layer(model: *const llama_model) -> c_int;
+    pub fn llama_model_n_head(model: *const llama_model) -> c_int;
+    pub fn llama_model_n_head_kv(model: *const llama_model) -> c_int;
 }
 
 #[cfg(test)]
@@ -254,5 +346,59 @@ mod layout_tests {
         assert_eq!(offset_of!(llama_model_params, no_host), 75);
         assert_eq!(offset_of!(llama_model_params, no_alloc), 76);
         assert_eq!(offset_of!(llama_model_params, load_mtp), 77);
+    }
+
+    #[test]
+    fn llama_batch_layout() {
+        assert_eq!(size_of::<llama_batch>(), 56);
+        assert_eq!(offset_of!(llama_batch, n_tokens), 0);
+        assert_eq!(offset_of!(llama_batch, token), 8);
+        assert_eq!(offset_of!(llama_batch, embd), 16);
+        assert_eq!(offset_of!(llama_batch, pos), 24);
+        assert_eq!(offset_of!(llama_batch, n_seq_id), 32);
+        assert_eq!(offset_of!(llama_batch, seq_id), 40);
+        assert_eq!(offset_of!(llama_batch, logits), 48);
+    }
+
+    #[test]
+    fn llama_context_params_layout() {
+        assert_eq!(size_of::<llama_context_params>(), 160);
+        assert_eq!(offset_of!(llama_context_params, n_ctx), 0);
+        assert_eq!(offset_of!(llama_context_params, n_batch), 4);
+        assert_eq!(offset_of!(llama_context_params, n_ubatch), 8);
+        assert_eq!(offset_of!(llama_context_params, n_seq_max), 12);
+        assert_eq!(offset_of!(llama_context_params, n_rs_seq), 16);
+        assert_eq!(offset_of!(llama_context_params, n_outputs_max), 20);
+        assert_eq!(offset_of!(llama_context_params, n_outputs_max_per_seq), 24);
+        assert_eq!(offset_of!(llama_context_params, n_threads), 28);
+        assert_eq!(offset_of!(llama_context_params, n_threads_batch), 32);
+        assert_eq!(offset_of!(llama_context_params, ctx_type), 36);
+        assert_eq!(offset_of!(llama_context_params, rope_scaling_type), 40);
+        assert_eq!(offset_of!(llama_context_params, pooling_type), 44);
+        assert_eq!(offset_of!(llama_context_params, attention_type), 48);
+        assert_eq!(offset_of!(llama_context_params, flash_attn_type), 52);
+        assert_eq!(offset_of!(llama_context_params, rope_freq_base), 56);
+        assert_eq!(offset_of!(llama_context_params, rope_freq_scale), 60);
+        assert_eq!(offset_of!(llama_context_params, yarn_ext_factor), 64);
+        assert_eq!(offset_of!(llama_context_params, yarn_attn_factor), 68);
+        assert_eq!(offset_of!(llama_context_params, yarn_beta_fast), 72);
+        assert_eq!(offset_of!(llama_context_params, yarn_beta_slow), 76);
+        assert_eq!(offset_of!(llama_context_params, yarn_orig_ctx), 80);
+        assert_eq!(offset_of!(llama_context_params, defrag_thold), 84);
+        assert_eq!(offset_of!(llama_context_params, cb_eval), 88);
+        assert_eq!(offset_of!(llama_context_params, cb_eval_user_data), 96);
+        assert_eq!(offset_of!(llama_context_params, type_k), 104);
+        assert_eq!(offset_of!(llama_context_params, type_v), 108);
+        assert_eq!(offset_of!(llama_context_params, abort_callback), 112);
+        assert_eq!(offset_of!(llama_context_params, abort_callback_data), 120);
+        assert_eq!(offset_of!(llama_context_params, embeddings), 128);
+        assert_eq!(offset_of!(llama_context_params, offload_kqv), 129);
+        assert_eq!(offset_of!(llama_context_params, no_perf), 130);
+        assert_eq!(offset_of!(llama_context_params, op_offload), 131);
+        assert_eq!(offset_of!(llama_context_params, swa_full), 132);
+        assert_eq!(offset_of!(llama_context_params, kv_unified), 133);
+        assert_eq!(offset_of!(llama_context_params, samplers), 136);
+        assert_eq!(offset_of!(llama_context_params, n_samplers), 144);
+        assert_eq!(offset_of!(llama_context_params, ctx_other), 152);
     }
 }

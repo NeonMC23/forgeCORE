@@ -80,10 +80,11 @@ their own loader path — an rpath on their final binaries or
 
 ## Test model fixture (optional)
 
-`tests/ggml_smoke.rs::tiny_fixture_model_loads_when_present` loads a
-real `.gguf` when `FORGE_TEST_MODEL` points at one, and skips otherwise.
-Generate a deterministic 7 KB fixture with the repo script (needs
-`pip install gguf numpy` with `PIP_TARGET` outside the repo):
+`tests/ggml_smoke.rs::tiny_fixture_model_loads_when_present` and the
+`tests/cpu_decode.rs` suite load a real `.gguf` when `FORGE_TEST_MODEL`
+points at one, and skip otherwise. Generate a deterministic 7 KB
+fixture with the repo script (needs `pip install gguf numpy` with
+`PIP_TARGET` outside the repo):
 
 ```sh
 . scripts/env.sh
