@@ -1,0 +1,11 @@
+[package]
+name = "forge-sys"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "forge_sys"
+path = "src/lib.rs"
+
+[build-dependencies]
+# none: build.rs only shells out to the prebuilt native tree

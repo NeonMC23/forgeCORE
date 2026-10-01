@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "forge-core"
 version = "0.1.0"
+dependencies = [
+ "forge-sys",
+]
+
+[[package]]
+name = "forge-sys"
+version = "0.1.0"

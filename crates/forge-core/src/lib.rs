@@ -1,34 +1,29 @@
-//! ForgeCore: a small, explicit, scalar numerical inference core.
+//! ForgeCore: thin Rust abstraction over llama.cpp/ggml.
 //!
-//! ForgeCore rebuilds the transformer inference mathematics from first
-//! principles. Correctness comes before performance: every operator here is a
-//! deliberately boring scalar reference implementation with no SIMD, no GPU,
-//! no threading, and no hidden layout reinterpretation.
+//! ForgeCore is the middle of `RAMforge → ForgeCore → llama.cpp/ggml →
+//! hardware`. It owns no compute of its own: [`Backend`] opens ggml
+//! backends, [`Tensor`] owns ggml tensors, [`runtime`] executes ggml
+//! graphs, and [`Model`] loads `.gguf` models through libllama. The only
+//! `unsafe` in the crate sits at the documented FFI boundary inside each
+//! module; no raw C pointers appear in any public API.
 //!
-//! ## Module layout
-//!
-//! * [`error`] — the single fallible-result type used by every kernel.
-//! * [`shape`] — tensor/matrix shape contracts and the authoritative matrix
-//!   convention (`y[o] = sum_i W[o, i] * x[i]`).
-//! * [`dtype`] — scalar F16/BF16 bit-pattern conversion.
-//! * [`ops`] — scalar reference operators: dot, matvec, RMSNorm,
-//!   elementwise add/mul, SiLU, SwiGLU, softmax, RoPE.
-//! * [`attention`] — explicit single-token causal attention with GQA mapping.
-//! * [`kv`] — explicit `[position][kv_head][head_dim]` KV cache.
-//! * [`model`] — reference transformer-layer and token-forward executor plus
-//!   model-dimension contracts.
-//! * [`checkpoint`] — deterministic numerical summaries for validation.
-//! * [`quant`] — quantization interface: block geometry plus scalar
-//!   dequantization for the formats implemented so far.
+//! The pre-pivot scalar kernels survive frozen under [`reference`] as
+//! validation oracles — they cross-check ggml numerics in tests and are
+//! never on an execution path.
 
-pub mod attention;
-pub mod checkpoint;
+pub mod backend;
+pub mod device;
 pub mod dtype;
 pub mod error;
-pub mod kv;
 pub mod model;
-pub mod ops;
-pub mod quant;
-pub mod shape;
+pub mod reference;
+pub mod runtime;
+pub mod tensor;
 
+pub use backend::Backend;
+pub use device::{enumerate_devices, DeviceInfo, DeviceType};
+pub use dtype::DType;
 pub use error::{Error, Result};
+pub use model::Model;
+pub use runtime::{add, matmul};
+pub use tensor::Tensor;

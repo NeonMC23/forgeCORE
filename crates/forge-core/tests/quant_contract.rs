@@ -1,8 +1,8 @@
 //! Quantization contract tests: block geometry and scalar decoders.
-use forge_core::quant::{
+use forge_core::reference::quant::{
     block_spec, dequantize_row, matvec_reference, row_bytes, BlockSpec, QuantFormat,
 };
-use forge_core::shape::MatrixShape;
+use forge_core::reference::shape::MatrixShape;
 
 #[test]
 fn block_geometry_table() {

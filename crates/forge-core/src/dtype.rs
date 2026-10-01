@@ -1,48 +1,95 @@
-//! Scalar floating-point bit-pattern conversion.
+//! Element data types.
 //!
-//! GGUF tensors may store weights as F16 or BF16. ForgeCore decodes them to
-//! F32 through these explicit bit-level conversions before any arithmetic.
-//! There is no platform-dependent behavior: the conversions are pure integer
-//! bit manipulation plus [`f32::from_bits`].
+//! [`DType`] is the safe-Rust mirror of upstream `enum ggml_type`: each
+//! variant's discriminant is the exact ggml type id, so conversion to the
+//! C ABI is a plain `as` cast. Types ForgeCore does not map yet surface
+//! as [`Error`] through [`DType::from_ggml`], never as silent substitutes.
 
-/// Convert 16 F16 bits (IEEE 754 binary16, little-endian value) to F32.
-///
-/// Handles zeros, subnormals, normals, infinities, and NaNs. The conversion
-/// is exact: every F16 value is representable in F32.
-pub fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = (u32::from(bits >> 15) & 1) << 31;
-    let exp = u32::from((bits >> 10) & 0x1F);
-    let mant = u32::from(bits & 0x3FF);
+use crate::error::{Error, Result};
 
-    let f32_bits = if exp == 0 {
-        if mant == 0 {
-            // Signed zero.
-            sign
-        } else {
-            // Subnormal: value = mant * 2^-24. Normalize so bit 10 is set:
-            // value = (1 + frac) * 2^(-14 - shift).
-            let shift = mant.leading_zeros() - 21;
-            let normalized = mant << shift;
-            let f32_exp = 113 - shift;
-            sign | (f32_exp << 23) | ((normalized & 0x3FF) << 13)
-        }
-    } else if exp == 0x1F {
-        // Infinity or NaN; payload preserved in the high mantissa bits.
-        sign | (0xFF << 23) | (mant << 13)
-    } else {
-        // Normal: re-bias exponent from 15 to 127 (written as +112 so
-        // small exponents cannot underflow in debug builds).
-        sign | ((exp + 112) << 23) | (mant << 13)
-    };
-    f32::from_bits(f32_bits)
+/// Tensor element type, mirroring upstream `enum ggml_type`.
+#[allow(non_camel_case_types)]
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DType {
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    Q2_K = 10,
+    Q3_K = 11,
+    Q4_K = 12,
+    Q5_K = 13,
+    Q6_K = 14,
+    Q8_K = 15,
+    I8 = 24,
+    I16 = 25,
+    I32 = 26,
+    F64 = 28,
+    BF16 = 30,
 }
 
-/// Convert 16 BF16 bits (brain float 16, little-endian value) to F32.
-///
-/// BF16 is the upper 16 bits of an F32; conversion appends 16 zero bits.
-/// Exact, including infinities and NaNs.
-pub fn bf16_bits_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
+impl DType {
+    /// ggml type id for the FFI boundary.
+    pub fn ggml_type(self) -> std::os::raw::c_int {
+        self as std::os::raw::c_int
+    }
+
+    /// Map a ggml type id back, rejecting unmapped ids explicitly.
+    pub fn from_ggml(id: i32) -> Result<Self> {
+        let dtype = match id {
+            0 => Self::F32,
+            1 => Self::F16,
+            2 => Self::Q4_0,
+            3 => Self::Q4_1,
+            6 => Self::Q5_0,
+            7 => Self::Q5_1,
+            8 => Self::Q8_0,
+            9 => Self::Q8_1,
+            10 => Self::Q2_K,
+            11 => Self::Q3_K,
+            12 => Self::Q4_K,
+            13 => Self::Q5_K,
+            14 => Self::Q6_K,
+            15 => Self::Q8_K,
+            24 => Self::I8,
+            25 => Self::I16,
+            26 => Self::I32,
+            28 => Self::F64,
+            30 => Self::BF16,
+            other => return Err(Error::unsupported(format!("ggml type id {other}"))),
+        };
+        Ok(dtype)
+    }
+
+    /// Short stable name (matches the ggml spelling).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::Q4_0 => "Q4_0",
+            Self::Q4_1 => "Q4_1",
+            Self::Q5_0 => "Q5_0",
+            Self::Q5_1 => "Q5_1",
+            Self::Q8_0 => "Q8_0",
+            Self::Q8_1 => "Q8_1",
+            Self::Q2_K => "Q2_K",
+            Self::Q3_K => "Q3_K",
+            Self::Q4_K => "Q4_K",
+            Self::Q5_K => "Q5_K",
+            Self::Q6_K => "Q6_K",
+            Self::Q8_K => "Q8_K",
+            Self::I8 => "I8",
+            Self::I16 => "I16",
+            Self::I32 => "I32",
+            Self::F64 => "F64",
+            Self::BF16 => "BF16",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -50,44 +97,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn f16_known_bit_patterns() {
-        assert_eq!(f16_bits_to_f32(0x3C00), 1.0);
-        assert_eq!(f16_bits_to_f32(0xBC00), -1.0);
-        assert_eq!(f16_bits_to_f32(0x4000), 2.0);
-        assert_eq!(f16_bits_to_f32(0xC000), -2.0);
-        assert_eq!(f16_bits_to_f32(0x0000), 0.0);
-        assert_eq!(f16_bits_to_f32(0x8000), -0.0);
-        assert_eq!(f16_bits_to_f32(0x7C00), f32::INFINITY);
-        assert_eq!(f16_bits_to_f32(0xFC00), f32::NEG_INFINITY);
-        assert!(f16_bits_to_f32(0x7E00).is_nan());
-        // 0x3555 = 0 01101 0101010101 -> (1365/1024) * 2^-2
-        // = 1365/4096 = 0.333251953125 (exactly representable; the
-        // literal is truncated to what F32 distinguishes).
-        assert_eq!(f16_bits_to_f32(0x3555), 0.333_251_95);
+    fn discriminants_match_sys_constants() {
+        assert_eq!(DType::F32.ggml_type(), forge_sys::ggml_type::F32);
+        assert_eq!(DType::F16.ggml_type(), forge_sys::ggml_type::F16);
+        assert_eq!(DType::Q4_0.ggml_type(), forge_sys::ggml_type::Q4_0);
+        assert_eq!(DType::Q4_1.ggml_type(), forge_sys::ggml_type::Q4_1);
+        assert_eq!(DType::Q5_0.ggml_type(), forge_sys::ggml_type::Q5_0);
+        assert_eq!(DType::Q5_1.ggml_type(), forge_sys::ggml_type::Q5_1);
+        assert_eq!(DType::Q8_0.ggml_type(), forge_sys::ggml_type::Q8_0);
+        assert_eq!(DType::Q8_1.ggml_type(), forge_sys::ggml_type::Q8_1);
+        assert_eq!(DType::Q2_K.ggml_type(), forge_sys::ggml_type::Q2_K);
+        assert_eq!(DType::Q3_K.ggml_type(), forge_sys::ggml_type::Q3_K);
+        assert_eq!(DType::Q4_K.ggml_type(), forge_sys::ggml_type::Q4_K);
+        assert_eq!(DType::Q5_K.ggml_type(), forge_sys::ggml_type::Q5_K);
+        assert_eq!(DType::Q6_K.ggml_type(), forge_sys::ggml_type::Q6_K);
+        assert_eq!(DType::Q8_K.ggml_type(), forge_sys::ggml_type::Q8_K);
+        assert_eq!(DType::I8.ggml_type(), forge_sys::ggml_type::I8);
+        assert_eq!(DType::I16.ggml_type(), forge_sys::ggml_type::I16);
+        assert_eq!(DType::I32.ggml_type(), forge_sys::ggml_type::I32);
+        assert_eq!(DType::F64.ggml_type(), forge_sys::ggml_type::F64);
+        assert_eq!(DType::BF16.ggml_type(), forge_sys::ggml_type::BF16);
     }
 
     #[test]
-    fn f16_subnormals_are_exact() {
-        // Smallest subnormal: 2^-24.
-        assert_eq!(f16_bits_to_f32(0x0001), 2f32.powi(-24));
-        // Largest subnormal: 1023 * 2^-24.
-        assert_eq!(f16_bits_to_f32(0x03FF), 1023.0 * 2f32.powi(-24));
-        // Smallest normal: 2^-14.
-        assert_eq!(f16_bits_to_f32(0x0400), 2f32.powi(-14));
-        // Largest finite: 65504.
-        assert_eq!(f16_bits_to_f32(0x7BFF), 65504.0);
-    }
-
-    #[test]
-    fn bf16_known_bit_patterns() {
-        assert_eq!(bf16_bits_to_f32(0x3F80), 1.0);
-        assert_eq!(bf16_bits_to_f32(0xBF80), -1.0);
-        assert_eq!(bf16_bits_to_f32(0x4000), 2.0);
-        assert_eq!(bf16_bits_to_f32(0x0000), 0.0);
-        assert_eq!(bf16_bits_to_f32(0x7F80), f32::INFINITY);
-        assert!(bf16_bits_to_f32(0x7FC0).is_nan());
-        // 0x3F80_0000 is 1.0f32; upper half 0x3F80 must round-trip exactly.
-        assert_eq!(bf16_bits_to_f32(0x3F80).to_bits(), 0x3F80_0000);
-        assert_eq!(bf16_bits_to_f32(0xC000).to_bits(), 0xC000_0000);
+    fn from_ggml_round_trips_and_rejects_unknown() {
+        for dtype in [
+            DType::F32,
+            DType::F16,
+            DType::Q4_0,
+            DType::Q4_1,
+            DType::Q5_0,
+            DType::Q5_1,
+            DType::Q8_0,
+            DType::Q8_1,
+            DType::Q2_K,
+            DType::Q3_K,
+            DType::Q4_K,
+            DType::Q5_K,
+            DType::Q6_K,
+            DType::Q8_K,
+            DType::I8,
+            DType::I16,
+            DType::I32,
+            DType::F64,
+            DType::BF16,
+        ] {
+            assert_eq!(DType::from_ggml(dtype.ggml_type()), Ok(dtype));
+        }
+        assert!(DType::from_ggml(4).is_err()); // removed Q4_2 slot
+        assert!(DType::from_ggml(999).is_err());
     }
 }

@@ -1,5 +1,9 @@
 # ForgeCore Phase 1 — Repository audit
 
+> Historical note: this audit describes the pre-pivot tree (independent
+> Rust inference engine, git history since removed). For the ggml pivot,
+> see `docs/PIVOT.md`.
+
 **Date:** 2026-09-24
 **Auditor:** initial ForgeCore development session (agentic)
 

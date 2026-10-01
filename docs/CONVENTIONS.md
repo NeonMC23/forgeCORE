@@ -1,5 +1,12 @@
 # ForgeCore numerical conventions
 
+> Scope note (2026-10-01 ggml pivot): this document now governs the
+> **frozen validation oracles** under `crates/forge-core/src/reference/`
+> only. All real execution defers to upstream ggml semantics; where ggml
+> disagrees with these conventions (e.g. `ggml_mul_mat` layout), ggml
+> wins and the difference is documented at the call site. See
+> `docs/PIVOT.md`.
+
 This is the authoritative convention record for the ForgeCore reference
 core. If code and this document ever disagree, that is a bug in one of
 them — file it, do not silently reinterpret.
