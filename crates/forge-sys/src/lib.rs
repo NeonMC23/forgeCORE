@@ -88,6 +88,36 @@ pub mod status {
     pub const ABORTED: i32 = 1;
 }
 
+/// `enum llama_vocab_type` values (`llama.h`).
+pub mod vocab_type {
+    pub const NONE: i32 = 0;
+    pub const SPM: i32 = 1;
+    pub const BPE: i32 = 2;
+    pub const WPM: i32 = 3;
+    pub const UGM: i32 = 4;
+    pub const RWKV: i32 = 5;
+    pub const PLAMO2: i32 = 6;
+    pub const TEST: i32 = 7;
+}
+
+/// `enum llama_token_attr` bitmask values (`llama.h`).
+pub mod token_attr {
+    pub const UNDEFINED: i32 = 0;
+    pub const UNKNOWN: i32 = 1;
+    pub const UNUSED: i32 = 2;
+    pub const NORMAL: i32 = 4;
+    pub const CONTROL: i32 = 8;
+    pub const USER_DEFINED: i32 = 16;
+    pub const BYTE: i32 = 32;
+    pub const NORMALIZED: i32 = 64;
+    pub const LSTRIP: i32 = 128;
+    pub const RSTRIP: i32 = 256;
+    pub const SINGLE_WORD: i32 = 512;
+}
+
+/// `LLAMA_TOKEN_NULL` (`llama.h`): sentinel for "no such special token".
+pub const LLAMA_TOKEN_NULL: c_int = -1;
+
 // ---------------------------------------------------------------------------
 // #[repr(C)] parameter structs (field order matches the upstream headers)
 // ---------------------------------------------------------------------------
@@ -305,6 +335,51 @@ unsafe extern "C" {
     pub fn llama_model_n_layer(model: *const llama_model) -> c_int;
     pub fn llama_model_n_head(model: *const llama_model) -> c_int;
     pub fn llama_model_n_head_kv(model: *const llama_model) -> c_int;
+
+    // -- llama.h: tokenizer / vocabulary ------------------------------------
+    //
+    // Every per-token getter below indexes the native id table without a
+    // bounds check (`vector::at` throws across the C boundary, which
+    // terminates; `is_control` uses unchecked `operator[]`, which is UB
+    // out of bounds), and every getter asserts the vocab type is not
+    // NONE. `forge-core` therefore validates each token id against
+    // `llama_vocab_n_tokens` before every call and refuses NONE vocabs
+    // at `Tokenizer` construction. The deprecated `llama_token_*` /
+    // `llama_add_bos/eos_token` aliases are deliberately NOT bound.
+    pub fn llama_vocab_type(vocab: *const llama_vocab) -> c_int;
+    pub fn llama_vocab_get_text(vocab: *const llama_vocab, token: c_int) -> *const c_char;
+    pub fn llama_vocab_get_score(vocab: *const llama_vocab, token: c_int) -> f32;
+    pub fn llama_vocab_get_attr(vocab: *const llama_vocab, token: c_int) -> c_int;
+    pub fn llama_vocab_is_eog(vocab: *const llama_vocab, token: c_int) -> bool;
+    pub fn llama_vocab_is_control(vocab: *const llama_vocab, token: c_int) -> bool;
+    pub fn llama_vocab_bos(vocab: *const llama_vocab) -> c_int;
+    pub fn llama_vocab_eos(vocab: *const llama_vocab) -> c_int;
+    pub fn llama_vocab_eot(vocab: *const llama_vocab) -> c_int;
+    pub fn llama_vocab_sep(vocab: *const llama_vocab) -> c_int;
+    pub fn llama_vocab_nl(vocab: *const llama_vocab) -> c_int;
+    pub fn llama_vocab_pad(vocab: *const llama_vocab) -> c_int;
+    pub fn llama_vocab_mask(vocab: *const llama_vocab) -> c_int;
+    pub fn llama_vocab_get_add_bos(vocab: *const llama_vocab) -> bool;
+    pub fn llama_vocab_get_add_eos(vocab: *const llama_vocab) -> bool;
+    // Negative return: -(required capacity); INT32_MIN on overflow.
+    pub fn llama_tokenize(
+        vocab: *const llama_vocab,
+        text: *const c_char,
+        text_len: c_int,
+        tokens: *mut c_int,
+        n_tokens_max: c_int,
+        add_special: bool,
+        parse_special: bool,
+    ) -> c_int;
+    pub fn llama_detokenize(
+        vocab: *const llama_vocab,
+        tokens: *const c_int,
+        n_tokens: c_int,
+        text: *mut c_char,
+        text_len_max: c_int,
+        remove_special: bool,
+        unparse_special: bool,
+    ) -> c_int;
 }
 
 #[cfg(test)]

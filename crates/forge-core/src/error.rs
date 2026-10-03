@@ -55,6 +55,12 @@ impl Error {
     pub fn logits(message: impl Into<String>) -> Self {
         Self(format!("logits error: {}", message.into()))
     }
+
+    /// Tokenizer or vocabulary failure (encode, decode, token lookup,
+    /// special-token requirements, ...).
+    pub fn tokenizer(message: impl Into<String>) -> Self {
+        Self(format!("tokenizer error: {}", message.into()))
+    }
 }
 
 impl fmt::Display for Error {
@@ -82,5 +88,6 @@ mod tests {
         assert_eq!(Error::batch("x").0, "batch error: x");
         assert_eq!(Error::decode("x").0, "decode error: x");
         assert_eq!(Error::logits("x").0, "logits error: x");
+        assert_eq!(Error::tokenizer("x").0, "tokenizer error: x");
     }
 }

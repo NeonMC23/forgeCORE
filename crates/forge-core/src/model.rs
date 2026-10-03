@@ -205,7 +205,7 @@ impl Model {
 }
 
 /// Convert a non-negative upstream `int32` dimension, rejecting negatives.
-fn u32_from_upstream(name: &str, value: c_int) -> Result<u32> {
+pub(crate) fn u32_from_upstream(name: &str, value: c_int) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::model(format!("{name} is negative: {value}")))
 }
 

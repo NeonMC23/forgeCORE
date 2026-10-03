@@ -3,7 +3,8 @@
 //! ForgeCore is the middle of `RAMforge → ForgeCore → llama.cpp/ggml →
 //! hardware`. It owns no compute of its own: [`Backend`] opens ggml
 //! backends, [`Tensor`] owns ggml tensors, [`runtime`] executes ggml
-//! graphs, [`Model`] loads `.gguf` models through libllama, and
+//! graphs, [`Model`] loads `.gguf` models through libllama,
+//! [`Tokenizer`] encodes text through the model's vocabulary, and
 //! [`Context`] runs the minimal CPU inference path (`Model` → `Context`
 //! → [`Batch`] → `decode` → [`Logits`]). The only `unsafe` in the crate
 //! sits at the documented FFI boundary inside each module; no raw C
@@ -23,6 +24,7 @@ pub mod model;
 pub mod reference;
 pub mod runtime;
 pub mod tensor;
+pub mod tokenizer;
 
 pub use backend::Backend;
 pub use batch::{Batch, BatchBuilder, TokenId};
@@ -33,3 +35,4 @@ pub use error::{Error, Result};
 pub use model::{Model, ModelOptions};
 pub use runtime::{add, matmul};
 pub use tensor::Tensor;
+pub use tokenizer::{DecodeOptions, EncodeOptions, SpecialTokens, TokenAttr, Tokenizer, VocabType};

@@ -98,6 +98,23 @@ FORGE_TEST_MODEL="$FORGE_LLAMA_DIR/models/tiny-llama.gguf" cargo test -p forge-c
 The fixture is a 1-layer LLAMA model (vocab 32, 1176 params); the test
 asserts the load reports matching metadata.
 
+## Tokenizer fixture (optional)
+
+`tests/tokenizer.rs` needs a second fixture with a well-formed SPM
+vocabulary (the decode fixture has no byte pieces, so upstream byte
+fallback throws on any non-empty encode — see the phase-1 report §7).
+Generate it with the same script in `--tok` mode (vocab 269:
+`<unk> <s> </s>`, ten `tokN` pieces, full `<0xXX>` byte coverage,
+`add_bos` + `add_eos`):
+
+```sh
+. scripts/env.sh
+mkdir -p "$FORGE_LLAMA_DIR/models"
+PYTHONPATH="$FORGE_LLAMA_DIR/py" python3 scripts/make-tiny-gguf.py --tok \
+    "$FORGE_LLAMA_DIR/models/tiny-tok.gguf"
+FORGE_TEST_MODEL_TOK="$FORGE_LLAMA_DIR/models/tiny-tok.gguf" cargo test -p forge-core --test tokenizer
+```
+
 ## Troubleshooting
 
 - `forge-sys: libggml.so not found …`: run `setup-native.sh` first, or
