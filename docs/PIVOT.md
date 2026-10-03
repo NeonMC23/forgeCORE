@@ -82,7 +82,7 @@ Alternatives rejected:
   contexts; RAMforge needs that control.
 - **Vendoring upstream source:** rejected per policy; the native tree
   lives outside the repo at `$FORGE_LLAMA_DIR`.
-- **bindgen:** rejected; the bound surface is ~40 functions and two
+- **bindgen:** rejected; the bound surface is 51 functions and four
   small structs, and hand-written declarations keep `unsafe` reviewable
   and the build dependency-free.
 
@@ -113,7 +113,7 @@ Public API (no raw pointers anywhere):
 !Sync` (raw handles) and free their allocations on drop. All fallible
 operations return `Result<T, Error>`, with per-domain constructors
 (`backend`/`model`/`context`/`batch`/`decode`/`logits` plus
-`unsupported`/`invalid`/`native`).
+`unsupported`/`invalid`).
 
 ## 5. FFI boundary
 

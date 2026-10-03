@@ -38,7 +38,7 @@ docs/                PIVOT.md, NATIVE.md, LICENSING.md, TOOLCHAIN.md, …
 Public API at a glance:
 
 ```rust
-use forge_core::{Backend, Tensor, add, enumerate_devices, matmul, Model};
+use forge_core::{Backend, Context, ContextOptions, Tensor, add, enumerate_devices, matmul, Model};
 
 let devices = enumerate_devices();          // CPU, CUDA, … — whatever is registered
 let backend = Backend::open_cpu()?;         // or Backend::open_device(&devices[i])

@@ -89,6 +89,7 @@ fixture with the repo script (needs `pip install gguf numpy` with
 ```sh
 . scripts/env.sh
 mkdir -p "$FORGE_LLAMA_DIR/models"
+PIP_TARGET="$FORGE_LLAMA_DIR/py" pip install gguf numpy
 PYTHONPATH="$FORGE_LLAMA_DIR/py" python3 scripts/make-tiny-gguf.py \
     "$FORGE_LLAMA_DIR/models/tiny-llama.gguf"
 FORGE_TEST_MODEL="$FORGE_LLAMA_DIR/models/tiny-llama.gguf" cargo test -p forge-core
