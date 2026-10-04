@@ -2,7 +2,7 @@
 //!
 //! A [`Context`] owns one native context plus a share of its [`Model`],
 //! so the model always outlives every context built from it. The
-//! phase-1 path is single-shot: build a [`Batch`](crate::batch::Batch),
+//! phase-1 path is single-shot: build a [`Batch`],
 //! [`decode`](Context::decode) it, read [`Logits`].
 //!
 //! [`ContextOptions`] is `#[non_exhaustive]` and exposes only what the

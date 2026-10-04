@@ -34,7 +34,7 @@
 //!
 //! ## Row geometry
 //!
-//! A quantized matrix with [`MatrixShape`](crate::reference::shape::MatrixShape)
+//! A quantized matrix with [`MatrixShape`]
 //! `[input, output]` stores `output` consecutive rows of
 //! [`row_bytes`] bytes; row `o` starts at byte `o * row_bytes`. The number
 //! of blocks per row is `input / values_per_block`, so `input` must be an

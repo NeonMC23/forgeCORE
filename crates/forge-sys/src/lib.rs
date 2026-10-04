@@ -116,6 +116,26 @@ pub mod token_attr {
     pub const SINGLE_WORD: i32 = 512;
 }
 
+/// `enum llama_split_mode` values (`llama.h`).
+pub mod split_mode {
+    pub const NONE: i32 = 0;
+    pub const LAYER: i32 = 1;
+    pub const ROW: i32 = 2;
+    pub const TENSOR: i32 = 3;
+}
+
+/// `enum llama_load_mode` values (`llama.h`).
+///
+/// `LLAMA_LOAD_MODE_DIRECT_IO` (4) is deliberately unbound: no
+/// `forge-core` API selects it.
+pub mod load_mode {
+    pub const AUTO: i32 = -1;
+    pub const NONE: i32 = 0;
+    pub const MMAP: i32 = 1;
+    pub const MLOCK: i32 = 2;
+    pub const MMAP_MLOCK: i32 = 3;
+}
+
 /// `LLAMA_TOKEN_NULL` (`llama.h`): sentinel for "no such special token".
 pub const LLAMA_TOKEN_NULL: c_int = -1;
 
@@ -141,7 +161,9 @@ pub struct ggml_init_params {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct llama_model_params {
-    pub devices: ggml_backend_dev_t,
+    // `ggml_backend_dev_t *`: NULL (default device selection) or a
+    // NULL-terminated array of registry-borrowed device handles.
+    pub devices: *mut ggml_backend_dev_t,
     pub tensor_buft_overrides: *const c_void,
     pub n_gpu_layers: i32,
     pub split_mode: i32,
@@ -350,6 +372,15 @@ unsafe extern "C" {
     ) -> *mut llama_model;
     pub fn llama_model_free(model: *mut llama_model);
     pub fn llama_model_n_params(model: *const llama_model) -> u64;
+    // Device/offload capability facts (`llama.h`). All four take no
+    // arguments and cannot fail: `max_devices` returns a constant
+    // (16); `supports_mmap/mlock` return compile-time platform flags;
+    // `supports_gpu_offload` loads the backend registry on first use
+    // and reports whether a GPU/IGPU device (or RPC support) exists.
+    pub fn llama_max_devices() -> usize;
+    pub fn llama_supports_mmap() -> bool;
+    pub fn llama_supports_mlock() -> bool;
+    pub fn llama_supports_gpu_offload() -> bool;
     pub fn llama_model_get_vocab(model: *const llama_model) -> *const llama_vocab;
     pub fn llama_vocab_n_tokens(vocab: *const llama_vocab) -> i32;
     pub fn llama_log_set(log_callback: ggml_log_callback, user_data: *mut c_void);

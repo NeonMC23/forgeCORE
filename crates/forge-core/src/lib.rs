@@ -11,7 +11,7 @@
 //! sits at the documented FFI boundary inside each module; no raw C
 //! pointers appear in any public API.
 //!
-//! The pre-pivot scalar kernels survive frozen under [`reference`] as
+//! The pre-pivot scalar kernels survive frozen under [`mod@reference`] as
 //! validation oracles — they cross-check ggml numerics in tests and are
 //! never on an execution path.
 
@@ -31,10 +31,13 @@ pub mod tokenizer;
 pub use backend::Backend;
 pub use batch::{Batch, BatchBuilder, TokenId};
 pub use context::{Context, ContextOptions, Logits};
-pub use device::{enumerate_devices, DeviceInfo, DeviceType};
+pub use device::{
+    enumerate_devices, max_devices, supports_gpu_offload, supports_mlock, supports_mmap,
+    DeviceInfo, DeviceType,
+};
 pub use dtype::DType;
 pub use error::{Error, Result};
-pub use model::{Model, ModelOptions};
+pub use model::{GpuLayers, Model, ModelLoadMode, ModelOptions, SplitMode};
 pub use runtime::{add, matmul};
 pub use sampler::{SampleConfig, SamplerChain};
 pub use tensor::Tensor;

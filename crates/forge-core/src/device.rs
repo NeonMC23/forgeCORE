@@ -95,6 +95,53 @@ pub fn enumerate_devices() -> Vec<DeviceInfo> {
     devices
 }
 
+/// Maximum device count upstream supports for model offload
+/// (`llama_max_devices`).
+///
+/// The pinned upstream returns the constant 16. A caller-supplied
+/// `tensor_split` array is read by index per selected device, so
+/// [`ModelOptions`](crate::model::ModelOptions) validates split lengths
+/// against the effective device count; this bound sizes such arrays.
+pub fn max_devices() -> usize {
+    // SAFETY: no arguments; returns a constant, never fails.
+    unsafe { forge_sys::llama_max_devices() }
+}
+
+/// Whether the platform build supports memory-mapping model files
+/// (`llama_supports_mmap`).
+///
+/// A compile-time platform flag (true on Linux); requesting mmap where
+/// it is unsupported makes upstream warn and load without mmap rather
+/// than fail.
+pub fn supports_mmap() -> bool {
+    // SAFETY: no arguments; returns a constant, never fails.
+    unsafe { forge_sys::llama_supports_mmap() }
+}
+
+/// Whether the platform build supports locking model mappings in RAM
+/// (`llama_supports_mlock`).
+///
+/// A compile-time platform flag (true on Linux), independent of
+/// runtime `mlock` limits.
+pub fn supports_mlock() -> bool {
+    // SAFETY: no arguments; returns a constant, never fails.
+    unsafe { forge_sys::llama_supports_mlock() }
+}
+
+/// Whether upstream reports GPU offload as available
+/// (`llama_supports_gpu_offload`).
+///
+/// True when the backend registry holds a GPU or IGPU device, or RPC
+/// support is compiled in. Self-initializing: upstream loads the
+/// registry on first use, so no `ensure_registry()` call is needed.
+/// [`Model::load_with_options`](crate::model::Model::load_with_options)
+/// refuses GPU layer requests under default device selection while
+/// this is false (explicit error, never silent CPU execution).
+pub fn supports_gpu_offload() -> bool {
+    // SAFETY: no arguments; loads the registry itself when needed.
+    unsafe { forge_sys::llama_supports_gpu_offload() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

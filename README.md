@@ -6,9 +6,11 @@ the middle of `RAMforge → ForgeCore → llama.cpp/ggml → hardware`.
 ForgeCore owns **no compute of its own**: it opens ggml backends,
 manages tensors and graphs, loads `.gguf` models through libllama,
 runs the minimal CPU inference path (`Model` → `Context` → `Batch` →
-`decode` → `Logits` → `sample`), exposes the model's tokenizer, and
-keeps frozen scalar oracles for cross-validation. All execution,
-quantization, and model loading are upstream's job.
+`decode` → `Logits` → `sample`), exposes the model's tokenizer,
+binds model GPU-offload options (CPU by default, explicit errors,
+never silent fallback), and keeps frozen scalar oracles for
+cross-validation. All execution, quantization, and model loading are
+upstream's job.
 
 ## Quickstart
 
@@ -33,6 +35,7 @@ crates/forge-core    safe API: devices, backends, tensors, runtime, models, cont
   tests/cpu_decode.rs  Model → Context → Batch → decode → logits integration test
   tests/tokenizer.rs   Tokenizer encode/decode/vocab integration test
   tests/sampler.rs     SamplerChain over synthetic + real logits integration test
+  tests/offload.rs     model offload options + capability facts integration test
 scripts/             env.sh, setup-native.sh, make-tiny-gguf.py
 docs/                PIVOT.md, NATIVE.md, LICENSING.md, TOOLCHAIN.md, …
 ```
@@ -40,15 +43,19 @@ docs/                PIVOT.md, NATIVE.md, LICENSING.md, TOOLCHAIN.md, …
 Public API at a glance:
 
 ```rust
-use forge_core::{Backend, Context, ContextOptions, Model, SampleConfig, Tensor, TokenId, add, enumerate_devices, matmul};
+use forge_core::{Backend, Context, ContextOptions, GpuLayers, Model, ModelOptions, SampleConfig, Tensor, TokenId, add, enumerate_devices, matmul, supports_gpu_offload};
 
 let devices = enumerate_devices();          // CPU, CUDA, … — whatever is registered
+let gpu_ok = supports_gpu_offload();        // capability fact; no placement policy here
 let backend = Backend::open_cpu()?;         // or Backend::open_device(&devices[i])
 let a = Tensor::from_f32(&backend, &[2, 3], &data)?;
 let sum = add(&a, &a)?;                     // one-node ggml graph, run on the backend
 let prod = matmul(&a, &b)?;                 // C = A·Bᵀ, ggml ne order
 let host: Vec<f32> = sum.to_vec_f32()?;
-let model = Model::load("model.gguf".as_ref())?;
+let model = Model::load("model.gguf".as_ref())?; // CPU unless offload is requested
+let mut opts = ModelOptions::default();
+opts.gpu_layers = GpuLayers::Count(20);     // explicit unsupported error without a GPU
+let gpu_model = Model::load_with_options("model.gguf".as_ref(), &opts)?;
 let mut context = Context::open(&model, &ContextOptions::default())?;
 context.decode(&batch)?;                    // batch of token ids + positions
 let logits: &[f32] = context.logits(last_index)?.values(); // owned n_vocab copy
@@ -70,8 +77,10 @@ let token: TokenId = sampler.sample(logits)?;              // back into Batch/To
 CPU-validated milestone: device discovery, F32 add/matmul execution,
 model loading with metadata, context/batch/decode/logits CPU
 inference path, native tokenizer (encode/decode/vocab), native
-sampler chains (greedy/dist/temp/top-k/top-p/min-p), and explicit
-validation errors — 125 tests green with strict clippy. Out of scope
-here: generation policy/loops, GPU offload, streaming, residency
-control, and RAMforge integration (see `docs/handoff/` reports for
-the phased roadmap state).
+sampler chains (greedy/dist/temp/top-k/top-p/min-p), model
+GPU-offload wiring (layer counts, split modes, device selection,
+tensor splits, mmap/mlock modes, capability facts), and explicit
+validation errors — 150 tests green with strict clippy. Out of scope
+here: generation policy/loops, KV-cache offload, streaming,
+residency control, multi-GPU orchestration, and RAMforge integration
+(see `docs/handoff/` reports for the phased roadmap state).
