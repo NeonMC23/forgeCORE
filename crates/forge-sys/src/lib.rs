@@ -37,6 +37,7 @@ opaque! {
     llama_model,
     llama_vocab,
     llama_context,
+    llama_sampler,
 }
 
 /// `ggml_backend_t` — pointer to an opaque backend instance.
@@ -117,6 +118,10 @@ pub mod token_attr {
 
 /// `LLAMA_TOKEN_NULL` (`llama.h`): sentinel for "no such special token".
 pub const LLAMA_TOKEN_NULL: c_int = -1;
+
+/// `LLAMA_DEFAULT_SEED` (`llama.h`): requests a random RNG seed from
+/// samplers that take a seed.
+pub const LLAMA_DEFAULT_SEED: u32 = 0xFFFF_FFFF;
 
 // ---------------------------------------------------------------------------
 // #[repr(C)] parameter structs (field order matches the upstream headers)
@@ -229,6 +234,38 @@ pub struct llama_context_params {
     pub samplers: *mut c_void,
     pub n_samplers: usize,
     pub ctx_other: *mut llama_context,
+}
+
+/// `struct llama_token_data` (`llama.h`): one sampling candidate.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct llama_token_data {
+    pub id: c_int,
+    pub logit: f32,
+    pub p: f32,
+}
+
+/// `struct llama_token_data_array` (`llama.h`): candidate set a sampler
+/// chain mutates in place (`size` shrinks as filters apply; `selected`
+/// is the chosen *index*, not a token id).
+///
+/// Always built by `forge-core` from an owned `Vec<llama_token_data>`
+/// that outlives the `apply` call; `selected` starts at -1.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct llama_token_data_array {
+    pub data: *mut llama_token_data,
+    pub size: usize,
+    pub selected: i64,
+    pub sorted: bool,
+}
+
+/// `struct llama_sampler_chain_params` (`llama.h`). Construct via
+/// [`llama_sampler_chain_default_params`], never by hand.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct llama_sampler_chain_params {
+    pub no_perf: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +417,32 @@ unsafe extern "C" {
         remove_special: bool,
         unparse_special: bool,
     ) -> c_int;
+
+    // -- llama.h: sampler chains ------------------------------------------
+    //
+    // `forge-core` drives chains exclusively through `apply` over a
+    // caller-built `llama_token_data_array` (mirroring the canonical
+    // flow inside `llama_sampler_sample`); the context-bound
+    // `llama_sampler_sample`, backend samplers, and every sampler
+    // outside greedy/dist/top-k/top-p/min-p/temp are deliberately NOT
+    // bound. Constructors only fail via C++ OOM throw (process abort,
+    // like a Rust allocation failure), never via NULL.
+    pub fn llama_sampler_chain_default_params() -> llama_sampler_chain_params;
+    pub fn llama_sampler_chain_init(params: llama_sampler_chain_params) -> *mut llama_sampler;
+    pub fn llama_sampler_chain_add(chain: *mut llama_sampler, smpl: *mut llama_sampler);
+    pub fn llama_sampler_chain_n(chain: *const llama_sampler) -> c_int;
+    pub fn llama_sampler_chain_remove(chain: *mut llama_sampler, i: c_int) -> *mut llama_sampler;
+    pub fn llama_sampler_init_greedy() -> *mut llama_sampler;
+    pub fn llama_sampler_init_dist(seed: u32) -> *mut llama_sampler;
+    pub fn llama_sampler_init_top_k(k: c_int) -> *mut llama_sampler;
+    pub fn llama_sampler_init_top_p(p: f32, min_keep: usize) -> *mut llama_sampler;
+    pub fn llama_sampler_init_min_p(p: f32, min_keep: usize) -> *mut llama_sampler;
+    pub fn llama_sampler_init_temp(t: f32) -> *mut llama_sampler;
+    pub fn llama_sampler_apply(smpl: *mut llama_sampler, cur_p: *mut llama_token_data_array);
+    pub fn llama_sampler_accept(smpl: *mut llama_sampler, token: c_int);
+    pub fn llama_sampler_reset(smpl: *mut llama_sampler);
+    pub fn llama_sampler_get_seed(smpl: *const llama_sampler) -> u32;
+    pub fn llama_sampler_free(smpl: *mut llama_sampler);
 }
 
 #[cfg(test)]
@@ -475,5 +538,28 @@ mod layout_tests {
         assert_eq!(offset_of!(llama_context_params, samplers), 136);
         assert_eq!(offset_of!(llama_context_params, n_samplers), 144);
         assert_eq!(offset_of!(llama_context_params, ctx_other), 152);
+    }
+
+    #[test]
+    fn llama_token_data_layout() {
+        assert_eq!(size_of::<llama_token_data>(), 12);
+        assert_eq!(offset_of!(llama_token_data, id), 0);
+        assert_eq!(offset_of!(llama_token_data, logit), 4);
+        assert_eq!(offset_of!(llama_token_data, p), 8);
+    }
+
+    #[test]
+    fn llama_token_data_array_layout() {
+        assert_eq!(size_of::<llama_token_data_array>(), 32);
+        assert_eq!(offset_of!(llama_token_data_array, data), 0);
+        assert_eq!(offset_of!(llama_token_data_array, size), 8);
+        assert_eq!(offset_of!(llama_token_data_array, selected), 16);
+        assert_eq!(offset_of!(llama_token_data_array, sorted), 24);
+    }
+
+    #[test]
+    fn llama_sampler_chain_params_layout() {
+        assert_eq!(size_of::<llama_sampler_chain_params>(), 1);
+        assert_eq!(offset_of!(llama_sampler_chain_params, no_perf), 0);
     }
 }

@@ -6,7 +6,8 @@
 //! graphs, [`Model`] loads `.gguf` models through libllama,
 //! [`Tokenizer`] encodes text through the model's vocabulary, and
 //! [`Context`] runs the minimal CPU inference path (`Model` → `Context`
-//! → [`Batch`] → `decode` → [`Logits`]). The only `unsafe` in the crate
+//! → [`Batch`] → `decode` → [`Logits`]), and [`SamplerChain`] samples
+//! token ids from logits. The only `unsafe` in the crate
 //! sits at the documented FFI boundary inside each module; no raw C
 //! pointers appear in any public API.
 //!
@@ -23,6 +24,7 @@ pub mod error;
 pub mod model;
 pub mod reference;
 pub mod runtime;
+pub mod sampler;
 pub mod tensor;
 pub mod tokenizer;
 
@@ -34,5 +36,6 @@ pub use dtype::DType;
 pub use error::{Error, Result};
 pub use model::{Model, ModelOptions};
 pub use runtime::{add, matmul};
+pub use sampler::{SampleConfig, SamplerChain};
 pub use tensor::Tensor;
 pub use tokenizer::{DecodeOptions, EncodeOptions, SpecialTokens, TokenAttr, Tokenizer, VocabType};

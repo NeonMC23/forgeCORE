@@ -61,6 +61,12 @@ impl Error {
     pub fn tokenizer(message: impl Into<String>) -> Self {
         Self(format!("tokenizer error: {}", message.into()))
     }
+
+    /// Sampling failure (invalid configuration, empty candidates,
+    /// chain errors, ...).
+    pub fn sample(message: impl Into<String>) -> Self {
+        Self(format!("sample error: {}", message.into()))
+    }
 }
 
 impl fmt::Display for Error {
@@ -89,5 +95,6 @@ mod tests {
         assert_eq!(Error::decode("x").0, "decode error: x");
         assert_eq!(Error::logits("x").0, "logits error: x");
         assert_eq!(Error::tokenizer("x").0, "tokenizer error: x");
+        assert_eq!(Error::sample("x").0, "sample error: x");
     }
 }
