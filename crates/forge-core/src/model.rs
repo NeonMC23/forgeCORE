@@ -441,6 +441,35 @@ impl Model {
         u32_from_upstream("n_embd", n)
     }
 
+    /// Input embedding width: one row of floats per token in an
+    /// embedding batch (see [`BatchBuilder`](crate::batch::BatchBuilder)).
+    pub fn n_embd_inp(&self) -> Result<u32> {
+        // SAFETY: raw is a live model; pure getter.
+        let n = unsafe { forge_sys::llama_model_n_embd_inp(self.inner.raw) };
+        u32_from_upstream("n_embd_inp", n)
+    }
+
+    /// Output embedding width: one row of floats per
+    /// [`Embeddings`](crate::context::Embeddings) output.
+    pub fn n_embd_out(&self) -> Result<u32> {
+        // SAFETY: raw is a live model; pure getter.
+        let n = unsafe { forge_sys::llama_model_n_embd_out(self.inner.raw) };
+        u32_from_upstream("n_embd_out", n)
+    }
+
+    /// Classifier head width: floats per sequence under RANK pooling.
+    pub fn n_cls_out(&self) -> u32 {
+        // SAFETY: raw is a live model; pure infallible getter.
+        unsafe { forge_sys::llama_model_n_cls_out(self.inner.raw) }
+    }
+
+    /// Whether the model has an encoder (used to resolve the effective
+    /// causal-attention state, which upstream exposes no getter for).
+    pub fn has_encoder(&self) -> bool {
+        // SAFETY: raw is a live model; pure predicate.
+        unsafe { forge_sys::llama_model_has_encoder(self.inner.raw) }
+    }
+
     /// Number of transformer layers.
     pub fn n_layer(&self) -> Result<u32> {
         // SAFETY: raw is a live model; pure getter.

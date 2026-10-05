@@ -67,6 +67,25 @@ impl Error {
     pub fn sample(message: impl Into<String>) -> Self {
         Self(format!("sample error: {}", message.into()))
     }
+
+    /// Embedding output access failure (embeddings disabled, no pooled
+    /// output for the requested token or sequence, ...).
+    pub fn embeddings(message: impl Into<String>) -> Self {
+        Self(format!("embeddings error: {}", message.into()))
+    }
+
+    /// Native memory (KV cache) operation failure (sequence removal
+    /// refused, ...). Validation failures (bad ids, ranges, divisors)
+    /// map to [`Error::invalid`] instead.
+    pub fn memory(message: impl Into<String>) -> Self {
+        Self(format!("memory error: {}", message.into()))
+    }
+
+    /// Context state serialization failure (export/import rejected,
+    /// corrupt, truncated, or mismatched bytes, ...).
+    pub fn state(message: impl Into<String>) -> Self {
+        Self(format!("state error: {}", message.into()))
+    }
 }
 
 impl fmt::Display for Error {
@@ -96,5 +115,8 @@ mod tests {
         assert_eq!(Error::logits("x").0, "logits error: x");
         assert_eq!(Error::tokenizer("x").0, "tokenizer error: x");
         assert_eq!(Error::sample("x").0, "sample error: x");
+        assert_eq!(Error::embeddings("x").0, "embeddings error: x");
+        assert_eq!(Error::memory("x").0, "memory error: x");
+        assert_eq!(Error::state("x").0, "state error: x");
     }
 }

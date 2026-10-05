@@ -37,6 +37,7 @@ opaque! {
     llama_model,
     llama_vocab,
     llama_context,
+    llama_memory_i,
     llama_sampler,
 }
 
@@ -44,6 +45,11 @@ opaque! {
 pub type ggml_backend_t = *mut ggml_backend;
 /// `ggml_backend_dev_t` — pointer to an opaque backend device.
 pub type ggml_backend_dev_t = *mut ggml_backend_dev;
+/// `llama_memory_t` — the context-owned memory object (`llama.h`).
+/// Borrowed from the context via `llama_get_memory`; NULL when the
+/// model architecture has no memory (e.g. BERT encoders). Must never
+/// outlive its context; `forge-core` models this as a borrow.
+pub type llama_memory_t = *mut llama_memory_i;
 
 // ---------------------------------------------------------------------------
 // Constants mirroring upstream enums (plain C enums, i32-compatible)
@@ -134,6 +140,44 @@ pub mod load_mode {
     pub const MMAP: i32 = 1;
     pub const MLOCK: i32 = 2;
     pub const MMAP_MLOCK: i32 = 3;
+}
+
+/// `enum llama_pooling_type` values (`llama.h`).
+pub mod pooling_type {
+    pub const UNSPECIFIED: i32 = -1;
+    pub const NONE: i32 = 0;
+    pub const MEAN: i32 = 1;
+    pub const CLS: i32 = 2;
+    pub const LAST: i32 = 3;
+    pub const RANK: i32 = 4;
+}
+
+/// `enum llama_attention_type` values (`llama.h`).
+pub mod attention_type {
+    pub const UNSPECIFIED: i32 = -1;
+    pub const CAUSAL: i32 = 0;
+    pub const NON_CAUSAL: i32 = 1;
+}
+
+/// `enum llama_flash_attn_type` values (`llama.h`).
+pub mod flash_attn_type {
+    pub const AUTO: i32 = -1;
+    pub const DISABLED: i32 = 0;
+    pub const ENABLED: i32 = 1;
+}
+
+/// `enum llama_rope_type` values (`llama.h`; non-canonical ids alias
+/// the `GGML_ROPE_TYPE_*` defines in `ggml.h`). `forge-core` uses
+/// these only to refuse position shifts on multi-position models
+/// (`MROPE`/`IMROPE` carry 4 positions per embedding and upstream
+/// aborts shifts there).
+pub mod rope_type {
+    pub const NONE: i32 = -1;
+    pub const NORM: i32 = 0;
+    pub const NEOX: i32 = 2;
+    pub const MROPE: i32 = 8;
+    pub const VISION: i32 = 24;
+    pub const IMROPE: i32 = 40;
 }
 
 /// `LLAMA_TOKEN_NULL` (`llama.h`): sentinel for "no such special token".
@@ -394,12 +438,118 @@ unsafe extern "C" {
     pub fn llama_free(ctx: *mut llama_context);
     pub fn llama_decode(ctx: *mut llama_context, batch: llama_batch) -> c_int;
     pub fn llama_get_logits_ith(ctx: *mut llama_context, i: c_int) -> *mut f32;
+    // Actual context sizing (`llama.h`): upstream resolves/pads the
+    // requested values at init (e.g. `n_ctx` pads up to a multiple of
+    // 256), so `forge-core` queries these after `open` instead of
+    // trusting the request. Pure getters off a live context.
+    pub fn llama_n_ctx(ctx: *const llama_context) -> u32;
+    pub fn llama_n_ctx_seq(ctx: *const llama_context) -> u32;
+    pub fn llama_n_batch(ctx: *const llama_context) -> u32;
+    pub fn llama_n_ubatch(ctx: *const llama_context) -> u32;
+    pub fn llama_n_seq_max(ctx: *const llama_context) -> u32;
+    // Resolved pooling type (`llama.h`): `UNSPECIFIED` becomes the
+    // model default (or `NONE`) at init. Pure getter off a live
+    // context; `forge-core` maps it back to `PoolingType`.
+    pub fn llama_pooling_type(ctx: *const llama_context) -> c_int;
+    // Post-open controls (`llama.h`): plain field updates, infallible.
+    // Thread counts are consumed verbatim at compute time (0/negative
+    // have no defined meaning), so `forge-core` validates `>= 1`.
+    pub fn llama_set_n_threads(ctx: *mut llama_context, n_threads: c_int, n_threads_batch: c_int);
+    pub fn llama_set_causal_attn(ctx: *mut llama_context, causal_attn: bool);
+    // Wait for in-flight work and fold evaluation stats (`llama.h`).
+    // Safe to call any time, including before any decode.
+    pub fn llama_synchronize(ctx: *mut llama_context);
+    // Embedding output rows (`llama.h`): same failure contract as
+    // `llama_get_logits_ith` (NULL for invalid ids in release builds).
+    // `_ith` rows hold `n_embd_out` floats; `_seq` rows hold
+    // `n_embd_out` floats, or `n_cls_out` under RANK pooling, and are
+    // NULL when pooling is NONE or the sequence has no pooled output.
+    pub fn llama_get_embeddings_ith(ctx: *mut llama_context, i: c_int) -> *mut f32;
+    pub fn llama_get_embeddings_seq(ctx: *mut llama_context, seq_id: c_int) -> *mut f32;
+    // Context memory object (`llama.h`): borrowed handle, NULL when
+    // the model has no memory (BERT-family encoders). Pure getter.
+    pub fn llama_get_memory(ctx: *const llama_context) -> llama_memory_t;
+    // Maximum parallel sequence id space (`llama-cparams.h`): returns
+    // `LLAMA_MAX_SEQ` (256), the seq-id bound for unified-KV caches.
+    pub fn llama_max_parallel_sequences() -> usize;
+    // Memory sequence ops (`llama.h`): the C wrappers null-check the
+    // handle but hold NO try/catch, and the implementations assert on
+    // out-of-range sequence ids (unconditional abort — verified by
+    // probe), on partial cross-stream copies, and on shifts for
+    // multi-position (MROPE/IMROPE) models; `seq_div` with `d == 0`
+    // divides by zero (verified SIGFPE). `forge-core` validates every
+    // precondition. `seq_rm` alone reports failure (`false`) instead
+    // of aborting. `seq_pos_min/max` return -1 for empty sequences.
+    pub fn llama_memory_clear(mem: llama_memory_t, data: bool);
+    pub fn llama_memory_seq_rm(mem: llama_memory_t, seq_id: c_int, p0: c_int, p1: c_int) -> bool;
+    pub fn llama_memory_seq_cp(
+        mem: llama_memory_t,
+        seq_id_src: c_int,
+        seq_id_dst: c_int,
+        p0: c_int,
+        p1: c_int,
+    );
+    pub fn llama_memory_seq_keep(mem: llama_memory_t, seq_id: c_int);
+    pub fn llama_memory_seq_add(
+        mem: llama_memory_t,
+        seq_id: c_int,
+        p0: c_int,
+        p1: c_int,
+        delta: c_int,
+    );
+    pub fn llama_memory_seq_div(mem: llama_memory_t, seq_id: c_int, p0: c_int, p1: c_int, d: c_int);
+    pub fn llama_memory_seq_pos_min(mem: llama_memory_t, seq_id: c_int) -> c_int;
+    pub fn llama_memory_seq_pos_max(mem: llama_memory_t, seq_id: c_int) -> c_int;
+    pub fn llama_memory_can_shift(mem: llama_memory_t) -> bool;
+    // Whole/sequence state serialization (`llama.h`): byte-oriented
+    // only (`forge-core` binds no file or `_ext` variants). The
+    // implementations catch `std::exception` internally and return 0
+    // on any failure (small destination, truncated/corrupt input,
+    // architecture or dtype mismatch), so 0 always means failure and
+    // the reported byte count always means success. `get_data` writes
+    // at most `size` bytes (overrun throws internally, never
+    // overflows); `set_data` reads at most `size` bytes. Both
+    // synchronize first. State holds the model-arch tag plus live KV
+    // cells — no logits, no embeddings (verified by probe).
+    pub fn llama_state_get_size(ctx: *mut llama_context) -> usize;
+    pub fn llama_state_get_data(ctx: *mut llama_context, dst: *mut u8, size: usize) -> usize;
+    pub fn llama_state_set_data(ctx: *mut llama_context, src: *const u8, size: usize) -> usize;
+    pub fn llama_state_seq_get_size(ctx: *mut llama_context, seq_id: c_int) -> usize;
+    pub fn llama_state_seq_get_data(
+        ctx: *mut llama_context,
+        dst: *mut u8,
+        size: usize,
+        seq_id: c_int,
+    ) -> usize;
+    pub fn llama_state_seq_set_data(
+        ctx: *mut llama_context,
+        src: *const u8,
+        size: usize,
+        seq_id: c_int,
+    ) -> usize;
 
     // -- llama.h: model metadata --------------------------------------------
     pub fn llama_model_desc(model: *const llama_model, buf: *mut c_char, buf_size: usize) -> c_int;
     pub fn llama_model_size(model: *const llama_model) -> u64;
     pub fn llama_model_n_ctx_train(model: *const llama_model) -> c_int;
     pub fn llama_model_n_embd(model: *const llama_model) -> c_int;
+    // Embedding widths (`llama.h`): input width sizes `llama_batch.embd`
+    // rows, output width sizes `llama_get_embeddings_*` rows. Pure
+    // getters off a live model; non-negative in practice, checked by
+    // `forge-core` like the other dimension getters.
+    pub fn llama_model_n_embd_inp(model: *const llama_model) -> c_int;
+    pub fn llama_model_n_embd_out(model: *const llama_model) -> c_int;
+    // Classifier head width for RANK-pooled sequence embeddings.
+    // `uint32_t`, infallible on a live model.
+    pub fn llama_model_n_cls_out(model: *const llama_model) -> u32;
+    // Whether the model has an encoder (`llama.h`). Pure predicate off
+    // a live model; `forge-core` uses it to resolve the effective
+    // causal-attention state (which has no direct getter).
+    pub fn llama_model_has_encoder(model: *const llama_model) -> bool;
+    // RoPE family (`llama.h`): pure function of the model weights.
+    // `forge-core` maps it through `rope_type` to refuse position
+    // shifts on MROPE/IMROPE models (upstream aborts there).
+    pub fn llama_model_rope_type(model: *const llama_model) -> c_int;
     pub fn llama_model_n_layer(model: *const llama_model) -> c_int;
     pub fn llama_model_n_head(model: *const llama_model) -> c_int;
     pub fn llama_model_n_head_kv(model: *const llama_model) -> c_int;

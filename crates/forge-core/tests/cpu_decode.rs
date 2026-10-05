@@ -66,13 +66,15 @@ fn tiny_model_load_with_check_tensors() {
 fn tiny_context_opens_with_defaults_and_explicit() {
     let Some(model) = load_fixture() else { return };
     let context = Context::open(&model, &ContextOptions::default()).expect("default context");
-    assert_eq!(context.n_ctx(), 64, "n_ctx resolves to n_ctx_train");
+    // n_ctx resolves to n_ctx_train (64), then upstream pads the
+    // effective length up to a multiple of 256: 256, not 64.
+    assert_eq!(context.n_ctx(), 256, "n_ctx is the effective length");
     assert_eq!(context.n_vocab(), 32);
 
     let mut explicit = ContextOptions::default();
     explicit.n_ctx = 32;
     let context = Context::open(&model, &explicit).expect("explicit context");
-    assert_eq!(context.n_ctx(), 32);
+    assert_eq!(context.n_ctx(), 256, "explicit n_ctx is padded too");
 }
 
 #[test]

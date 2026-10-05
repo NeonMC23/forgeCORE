@@ -21,6 +21,7 @@ pub mod context;
 pub mod device;
 pub mod dtype;
 pub mod error;
+pub mod memory;
 pub mod model;
 pub mod reference;
 pub mod runtime;
@@ -29,14 +30,17 @@ pub mod tensor;
 pub mod tokenizer;
 
 pub use backend::Backend;
-pub use batch::{Batch, BatchBuilder, TokenId};
-pub use context::{Context, ContextOptions, Logits};
+pub use batch::{Batch, BatchBuilder, SeqId, TokenId};
+pub use context::{
+    AttentionType, Context, ContextOptions, Embeddings, FlashAttnType, Logits, PoolingType,
+};
 pub use device::{
     enumerate_devices, max_devices, supports_gpu_offload, supports_mlock, supports_mmap,
     DeviceInfo, DeviceType,
 };
 pub use dtype::DType;
 pub use error::{Error, Result};
+pub use memory::{Memory, SeqState, State};
 pub use model::{GpuLayers, Model, ModelLoadMode, ModelOptions, SplitMode};
 pub use runtime::{add, matmul};
 pub use sampler::{SampleConfig, SamplerChain};
