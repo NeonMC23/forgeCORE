@@ -115,6 +115,22 @@ PYTHONPATH="$FORGE_LLAMA_DIR/py" python3 scripts/make-tiny-gguf.py --tok \
 FORGE_TEST_MODEL_TOK="$FORGE_LLAMA_DIR/models/tiny-tok.gguf" cargo test -p forge-core --test tokenizer
 ```
 
+## DSV4 fixture (optional)
+
+The `tests/kv_state.rs` DeepSeek-V4 regression tests need a third
+fixture: a minimal loadable `deepseek4`-architecture model (2 layers,
+compress ratios 4/128, 2 experts, seed 9) exercising the native
+`llama_kv_cache_dsv4` memory class, which asserts `seq < n_seq_max`
+even when unified. Generate it with the same script in `--dsv4` mode:
+
+```sh
+. scripts/env.sh
+mkdir -p "$FORGE_LLAMA_DIR/models"
+PYTHONPATH="$FORGE_LLAMA_DIR/py" python3 scripts/make-tiny-gguf.py --dsv4 \
+    "$FORGE_LLAMA_DIR/models/tiny-dsv4.gguf"
+FORGE_TEST_MODEL_DSV4="$FORGE_LLAMA_DIR/models/tiny-dsv4.gguf" cargo test -p forge-core --test kv_state dsv4
+```
+
 ## Troubleshooting
 
 - `forge-sys: libggml.so not found …`: run `setup-native.sh` first, or

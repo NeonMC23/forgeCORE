@@ -24,17 +24,18 @@
 //! * [`Memory::keep_seq`] and sequence-state restore additionally
 //!   require `seq < n_seq_max` even on unified caches: the DSV4 cache
 //!   asserts that tighter bound (and the recurrent cache does once
-//!   rollback snapshots are enabled). ForgeCore cannot detect which
-//!   implementation backs a context — no such getter exists at the
-//!   pin — so the tighter bound applies uniformly.
-//!
-//! One residual cannot be validated away: on DeepSeek-V4-architecture
-//! models with unified KV, `remove_range`/`copy_seq` with
-//! `seq >= n_seq_max` abort inside the compressed-state helpers. The
-//! general bound stays 256 there because every other implementation
-//! handles those ids safely and refusing them would strand
-//! legitimately decoded sequences; RAMforge's slot discipline (`seq <
-//! n_seq_max`) never reaches the residual. See the P5 report.
+//!   rollback snapshots are enabled). That pair applies uniformly
+//!   because no per-operation implementation getter exists at the pin.
+//! * On DeepSeek-V4-architecture models the *whole* general bound
+//!   collapses to `n_seq_max`, unified or not: the DSV4 memory class
+//!   forces per-sequence inner streams (`unified_compressed = false`,
+//!   hardcoded) and asserts `seq < n_seq_max` in `seq_rm`,
+//!   `seq_cp`, `seq_keep`, shifts, state export, and state restore
+//!   (verified SIGABRT each). ForgeCore detects the architecture via
+//!   the `general.architecture` GGUF metadata (`"deepseek4"` routes to
+//!   the DSV4 class in the native factory — the only such site at the
+//!   pin), so every other implementation keeps the relaxed unified
+//!   bound. See the P5 report.
 //!
 //! Position shifts ([`Memory::shift_positions`]) are refused on
 //! multi-position (MROPE/IMROPE) models — upstream aborts there — and
@@ -66,13 +67,14 @@ const MAX_SHIFT: i32 = (1 << 30) - 1;
 ///
 /// Created by [`Context::memory`](crate::context::Context::memory);
 /// carries the validation facts (`n_seq_max`, unified mode and bound,
-/// shift support) cached at context creation so every operation can be
-/// checked before reaching native code.
+/// DeepSeek-V4 detection, shift support) cached at context creation so
+/// every operation can be checked before reaching native code.
 pub struct Memory<'a> {
     raw: forge_sys::llama_memory_t,
     n_seq_max: u32,
     unified_limit: u32,
     kv_unified: bool,
+    dsv4_memory: bool,
     shift_allowed: bool,
     // Exclusive borrow of the owning context: the native object stays
     // alive exactly while this handle does, and no decode or state op
@@ -86,6 +88,7 @@ impl<'a> Memory<'a> {
         n_seq_max: u32,
         unified_limit: u32,
         kv_unified: bool,
+        dsv4_memory: bool,
         shift_allowed: bool,
     ) -> Self {
         Self {
@@ -93,6 +96,7 @@ impl<'a> Memory<'a> {
             n_seq_max,
             unified_limit,
             kv_unified,
+            dsv4_memory,
             shift_allowed,
             _borrow: PhantomData,
         }
@@ -101,11 +105,13 @@ impl<'a> Memory<'a> {
     /// Exclusive upper bound for sequence ids on the general
     /// operations (`remove_range`, `copy_seq`, shifts, position
     /// queries, sequence-state export): `n_seq_max` on split caches,
-    /// the native parallel-sequence limit on unified caches.
+    /// the native parallel-sequence limit on unified caches — except
+    /// on DeepSeek-V4 models, where the DSV4 memory class asserts `seq
+    /// < n_seq_max` even when unified, so the bound stays `n_seq_max`.
     /// [`Memory::keep_seq`] and sequence-state restore accept only
     /// `n_seq_max` (see the module docs).
     pub fn seq_limit(&self) -> u32 {
-        if self.kv_unified {
+        if self.kv_unified && !self.dsv4_memory {
             self.unified_limit
         } else {
             self.n_seq_max

@@ -135,8 +135,10 @@ fake more certainty than exists.
 
 `forge-sys`: opaque `llama_memory_i` + `llama_memory_t` alias,
 `rope_type` consts (NONE −1, NORM 0, NEOX 2, MROPE 8, VISION 24,
-IMROPE 40 — probed values), and 18 functions: `llama_get_memory`,
-`llama_max_parallel_sequences`, `llama_model_rope_type`, all 9
+IMROPE 40 — probed values), and 19 functions: `llama_get_memory`,
+`llama_max_parallel_sequences`, `llama_model_rope_type`,
+`llama_model_meta_val_str` (corrective pass §18: reads
+`general.architecture` to detect DeepSeek-V4), all 9
 `llama_memory_*` ops, and the 6 byte-oriented state functions. Each
 carries a doc comment with its verified contract. The existing
 `llama_context_params` TerZGyr already declared `type_k`/`type_v`
@@ -202,10 +204,12 @@ inverted ranges, restores with trailing bytes. Proven by probe:
 unified `seq_rm(300)` SIGABRT, `d = 0` SIGFPE, partial cross-stream
 copy SIGABRT — all unreachable through the API. Residuals: (1) DSV4
 arch + unified + `seq >= n_seq_max` + rm/cp aborts in
-compressed-state helpers — undetectable at the pin (no impl getter),
-documented on the methods and here; refusing it would strand
-legitimately decoded sequences on the other eight implementations,
-and slot-disciplined callers (`seq < n_seq_max`) never reach it.
+compressed-state helpers — ELIMINATED by the corrective pass (§18):
+the architecture is detectable after all
+(`general.architecture == "deepseek4"` routes to the DSV4 class in
+the native factory, the only such site at the pin), so ForgeCore now
+refuses those ids pre-FFI on DSV4 while every other implementation
+keeps the relaxed unified bound.
 (2) OOM-class `bad_alloc` across the C ABI (same class as P2's
 sampler analysis). (3) SWA-family ghosts (evicted base history) do
 not shift when the window reports empty — a documented semantic, not
@@ -215,7 +219,9 @@ executes).
 ## 10. Tests
 
 +2 unit (`MAX_SHIFT` pin, snapshot accessor roundtrip) and +37
-integration in new `tests/kv_state.rs`: handle/limits (2),
+integration in new `tests/kv_state.rs` (44 after the §18 corrective
+pass: +7 DSV4-unified strict-bound regressions, gated on the new
+`FORGE_TEST_MODEL_DSV4` fixture): handle/limits (2),
 pos queries (1), seq-id refusal incl. tight bound (2), clear (2),
 rm/cp/keep (6), range validation (2), shifts/scales (7), repeated
 ops (1), state size/roundtrip/cross-context/corruption/truncation
@@ -230,9 +236,10 @@ three-line null/flag checks over audited semantics.
 
 ## 11. CPU validation
 
-Full suite on the CPU-only build: **232 green in debug and 232 in
-release** (86 lib + 37 kv_state + 31 + 9 + 9 + 21 + 5 + 13 + 14 + 7;
-was 193/193). Pre-fixture SKIP path green (232 pass, 37/37 SKIP in
+Full suite on the CPU-only build: **239 green in debug and 239 in
+release** (86 lib + 44 kv_state + 31 + 9 + 9 + 21 + 5 + 13 + 14 + 7;
+was 193/193, then 232/232 before the §18 corrective pass).
+Pre-fixture SKIP path green (239 pass, 44/44 SKIP in
 the new suite). `cargo fmt --all --check`, `cargo check --workspace
 --all-targets`, `cargo clippy --workspace --all-targets
 --all-features -- -D warnings`, and `RUSTDOCFLAGS="-D warnings"
@@ -258,7 +265,13 @@ implementation; untouched.
   used methods) is signature- and behavior-identical; P5 is purely
   additive (two defaulted option fields whose F16 values equal the
   native defaults, plus new items). Default-option opens execute the
-  same native calls as P4.
+  same native calls as P4. The §18 corrective pass re-verified this
+  read-only: no public signature changed (only validation bodies, a
+  private field, and a `pub(crate)` parameter), RAMforge uses only
+  `BatchBuilder/Context/ContextOptions/Model`, never enables unified
+  KV, and non-DSV4 behavior is bit-identical — the stricter bound
+  only bites DSV4-unified ids `>= n_seq_max`, which RAMforge's slot
+  discipline never emits.
 - **B (P5 fills, for future RAMforge use):** native clear/rm/cp/keep/
   shift/scale/pos-bounds for session prefix management through the
   adapter (replacing manual position bookkeeping); whole + per-seq
@@ -283,8 +296,9 @@ implementation; untouched.
 ## 14. Known limitations
 
 1. **GPU execution unvalidated** (environmental) — §12.
-2. **DSV4-unified-highseq abort residual** (§9.1) — undetectable,
-   documented, unreachable under slot discipline.
+2. **DSV4-unified-highseq abort residual** (§9.1) — RESOLVED by
+   the §18 corrective pass (pre-FFI rejection proven by regression;
+   negative control: the test aborts without the fix).
 3. **`memory() == None` and MROPE-refusal paths untested** (no
    BERT/MROPE fixtures craftable from the tiny generator) — §10.
 4. **Causal heuristic, decode-throw-on-OOM, `n_seq_max > 256`
@@ -312,30 +326,35 @@ recorded in rustdoc or here.
 
 With `scripts/env.sh` sourced and
 `FORGE_TEST_MODEL=$FORGE_LLAMA_DIR/models/tiny-llama.gguf`,
-`FORGE_TEST_MODEL_TOK=$FORGE_LLAMA_DIR/models/tiny-tok.gguf`:
+`FORGE_TEST_MODEL_TOK=$FORGE_LLAMA_DIR/models/tiny-tok.gguf`,
+`FORGE_TEST_MODEL_DSV4=$FORGE_LLAMA_DIR/models/tiny-dsv4.gguf`
+(`--dsv4` mode of `scripts/make-tiny-gguf.py`, seed 9):
 
 - `cargo fmt --all --check` → clean.
 - `cargo check --workspace --all-targets` → clean.
-- `cargo test --workspace` → 232 green (86 + 37 + 31 + 9 + 9 + 21 +
+- `cargo test --workspace` → 239 green (86 + 44 + 31 + 9 + 9 + 21 +
   5 + 13 + 14 + 7).
-- `cargo test --workspace --release` → 232 green (same split).
+- `cargo test --workspace --release` → 239 green (same split).
 - `cargo clippy --workspace --all-targets --all-features -- -D
   warnings` → clean.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` →
   clean.
-- Fixture-less `cargo test --workspace` → 232 pass (37/37 SKIP in
+- Fixture-less `cargo test --workspace` → 239 pass (44/44 SKIP in
   `kv_state`, verified via `--nocapture`).
 - Native probes: `p5-values-probe` exit 0 (all facts as in §3);
   `p5-abort-probe`: `seqrm300` → 134, `seqdiv0` → 136,
   `seqcp-partial` → 134, `seqrm-split` → survived `r=1`,
-  `corrupt-struct` → clean 0s.
+  `corrupt-struct` → clean 0s; §18 `probe_dsv4` matrix: rm/cp/keep/
+  simport abort at both geometries, add/div/sexport/decode abort
+  past `n_seq_max` 1 (see §18 table).
 - `/home/user/` contains only `RAMforge/` + `forgeCORE/`; no
   `target/`, caches, fixtures, or probe artifacts in the workspace
   (all under `/var/tmp`, outside the snapshot).
 
 ## 17. Final verdict
 
-**Verdict: COMPLETE WITH LIMITATIONS**
+**Verdict: COMPLETE WITH LIMITATIONS** (residual-free after §18:
+the §9.1 abort is eliminated, not merely documented)
 
 Implemented: borrowed `Memory` handle with clear/rm/cp/keep/shift/
 scale/pos-bounds/can_shift, owned `State`/`SeqState` snapshots with
@@ -347,8 +366,166 @@ getters (none exist natively), `swa_full`, `n_rs_seq`.
 Deferred to later forgeCORE phases: device-buffer state (P6),
 allocated/resident reporting (needs upstream C API or P6 buffer
 introspection), observability (P7). RAMforge-owned: everything in
-§13-C. Limitations: environmental GPU gap (§12), one documented
-native abort residual (§9.1), two untestable-but-audited paths
-(§10). Recommended next forgeCORE phase: **P6 ggml execution
-surface** (buffer introspection would additionally let a future
-pass ground the allocated/resident facts P5 had to leave unknown).
+§13-C. Limitations: environmental GPU gap (§12), two
+untestable-but-audited paths (§10); the §9.1 abort residual is
+eliminated by §18. Recommended next forgeCORE phase: **P6 ggml
+execution surface** (buffer introspection would additionally let a
+future pass ground the allocated/resident facts P5 had to leave
+unknown).
+
+## 18. Corrective pass: DSV4/unified strict sequence bound
+
+### 18.1 Pin re-verification
+
+`/var/tmp` was wiped between sessions, so the toolchain, native
+tree, fixtures, and probes were rebuilt from the workspace scripts
+(`rustup` with exported `CARGO_HOME`/`RUSTUP_HOME`, CMake 4.1.2,
+`setup-native.sh`, `make-tiny-gguf.py`). The rebuilt checkout
+re-verifies to `7fe450e19305b828c199d602c23a8337aaa1f03b`
+(`git describe` → `v0.5.0`): the same pin as P0–P5, so every
+P0–P5 audit conclusion still stands and the audit below targets the
+identical source.
+
+### 18.2 Corrected native invariant
+
+The §9.1 residual theory ("unified DSV4 compresses with
+`n_stream = 1`") was wrong. The DSV4 constructor
+(`llama-kv-cache-dsv4.cpp:1210`) takes the public `unified` flag and
+**ignores it**:
+
+```cpp
+GGML_UNUSED(unified);
+// Keep DSV4 KV/state streams per sequence even when public KV mode is unified.
+const bool unified_raw = false;
+...
+const bool unified_compressed = false;
+```
+
+All four inner caches (`kv_raw` iswa, `kv_csa`, `kv_hca`, `kv_lid`)
+and all three compressor states are built with `unified = false`,
+so every inner `n_stream` equals `n_seq_max` — always. The exact,
+state-derivable invariant is therefore uniform and simple:
+
+> **On `llama_kv_cache_dsv4`, every per-sequence entry point
+> requires `seq < n_seq_max`, unified or not.**
+
+Verified assert/throw sites at the pin (all reached with
+caller-controlled ids, none guarded by a wider check first):
+
+| Entry | Site | Mechanism (`seq >= n_seq_max`) |
+|---|---|---|
+| `seq_rm` full-tail | `clear_compressed`, dsv4:1734 | `GGML_ASSERT(seq < n_seq_max)` → SIGABRT |
+| `seq_rm` partial (`p0 > 0`) | dsv4:1463 | returns `false` (safe; maps to `Error::memory`) |
+| `seq_cp` | `comp_state::seq_cp`, dsv4:1026–1027 | `GGML_ASSERT(seq < n_stream == n_seq_max)` → SIGABRT |
+| `seq_keep` | dsv4:1530 | `GGML_ASSERT(seq < n_seq_max)` → SIGABRT |
+| `seq_add`/`seq_div` | inner cache, kv-cache:576/627 | `GGML_ASSERT(seq < seq_to_stream.size())` → SIGABRT past `n_seq_max` 1 (at `n_seq_max` 1 the inner map stays 256 wide and the op silently aliases stream 0) |
+| `seq_pos_min`/`seq_pos_max` | dsv4:1555/1563 | guarded: return −1 (safe) |
+| seq export | inner `seq_pos_max`, kv-cache:678 via dsv4:1608 | SIGABRT past `n_seq_max` 1 (at 1, the later `rs_idx` throw is caught by `state_seq_get_data`'s handler → size 0) |
+| seq restore | `clear_compressed`, dsv4:1734 via dsv4:1656 | SIGABRT (asserts are uncatchable) |
+| decode | `dsv4_stream_offset`, dsv4:51 via the context ctor | `throw runtime_error` uncaught through `llama_decode` → terminate past `n_seq_max` 1 (at 1, `n_stream <= 1` skips the throw and the batch silently aliases stream 0) |
+
+Whole-state export/import (`seq = -1`) never touches a per-stream
+index and is safe on every geometry. The public C wrappers
+(`llama_memory_seq_*`, `llama_state_seq_*`, `llama_decode`) add no
+sequence validation (null checks and the state try/catch only), so
+all of the above must be pre-validated in ForgeCore.
+
+No per-implementation native getter exists at the pin
+(`llama_memory_is_unified` and friends are absent from the headers
+and sources), but the implementation *is* exactly derivable: the
+`general.architecture` GGUF string maps to `LLM_ARCH_DEEPSEEK4`
+(`llama-arch.cpp:83`; unknown strings fail the load, so a loaded
+model always carries a recognized one), and the memory factory
+constructs `llama_kv_cache_dsv4` at exactly one site
+(`llama-model.cpp:2491`, inside `case LLM_ARCH_DEEPSEEK4`, non-MTP
+branch). ForgeCore never sets `ctx_type`, so the non-MTP branch
+always applies: **`general.architecture == "deepseek4"` ⟺ DSV4
+memory**, with no approximation and no fake limit.
+
+### 18.3 Deterministic repro
+
+`scripts/make-tiny-gguf.py --dsv4` (seed 9) fabricates a minimal
+loadable DeepSeek-V4 GGUF: 2 layers (compress ratios 4 + 128, so
+every compressor cache owns a layer), 2 experts / 1 shared,
+hyper-connection mult 4 (native asserts `hc == 4`), indexer head 64
+(only the indexer cache takes the forced Hadamard path, and 64 rows
+always divide its `nrot` 64). Geometry lessons (all verified
+crashes, not guesses): a layer-less forced-rotation cache divides
+by zero (`build_input_k_rot`), `hc != 4` aborts the graph, indexer
+head `< n_rot` aborts the compressor build, and Hadamard inputs
+whose element count is not a multiple of 64 abort the reshape.
+
+`probe_dsv4` (throwaway C probe under `/var/tmp`, one op per
+process, SIGFPE/SIGABRT/SIGSEGV backtrace handler) drives
+`SeqId(5)` on a unified `n_seq_max = 1` context, then repeats at
+`n_seq_max = 4`:
+
+| Op (seq 5, unified) | `n_seq_max` 1 | `n_seq_max` 4 |
+|---|---|---|
+| `rm` / `cp` / `keep` | SIGABRT | SIGABRT |
+| `add` / `div` | silent stream-0 alias | SIGABRT |
+| `pos_min` / `pos_max` | −1 (guarded) | −1 (guarded) |
+| seq export size+data | 0 (throw caught) | SIGABRT |
+| seq restore | SIGABRT | SIGABRT |
+| decode | success (aliases stream 0!) | SIGABRT (uncaught throw) |
+
+Valid-id controls all succeed at both geometries (`rm0`, `cp00`,
+`decode0`, `can_shift = 0`). The `n_seq_max = 1` silent-aliasing
+rows (shift/div/decode touching stream 0 on behalf of seq 5) are
+arguably worse than the aborts: no error, wrong cache.
+
+### 18.4 Fix (safe API, additive validation only)
+
+`Context::open` reads `general.architecture` once via the new
+`llama_model_meta_val_str` binding and caches `dsv4_memory: bool`
+(exact-match only; anything else keeps prior behavior
+bit-for-bit). The flag collapses every general sequence bound to
+`n_seq_max` on DSV4:
+
+- `Memory::seq_limit()` → `n_seq_max` (covers `remove_range`,
+  `copy_seq`, shifts, scales, position queries);
+- `check_state_seq` (export side) → `n_seq_max` (`keep_seq` and
+  restore already used it);
+- `decode` applies the `n_seq_max` check even when unified.
+
+No public signature changed (validation bodies, one private field,
+one `pub(crate)` parameter); no global unified disable; no API
+removal; no caller `unsafe`. Non-DSV4 paths execute byte-identical
+logic (proven by the unchanged legacy suites in §18.6).
+
+### 18.5 Regression tests
+
++7 integration tests in `tests/kv_state.rs`, gated on the new
+`FORGE_TEST_MODEL_DSV4` fixture (SKIP without it): strict limit
+reported on unified DSV4 (`seq_limit() == 1`, `can_shift() ==
+false`); all eight memory ops refuse seq 1 and 5 (the exact prior
+abort cases); valid seq-0 decode/query/shift/surgery succeeds;
+state export/import refuse 5 and roundtrip 0; decode refuses 5 and
+accepts 0; split DSV4 matches; and a unified `n_seq_max = 4`
+context proves the boundary is exactly `n_seq_max` (seq 3 works
+everywhere, seq 5 refuses everywhere). Negative control: with the
+`seq_limit` gate temporarily reverted, the memory-ops test dies
+with SIGABRT; with the fix, it passes — the suite genuinely guards
+the residual.
+
+### 18.6 Validation
+
+239/239 debug and release (86 + 44 + 31 + 9 + 9 + 21 + 5 + 13 + 14 +
+7); `fmt --check`, `check --workspace --all-targets`, `clippy
+--workspace --all-targets --all-features -- -D warnings`, and
+`RUSTDOCFLAGS="-D warnings" cargo doc` all clean; fixture-less run
+239 pass with 44/44 SKIP in `kv_state`. §16 commands re-run for
+this pass. RAMforge V4.1.0 re-audited read-only after the fix
+(§13-A): untouched, and the stricter bound only bites ids
+RAMforge's slot discipline never emits. `/home/user/` holds only
+`RAMforge/` + `forgeCORE/`; no `target/`, fixtures, or probe
+artifacts in the workspace.
+
+### 18.7 Limitations delta and no-P6 statement
+
+§14 item 2 is resolved and struck. Everything else in §14 stands
+(GPU environment, two untestable-but-audited paths, P4 carryovers).
+This pass adds no P6 surface (no ggml execution, no buffer
+introspection, no device state) and no RAMforge changes; the DSV4
+fixture generator mode and `FORGE_TEST_MODEL_DSV4` are test-only
+scaffolding under the existing `/var/tmp` discipline.

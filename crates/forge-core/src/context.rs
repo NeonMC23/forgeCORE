@@ -21,7 +21,9 @@
 //! `n_batch` (upstream aborts), batches larger than the effective
 //! `n_ubatch` under non-causal attention (upstream aborts), and
 //! sequence ids outside the effective `n_seq_max` (unless unified KV
-//! defers sequence validation to upstream). Token ranges,
+//! defers sequence validation to upstream — except on DeepSeek-V4,
+//! whose memory keeps per-sequence streams even when unified, so the
+//! `n_seq_max` bound holds there too). Token ranges,
 //! position consecutiveness, and KV capacity stay upstream's domain and
 //! map to [`Error::decode`] — nothing is hidden or retried.
 //!
@@ -33,7 +35,7 @@ use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::memory::{Memory, SeqState, State};
 use crate::model::{Model, ModelInner};
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int};
 use std::rc::Rc;
 
 /// Pooled-embedding mode (upstream `llama_pooling_type`).
@@ -321,6 +323,12 @@ pub struct Context {
     causal_attn: bool,
     pooling: PoolingType,
     kv_unified: bool,
+    // DeepSeek-V4 memory detection (read once at `open` from the
+    // `general.architecture` metadata): the DSV4 memory class forces
+    // per-sequence inner streams even when unified and asserts `seq <
+    // n_seq_max` on every sequence op, so the unified relaxation of
+    // sequence-id validation never applies to it.
+    dsv4_memory: bool,
     n_embd_out: u32,
     n_cls_out: u32,
     // Native parallel-sequence limit (unified seq-id bound) and
@@ -410,6 +418,26 @@ impl Context {
             let rope = forge_sys::llama_model_rope_type(model.raw());
             let shift_allowed =
                 rope != forge_sys::rope_type::MROPE && rope != forge_sys::rope_type::IMROPE;
+            // DeepSeek-V4 detection: `general.architecture ==
+            // "deepseek4"` routes to the DSV4 memory class in the
+            // native factory (the only such construction site at the
+            // pin), and ForgeCore never sets `ctx_type`, so the
+            // non-MTP branch always applies. A loaded model always
+            // carries a recognized architecture string (the loader
+            // throws otherwise), so only an exact match enables the
+            // strict bound; anything else keeps the relaxed unified
+            // behavior bit-for-bit.
+            let dsv4_memory = {
+                let mut buf = [0u8; 64];
+                let len = forge_sys::llama_model_meta_val_str(
+                    model.raw(),
+                    c"general.architecture".as_ptr(),
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len(),
+                );
+                let n = usize::try_from(len).unwrap_or(0);
+                n == b"deepseek4".len() && buf.get(..n) == Some(b"deepseek4".as_slice())
+            };
             let n_vocab = model.vocab_size()?;
             let n_embd_out = model.n_embd_out()?;
             let n_cls_out = model.n_cls_out();
@@ -439,6 +467,7 @@ impl Context {
                 causal_attn,
                 pooling,
                 kv_unified: options.kv_unified,
+                dsv4_memory,
                 n_embd_out,
                 n_cls_out,
                 max_parallel_seqs,
@@ -547,7 +576,9 @@ impl Context {
     /// attention (both are upstream aborts, verified by probe), and
     /// sequence ids outside the effective `n_seq_max` (unless
     /// [`ContextOptions::kv_unified`] defers sequence validation to
-    /// upstream, whose 256-sequence bound fails safely). Token ranges,
+    /// upstream, whose 256-sequence bound fails safely — except on
+    /// DeepSeek-V4, whose unified memory still asserts `n_seq_max`,
+    /// so the bound holds there too). Token ranges,
     /// position consecutiveness, and KV capacity stay upstream's
     /// domain: violations come back as error codes and map to
     /// [`Error::decode`] with the code's meaning — nothing is hidden
@@ -573,9 +604,11 @@ impl Context {
         }
         // Under unified KV, upstream validates sequence ids against
         // its internal 256-sequence bound (a safe native error, not an
-        // abort), so there is nothing to pre-check; otherwise the
-        // effective n_seq_max applies.
-        if !self.kv_unified {
+        // abort), so there is nothing to pre-check — except on
+        // DeepSeek-V4, whose unified memory asserts `n_seq_max`
+        // instead (verified SIGABRT); otherwise the effective
+        // n_seq_max applies.
+        if !self.kv_unified || self.dsv4_memory {
             if let Some(bad) = batch.all_seq_ids().find(|seq| *seq >= self.n_seq_max) {
                 return Err(Error::invalid(format!(
                     "decode: seq id {bad} out of range (context n_seq_max {})",
@@ -709,6 +742,7 @@ impl Context {
                 self.n_seq_max,
                 self.max_parallel_seqs,
                 self.kv_unified,
+                self.dsv4_memory,
                 self.shift_allowed,
             ))
         }
@@ -781,7 +815,8 @@ impl Context {
     pub fn seq_state_size(&mut self, seq: SeqId) -> Result<u64> {
         let id = self.check_state_seq(seq, "seq_state_size")?;
         // SAFETY: as in `state_size`; the id satisfies the general
-        // bound (export asserts nothing tighter on any implementation).
+        // bound, which collapses to `n_seq_max` on DeepSeek-V4 (its
+        // export asserts that bound via the inner position query).
         let size = unsafe { forge_sys::llama_state_seq_get_size(self.raw, id) };
         if size == 0 {
             return Err(Error::state(format!(
@@ -844,10 +879,11 @@ impl Context {
 
     /// Validate a sequence id for state *export*-side calls (general
     /// bound: `n_seq_max`, or the native parallel-sequence limit when
-    /// unified). Restore-side calls use the tighter `n_seq_max`
+    /// unified — except on DeepSeek-V4, whose unified export asserts
+    /// `n_seq_max`). Restore-side calls use the tighter `n_seq_max`
     /// inline; see [`Context::import_seq_state`].
     fn check_state_seq(&self, seq: SeqId, op: &str) -> Result<c_int> {
-        let bound = if self.kv_unified {
+        let bound = if self.kv_unified && !self.dsv4_memory {
             self.max_parallel_seqs
         } else {
             self.n_seq_max

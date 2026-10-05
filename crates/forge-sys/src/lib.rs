@@ -550,6 +550,18 @@ unsafe extern "C" {
     // `forge-core` maps it through `rope_type` to refuse position
     // shifts on MROPE/IMROPE models (upstream aborts there).
     pub fn llama_model_rope_type(model: *const llama_model) -> c_int;
+    // GGUF metadata string lookup (`llama.h`): copies the value for
+    // `key` into `buf` (`snprintf` semantics, returns the would-be
+    // length, or -1 when the key is absent). `forge-core` reads
+    // `general.architecture` once at context creation to detect
+    // DeepSeek-V4, whose memory keeps per-sequence streams even when
+    // unified (so `seq < n_seq_max` binds there too).
+    pub fn llama_model_meta_val_str(
+        model: *const llama_model,
+        key: *const c_char,
+        buf: *mut c_char,
+        buf_size: usize,
+    ) -> c_int;
     pub fn llama_model_n_layer(model: *const llama_model) -> c_int;
     pub fn llama_model_n_head(model: *const llama_model) -> c_int;
     pub fn llama_model_n_head_kv(model: *const llama_model) -> c_int;

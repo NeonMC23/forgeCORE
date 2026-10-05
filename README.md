@@ -96,7 +96,7 @@ threading, pooling/attention/flash selection, embedding outputs,
 advisory KV/op offload flags), native KV sequence ops and
 byte-oriented state snapshots (clear/remove/copy/keep, position
 shifts, exact state sizes, KV cache dtypes), and explicit validation
-errors — 232 tests green with strict clippy. Out of scope here:
+errors — 239 tests green with strict clippy. Out of scope here:
 generation policy/loops, allocated/resident memory reporting
 (unavailable in the pinned C API), memory estimation, streaming,
 residency control, multi-GPU orchestration, and RAMforge integration

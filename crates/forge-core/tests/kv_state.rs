@@ -664,6 +664,159 @@ fn context_drop_and_reopen_with_state() {
     assert_eq!(memory.pos_max(0).unwrap(), Some(3));
 }
 
+// -- DSV4 unified strict bound -------------------------------------------------
+//
+// DeepSeek-V4 memory keeps per-sequence inner streams even when unified
+// and asserts `seq < n_seq_max` on every sequence op (verified SIGABRT
+// at the pin). These tests prove the pre-FFI rejection; they need the
+// DSV4 fixture via `FORGE_TEST_MODEL_DSV4` and SKIP without it.
+
+fn dsv4_fixture() -> Option<PathBuf> {
+    match std::env::var("FORGE_TEST_MODEL_DSV4") {
+        Ok(path) => Some(PathBuf::from(path)),
+        Err(_) => {
+            println!("SKIP: FORGE_TEST_MODEL_DSV4 not set (see docs/NATIVE.md)");
+            None
+        }
+    }
+}
+
+fn load_dsv4() -> Option<Model> {
+    dsv4_fixture().map(|path| Model::load(&path).expect("dsv4 fixture must load"))
+}
+
+fn dsv4_unified_options() -> ContextOptions {
+    let mut options = default_options();
+    options.kv_unified = true;
+    options
+}
+
+#[test]
+fn dsv4_unified_reports_strict_seq_limit() {
+    quiet();
+    let Some(model) = load_dsv4() else { return };
+    let mut context = Context::open(&model, &dsv4_unified_options()).expect("open");
+    let memory = context.memory().expect("dsv4 has memory");
+    // Unified, but the DSV4 class still asserts n_seq_max.
+    assert_eq!(memory.seq_limit(), 1);
+    assert!(!memory.can_shift());
+}
+
+#[test]
+fn dsv4_unified_rejects_high_seq_memory_ops() {
+    quiet();
+    let Some(model) = load_dsv4() else { return };
+    // Exact prior abort cases: remove_range/copy_seq with seq >=
+    // n_seq_max on a unified DSV4 cache aborted natively (SIGABRT);
+    // now every op refuses up front.
+    let mut context = Context::open(&model, &dsv4_unified_options()).expect("open");
+    let mut memory = context.memory().expect("memory");
+    for seq in [1, 5] {
+        assert!(memory.remove_range(seq, 0, None).is_err(), "rm {seq}");
+        assert!(memory.copy_seq(0, seq).is_err(), "cp dst {seq}");
+        assert!(memory.copy_seq(seq, 0).is_err(), "cp src {seq}");
+        assert!(memory.keep_seq(seq).is_err(), "keep {seq}");
+        assert!(
+            memory.shift_positions(seq, 0, None, 1).is_err(),
+            "shift {seq}"
+        );
+        assert!(
+            memory.scale_positions(seq, 0, None, 2).is_err(),
+            "scale {seq}"
+        );
+        assert!(memory.pos_min(seq).is_err(), "min {seq}");
+        assert!(memory.pos_max(seq).is_err(), "max {seq}");
+    }
+}
+
+#[test]
+fn dsv4_unified_valid_seqs_succeed() {
+    quiet();
+    let Some(model) = load_dsv4() else { return };
+    // Valid unified behavior is preserved: seq 0 decodes, queries,
+    // shifts, and survives surgery.
+    let mut context = Context::open(&model, &dsv4_unified_options()).expect("open");
+    context.decode(&seq_batch(0)).expect("decode seq 0");
+    {
+        let mut memory = context.memory().expect("memory");
+        assert_eq!(memory.pos_min(0).unwrap(), Some(1));
+        assert_eq!(memory.pos_max(0).unwrap(), Some(1));
+        memory.shift_positions(0, 0, None, 1).expect("shift seq 0");
+        memory.copy_seq(0, 0).expect("self copy");
+        memory.keep_seq(0).expect("keep seq 0");
+        memory.remove_range(0, 0, None).expect("remove seq 0");
+        assert_eq!(memory.pos_max(0).unwrap(), None);
+    }
+}
+
+#[test]
+fn dsv4_unified_rejects_high_seq_state_ops() {
+    quiet();
+    let Some(model) = load_dsv4() else { return };
+    let mut context = Context::open(&model, &dsv4_unified_options()).expect("open");
+    context.decode(&seq_batch(0)).expect("decode");
+    assert!(context.seq_state_size(5).is_err());
+    assert!(context.export_seq_state(5).is_err());
+    let snap = context.export_seq_state(0).expect("export seq 0");
+    assert!(!snap.is_empty());
+    assert!(context.import_seq_state(5, &snap).is_err());
+    context.memory().expect("memory").clear(true);
+    context.import_seq_state(0, &snap).expect("restore seq 0");
+}
+
+#[test]
+fn dsv4_unified_rejects_high_seq_decode() {
+    quiet();
+    let Some(model) = load_dsv4() else { return };
+    // Unified decode with seq >= n_seq_max aborted natively past
+    // n_seq_max 1 (uncaught DSV4 exception) and silently aliased
+    // stream 0 at n_seq_max 1; now it refuses up front.
+    let mut context = Context::open(&model, &dsv4_unified_options()).expect("open");
+    assert!(context.decode(&seq_batch(5)).is_err());
+    context.decode(&seq_batch(0)).expect("decode seq 0");
+}
+
+#[test]
+fn dsv4_split_matches_strict_bound() {
+    quiet();
+    let Some(model) = load_dsv4() else { return };
+    // Split DSV4 was already sound; unified must now behave the same.
+    let mut context = Context::open(&model, &default_options()).expect("open");
+    {
+        let mut memory = context.memory().expect("memory");
+        assert_eq!(memory.seq_limit(), 1);
+        assert!(memory.remove_range(5, 0, None).is_err());
+        assert!(memory.copy_seq(5, 0).is_err());
+    }
+    assert!(context.decode(&seq_batch(5)).is_err());
+    context.decode(&seq_batch(0)).expect("decode seq 0");
+}
+
+#[test]
+fn dsv4_unified_wider_cache_bounds_exactly() {
+    quiet();
+    let Some(model) = load_dsv4() else { return };
+    // n_seq_max = 4 unified: the boundary is exactly n_seq_max —
+    // seq 3 works everywhere, seq 5 refuses everywhere.
+    let mut options = dsv4_unified_options();
+    options.n_seq_max = 4;
+    let mut context = Context::open(&model, &options).expect("open");
+    context.decode(&seq_batch(3)).expect("decode seq 3");
+    assert!(context.decode(&seq_batch(5)).is_err());
+    {
+        let mut memory = context.memory().expect("memory");
+        assert_eq!(memory.seq_limit(), 4);
+        assert!(memory.pos_max(3).unwrap().is_some());
+        memory.copy_seq(3, 0).expect("copy 3 -> 0");
+        memory.remove_range(3, 0, None).expect("remove seq 3");
+        assert!(memory.remove_range(5, 0, None).is_err());
+        assert!(memory.pos_max(5).is_err());
+    }
+    assert!(context.export_seq_state(5).is_err());
+    let snap = context.export_seq_state(0).expect("export seq 0");
+    assert!(context.import_seq_state(5, &snap).is_err());
+}
+
 #[test]
 fn gpu_state_smoke() {
     quiet();
