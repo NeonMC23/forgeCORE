@@ -223,9 +223,16 @@ pub enum OpSpec {
     Softmax,
     SoftmaxExt,
     Rope,
-    Cast { from: crate::dtype::DType, to: crate::dtype::DType },
-    GetRows { table: crate::dtype::DType },
-    Concat { dtype: crate::dtype::DType },
+    Cast {
+        from: crate::dtype::DType,
+        to: crate::dtype::DType,
+    },
+    GetRows {
+        table: crate::dtype::DType,
+    },
+    Concat {
+        dtype: crate::dtype::DType,
+    },
 }
 
 impl DeviceInfo {
@@ -300,13 +307,11 @@ impl DeviceInfo {
                     )));
                 }
             }
-            OpSpec::GetRows { table } => {
-                if !crate::runtime::get_rows_table_supported(table) {
-                    return Err(Error::invalid(format!(
-                        "cannot probe unsupported get_rows table {}",
-                        table.name()
-                    )));
-                }
+            OpSpec::GetRows { table } if !crate::runtime::get_rows_table_supported(table) => {
+                return Err(Error::invalid(format!(
+                    "cannot probe unsupported get_rows table {}",
+                    table.name()
+                )));
             }
             _ => {}
         }
@@ -352,9 +357,8 @@ impl DeviceInfo {
         use crate::dtype::DType;
         use crate::error::Error;
         // Scratch metadata context (inputs + op node + slack).
-        let ctx = crate::tensor::new_ctx(6).map_err(|_| {
-            Error::backend("op probe context allocation failed")
-        })?;
+        let ctx = crate::tensor::new_ctx(6)
+            .map_err(|_| Error::backend("op probe context allocation failed"))?;
         // One probe input; NULL on context OOM.
         unsafe fn input(
             ctx: *mut forge_sys::ggml_context,
@@ -395,8 +399,13 @@ impl DeviceInfo {
                     Some(forge_sys::ggml_mul_mat(ctx, a, b))
                 }
             }
-            OpSpec::Silu | OpSpec::Sqr | OpSpec::Sqrt | OpSpec::Scale | OpSpec::RmsNorm
-            | OpSpec::Norm | OpSpec::Softmax => {
+            OpSpec::Silu
+            | OpSpec::Sqr
+            | OpSpec::Sqrt
+            | OpSpec::Scale
+            | OpSpec::RmsNorm
+            | OpSpec::Norm
+            | OpSpec::Softmax => {
                 let a = input(ctx, DType::F32, &[8, 5]);
                 if a.is_null() {
                     None
@@ -431,7 +440,6 @@ impl DeviceInfo {
                         ctx,
                         a,
                         pos,
-           
                         std::ptr::null_mut(),
                         8,
                         forge_sys::rope_type::NEOX,
@@ -490,8 +498,7 @@ impl DeviceInfo {
         };
         // Allocate the probe from the device's own buffer type so
         // the support query runs on the device's safe path.
-        let buffer =
-            forge_sys::ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        let buffer = forge_sys::ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         if buffer.is_null() {
             forge_sys::ggml_free(ctx);
             return Err(Error::backend("op probe allocation failed"));

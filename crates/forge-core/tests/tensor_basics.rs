@@ -146,7 +146,10 @@ fn fill_f32_covers_and_validates() {
     t.fill_f32(2.5).expect("fill");
     assert_eq!(t.to_vec_f32().expect("download"), vec![2.5; 6]);
     let f16 = Tensor::empty(&backend, DType::F16, &[4]).expect("F16");
-    assert!(f16.fill_f32(1.0).is_err(), "F32 fill of F16 aborts natively");
+    assert!(
+        f16.fill_f32(1.0).is_err(),
+        "F32 fill of F16 aborts natively"
+    );
     let tr = t.transpose().expect("transpose");
     assert!(tr.fill_f32(1.0).is_err(), "strided fill miswrites natively");
 }
@@ -170,10 +173,16 @@ fn copy_into_moves_bytes_across_backends() {
     let src = Tensor::from_f32(&backend, &[2, 2], &[1.0, 2.0, 3.0, 4.0]).expect("src");
     let dst = Tensor::empty(&other, DType::F32, &[2, 2]).expect("dst");
     src.copy_into(&dst).expect("cross-backend copy");
-    assert_eq!(dst.to_vec_f32().expect("download"), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(
+        dst.to_vec_f32().expect("download"),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
     // Self-copy is a natively handled no-op.
     src.copy_into(&src).expect("self copy");
-    assert_eq!(src.to_vec_f32().expect("download"), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(
+        src.to_vec_f32().expect("download"),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
 }
 
 #[test]
@@ -252,8 +261,8 @@ fn graph_add_names_anonymous_tensors() {
 fn views_outlive_parents_via_shared_allocation() {
     let backend = open_test_cpu();
     let view = {
-        let parent = Tensor::from_f32(&backend, &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-            .expect("parent");
+        let parent =
+            Tensor::from_f32(&backend, &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("parent");
         parent.transpose().expect("transpose")
         // Parent drops here; the view keeps the allocation alive.
     };

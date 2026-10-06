@@ -30,9 +30,10 @@ pub const MAX_DIMS: usize = 4;
 ///
 /// Views, reshapes, transposes, and permutes alias their parent's
 /// storage instead of copying it; the buffer is freed when the last
-/// tensor holding a share is dropped. Contexts only hold metadata, so
-/// freeing a context while a sibling tensor (and the buffer) is still
-/// alive is always safe.
+/// tensor holding a share is dropped. Contexts are shared through
+/// [`History`] for the same reason: a result's `src` chain points
+/// into its inputs' contexts, so contexts are only freed with the
+/// last downstream tensor.
 struct Allocation {
     buffer: *mut forge_sys::ggml_backend_buffer,
 }
@@ -44,6 +45,47 @@ impl Drop for Allocation {
         // tensor pointing data into it is gone (each holds an Rc share).
         unsafe { forge_sys::ggml_backend_buffer_free(self.buffer) };
     }
+}
+
+/// Shared owner of one ggml metadata context (tensor structs live in
+/// the context pool). Freed when the last share drops.
+struct CtxAlloc {
+    ctx: *mut forge_sys::ggml_context,
+}
+
+impl Drop for CtxAlloc {
+    fn drop(&mut self) {
+        // SAFETY: ctx came from a successful context call and is
+        // freed exactly once (Drop on the shared owner); every tensor
+        // struct carved from it is gone (each live downstream tensor
+        // holds a share through its History).
+        unsafe { forge_sys::ggml_free(self.ctx) };
+    }
+}
+
+/// One node of a tensor's forward tape: this tensor's own storage
+/// plus shares of every ancestor's (op inputs, view parents).
+///
+/// ggml graph expansion (`ggml_build_forward_expand`) walks the whole
+/// ancestor DAG through raw `src`/`view_src` pointers, and graph
+/// (re)compute reads ancestor buffers — so a result must keep its
+/// inputs' contexts AND buffers alive even after the input `Tensor`s
+/// drop. Without this, using an op result after its statement-scoped
+/// inputs dropped is heap use-after-free in safe code (found by the
+/// `cpu_exec_proof` attention test: `munmap_chunk(): invalid
+/// pointer`). Retention is DAG-shared (one node per tensor, parents
+/// linked, never flattened), so a chain of N tensors holds N nodes,
+/// not N-squared. Dropping a result releases everything it alone
+/// retained.
+struct History {
+    alloc: Rc<Allocation>,
+    // Retention-only: never read except by Drop (which frees the
+    // context and releases the ancestors). The shares exist so
+    // downstream ggml nodes keep pointing at live storage.
+    #[allow(dead_code)]
+    ctx: Rc<CtxAlloc>,
+    #[allow(dead_code)]
+    parents: Vec<Rc<History>>,
 }
 
 /// Allocate a metadata-only ggml context sized for `n_tensors`
@@ -152,7 +194,7 @@ fn checked_ne(dtype: DType, shape: &[usize]) -> Result<(Vec<i64>, usize)> {
             .ok_or_else(|| Error::invalid("element count overflow"))?;
         ne.push(extent_i64);
     }
-    if dtype.is_quantized() && shape[0] % dtype.block_len() != 0 {
+    if dtype.is_quantized() && !shape[0].is_multiple_of(dtype.block_len()) {
         return Err(Error::invalid(format!(
             "dim-0 extent {} is not a multiple of the {} block length {}",
             shape[0],
@@ -186,15 +228,20 @@ fn contiguous_nbytes(dtype: DType, ne: &[i64]) -> Option<usize> {
 }
 
 /// An owned tensor living on one [`Backend`].
+///
+/// A tensor retains its whole ggml history (see the private `History`
+/// tape): op results keep their inputs' storage alive, views keep
+/// their parent.
+/// Dropping an input or a parent never dangles a result or a view;
+/// memory releases when the last downstream tensor drops.
 pub struct Tensor {
     // Field order is load-bearing: struct fields drop in declaration
-    // order, so `alloc` (the backend buffer) is declared before
-    // `backend` to guarantee the buffer is freed while the backend
-    // is still alive. (Buffer freeing on some backends needs a live
-    // backend; freeing the backend first would be use-after-free.)
-    alloc: Rc<Allocation>,
+    // order, so `history` (every buffer owner, own and ancestral) is
+    // declared before `backend` to guarantee buffers free while the
+    // backend is still alive. (Buffer freeing on some backends needs
+    // a live backend; freeing the backend first would be use-after-free.)
+    history: Rc<History>,
     backend: Rc<BackendInner>,
-    ctx: *mut forge_sys::ggml_context,
     raw: *mut forge_sys::ggml_tensor,
     dtype: DType,
     shape: Vec<usize>,
@@ -202,17 +249,6 @@ pub struct Tensor {
     /// bounds). [`Graph`](crate::Graph) uses it to refuse expansions
     /// that could overflow the native graph (a release abort).
     graph_size: usize,
-}
-
-impl Drop for Tensor {
-    fn drop(&mut self) {
-        // SAFETY: ctx is a distinct live allocation owned by this
-        // Tensor; the buffer is freed by the shared Allocation owner.
-        // No other owner of ctx exists, so it cannot be double-freed.
-        unsafe {
-            forge_sys::ggml_free(self.ctx);
-        }
-    }
 }
 
 impl Tensor {
@@ -281,10 +317,13 @@ impl Tensor {
                 return Err(Error::backend("backend buffer allocation failed"));
             }
             let tensor = Self {
+                history: Rc::new(History {
+                    alloc: Rc::new(Allocation { buffer }),
+                    ctx: Rc::new(CtxAlloc { ctx }),
+                    parents: Vec::new(),
+                }),
                 backend: Rc::clone(backend.inner()),
-                ctx,
                 raw,
-                alloc: Rc::new(Allocation { buffer }),
                 dtype,
                 shape,
                 graph_size: 1,
@@ -334,6 +373,10 @@ impl Tensor {
     }
 
     /// Wrap a tensor produced by a ggml op plus its owned allocations.
+    /// The result retains `inputs`' storage (see [`History`]).
+    // Private constructor: eight heterogeneous, all-used parameters; a
+    // bundle struct would add indirection at every op call site.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn wrap_computed(
         backend: &Backend,
         ctx: *mut forge_sys::ggml_context,
@@ -342,12 +385,16 @@ impl Tensor {
         dtype: DType,
         shape: Vec<usize>,
         graph_size: usize,
+        inputs: &[&Tensor],
     ) -> Self {
         let tensor = Self {
+            history: Rc::new(History {
+                alloc: Rc::new(Allocation { buffer }),
+                ctx: Rc::new(CtxAlloc { ctx }),
+                parents: inputs.iter().map(|t| Rc::clone(&t.history)).collect(),
+            }),
             backend: Rc::clone(backend.inner()),
-            ctx,
             raw,
-            alloc: Rc::new(Allocation { buffer }),
             dtype,
             shape: normalize_shape(&shape),
             graph_size,
@@ -357,8 +404,9 @@ impl Tensor {
     }
 
     /// Wrap a zero-copy shape result (view/reshape/transpose/permute)
-    /// sharing `parent`'s allocation. The new tensor keeps its own
-    /// metadata context; `expect_contiguous` selects the cross-check.
+    /// sharing `parent`'s allocation and retaining its history. The
+    /// new tensor keeps its own metadata context; `expect_contiguous`
+    /// selects the cross-check.
     fn wrap_aliased(
         parent: &Tensor,
         ctx: *mut forge_sys::ggml_context,
@@ -367,18 +415,23 @@ impl Tensor {
         expect_contiguous: bool,
     ) -> Result<Self> {
         let tensor = Self {
+            history: Rc::new(History {
+                alloc: Rc::clone(&parent.history.alloc),
+                ctx: Rc::new(CtxAlloc { ctx }),
+                parents: vec![Rc::clone(&parent.history)],
+            }),
             backend: Rc::clone(&parent.backend),
-            ctx,
             raw,
-            alloc: Rc::clone(&parent.alloc),
             dtype: parent.dtype,
             shape: normalize_shape(&shape),
             graph_size: Self::child_graph_size(&[parent])?,
         };
         tensor.debug_cross_check(expect_contiguous);
-        // The alias points into the parent's live buffer (shared Rc),
-        // and its bytes are inside the parent's footprint (validated
-        // by the caller), so the data pointer is sound.
+        // The alias points into the parent's live buffer (shared Rc)
+        // and keeps the parent's history alive (shared History, so
+        // dropping the parent never dangles `view_src`), and its bytes
+        // are inside the parent's footprint (validated by the caller),
+        // so the data pointer is sound.
         Ok(tensor)
     }
 
@@ -413,12 +466,7 @@ impl Tensor {
         // storage; data points to nbytes of valid host memory;
         // offset + size == nbytes is in bounds.
         unsafe {
-            forge_sys::ggml_backend_tensor_set(
-                self.raw,
-                data.as_ptr().cast::<c_void>(),
-                0,
-                nbytes,
-            );
+            forge_sys::ggml_backend_tensor_set(self.raw, data.as_ptr().cast::<c_void>(), 0, nbytes);
         }
         Ok(())
     }
@@ -450,12 +498,7 @@ impl Tensor {
         }
         // SAFETY: as for `upload_f32`.
         unsafe {
-            forge_sys::ggml_backend_tensor_set(
-                self.raw,
-                data.as_ptr().cast::<c_void>(),
-                0,
-                nbytes,
-            );
+            forge_sys::ggml_backend_tensor_set(self.raw, data.as_ptr().cast::<c_void>(), 0, nbytes);
         }
         Ok(())
     }
@@ -604,8 +647,13 @@ impl Tensor {
     /// Both tensors must share dtype, shape, and contiguity, and
     /// neither may be a view: the native copy asserts identical
     /// layout (same type/ne/strides — implied by the Rust checks) and
-    /// dereferences both buffers without resolving views (a NULL
-    /// dereference on views, verified in source).
+    /// reads the *source* buffer without resolving views. ForgeCore
+    /// views carry a NULL buffer (no `view_init` runs on the
+    /// alias-only path), which trips the native NULL assert
+    /// (`ggml-backend.cpp`, `buffer_get_type`) — a NULL dereference
+    /// under NDEBUG. Destination views happen to survive (the set
+    /// path resolves them onto the parent buffer) but are refused
+    /// symmetrically rather than relying on that path.
     pub fn copy_into(&self, dst: &Tensor) -> Result<()> {
         if self.dtype != dst.dtype {
             return Err(Error::invalid(format!(
@@ -627,7 +675,7 @@ impl Tensor {
         }
         if self.is_view() || dst.is_view() {
             return Err(Error::invalid(
-                "copy refuses views (native copy dereferences a NULL buffer on views)",
+                "copy refuses views (native copy asserts on a view's NULL source buffer)",
             ));
         }
         // SAFETY: same dtype + same shape + both contiguous implies
@@ -686,10 +734,12 @@ impl Tensor {
         // SAFETY: raw is live; the name array is always
         // NUL-terminated (zero-initialized, truncation-safe writes).
         unsafe {
-            CStr::from_ptr(forge_sys::ggml_get_name(self.raw)).to_string_lossy().into_owned()
+            CStr::from_ptr(forge_sys::ggml_get_name(self.raw))
+                .to_string_lossy()
+                .into_owned()
         }
     }
-    
+
     /// Set the tensor name (NUL bytes rejected; longer than 63
     /// bytes truncated at a UTF-8 boundary — ggml names hold
     /// `GGML_MAX_NAME` = 64 bytes including the NUL).
@@ -756,10 +806,11 @@ impl Tensor {
                 return Err(Error::invalid(format!("{op}: axis {axis} has extent 0")));
             }
             ne_i64.push(
-                i64::try_from(extent).map_err(|_| Error::invalid(format!("{op}: extent exceeds i64")))?,
+                i64::try_from(extent)
+                    .map_err(|_| Error::invalid(format!("{op}: extent exceeds i64")))?,
             );
         }
-        if self.dtype.is_quantized() && ne[0] % self.dtype.block_len() != 0 {
+        if self.dtype.is_quantized() && !ne[0].is_multiple_of(self.dtype.block_len()) {
             return Err(Error::invalid(format!(
                 "{op}: dim-0 extent {} is not a multiple of the {} block length {}",
                 ne[0],
@@ -768,7 +819,7 @@ impl Tensor {
             )));
         }
         let type_size = self.dtype.type_size();
-        if offset % type_size != 0 {
+        if !offset.is_multiple_of(type_size) {
             // No native assert covers this; a misaligned offset would
             // make kernels dereference misaligned element pointers
             // (undefined behavior on strict-alignment targets).
@@ -786,9 +837,8 @@ impl Tensor {
         }
         // Native assert form: packed-form size + offset <= parent
         // footprint.
-        let packed = contiguous_nbytes(self.dtype, &ne_i64).ok_or_else(|| {
-            Error::invalid(format!("{op}: packed view size overflow"))
-        })?;
+        let packed = contiguous_nbytes(self.dtype, &ne_i64)
+            .ok_or_else(|| Error::invalid(format!("{op}: packed view size overflow")))?;
         let parent_bytes = self.nbytes();
         let packed_end = packed
             .checked_add(offset)
@@ -804,9 +854,11 @@ impl Tensor {
         for (dim, &stride) in nb.iter().enumerate() {
             let steps = ne[dim + 1].saturating_sub(1);
             span = span
-                .checked_add(stride.checked_mul(steps).ok_or_else(|| {
-                    Error::invalid(format!("{op}: strided footprint overflow"))
-                })?)
+                .checked_add(
+                    stride.checked_mul(steps).ok_or_else(|| {
+                        Error::invalid(format!("{op}: strided footprint overflow"))
+                    })?,
+                )
                 .ok_or_else(|| Error::invalid(format!("{op}: strided footprint overflow")))?;
         }
         let span_end = span
@@ -982,9 +1034,10 @@ impl Tensor {
     fn check_alias_footprint(&self, op: &str) -> Result<()> {
         let mut ne = Vec::with_capacity(MAX_DIMS);
         for dim in 0..MAX_DIMS {
-            ne.push(i64::try_from(extent_of(&self.shape, dim)).map_err(|_| {
-                Error::invalid(format!("{op}: extent exceeds i64 range"))
-            })?);
+            ne.push(
+                i64::try_from(extent_of(&self.shape, dim))
+                    .map_err(|_| Error::invalid(format!("{op}: extent exceeds i64 range")))?,
+            );
         }
         let packed = contiguous_nbytes(self.dtype, &ne)
             .ok_or_else(|| Error::invalid(format!("{op}: packed size overflow")))?;
@@ -1024,14 +1077,17 @@ impl Tensor {
                 self.dtype,
                 self.shape.clone(),
                 graph_size,
+                &[self],
             )
         }
     }
 
     /// Eager dtype conversion (native `ggml_cast`).
     ///
-    /// Supported pairs (the CPU kernel's implemented conversions;
-    /// anything else aborts natively with "not implemented"):
+    /// Supported pairs (an audited strict subset of the CPU
+    /// kernel's conversions — native additionally quantizes F16/BF16
+    /// into Q*, which stays rejected as unaudited; rejected pairs
+    /// abort natively, or crash on a NULL dequantizer row):
     /// same-type, F32 to F16/BF16/I32/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, F16
     /// to F32/BF16, BF16 to F32/F16, I32 to F32, and
     /// Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K to F32.
@@ -1040,9 +1096,10 @@ impl Tensor {
     /// pointer), and K-quant super-blocks are not quantizable into
     /// (their hierarchical layout needs a deeper audit than the flat
     /// one-scale-per-block family got). The input must be contiguous:
-    /// strided sources abort the quantizing path, and transposed
-    /// strides over-read the dequantizing path (block offsets scale
-    /// by row bytes instead of block bytes). F32 to quant
+    /// strided sources abort the quantizing path (native contiguity
+    /// assert, verified in source), and strided quant sources
+    /// silently misread on the dequantizing path (probe-measured
+    /// max|diff| of ~4 against the logical transpose). F32 to quant
     /// additionally needs a block-divisible dim
     /// 0 (the quantizer integer-divides the row into blocks). F32 to
     /// I32 truncates toward zero.
@@ -1060,7 +1117,10 @@ impl Tensor {
                 "cast needs a contiguous input (use `cont` first)",
             ));
         }
-        if from == DType::F32 && dtype.is_quantized() && self.shape[0] % dtype.block_len() != 0 {
+        if from == DType::F32
+            && dtype.is_quantized()
+            && !self.shape[0].is_multiple_of(dtype.block_len())
+        {
             return Err(Error::invalid(format!(
                 "cast to {} needs dim 0 divisible by {}, got {}",
                 dtype.name(),
@@ -1082,39 +1142,9 @@ impl Tensor {
                 dtype,
                 self.shape.clone(),
                 graph_size,
+                &[self],
             )
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_strips_trailing_ones() {
-        assert_eq!(normalize_shape(&[2, 3, 1, 1]), vec![2, 3]);
-        assert_eq!(normalize_shape(&[5]), vec![5]);
-        assert_eq!(normalize_shape(&[1, 1, 1]), vec![1]);
-        assert_eq!(normalize_shape(&[1, 4]), vec![1, 4]);
-    }
-
-    #[test]
-    fn checked_ne_rejects_bad_shapes() {
-        assert!(checked_ne(DType::F32, &[]).is_err());
-        assert!(checked_ne(DType::F32, &[1, 2, 3, 4, 5]).is_err());
-        assert!(checked_ne(DType::F32, &[4, 0]).is_err());
-        assert!(checked_ne(DType::F32, &[usize::MAX, usize::MAX]).is_err());
-        let (ne, n) = checked_ne(DType::F32, &[4, 3]).unwrap();
-        assert_eq!((ne, n), (vec![4, 3], 12));
-    }
-
-    #[test]
-    fn checked_ne_enforces_quant_blocks() {
-        assert!(checked_ne(DType::Q4_0, &[30, 4]).is_err());
-        assert!(checked_ne(DType::Q4_0, &[32, 4]).is_ok());
-        assert!(checked_ne(DType::Q8_0, &[31]).is_err());
-        assert!(checked_ne(DType::F32, &[7]).is_ok());
     }
 }
 
@@ -1134,7 +1164,9 @@ impl std::fmt::Debug for Tensor {
 /// conversion table; shared by [`Tensor::cast`] and op probes).
 ///
 /// Same-type pairs copy bytes (always sound). The float/int pairs
-/// mirror the kernel's option table exactly. `F32 -> Q*` covers the
+/// mirror an audited subset of the kernel's option table (native
+/// also quantizes F16/BF16 into Q*; excluded as unaudited).
+/// `F32 -> Q*` covers the
 /// flat-block family only (`from_float` present, one scale per
 /// block); K-quant super-blocks need a deeper audit and `Q8_1` has
 /// no dequantizer, so quantizing into it would be a one-way trap.
@@ -1181,4 +1213,35 @@ fn forge_sys_row_size(dtype: DType, ne0: i64) -> usize {
     // SAFETY: dtype is valid and dim 0 is block-divisible, which is
     // exactly what `ggml_row_size` debug-asserts.
     unsafe { forge_sys::ggml_row_size(dtype.ggml_type(), ne0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_strips_trailing_ones() {
+        assert_eq!(normalize_shape(&[2, 3, 1, 1]), vec![2, 3]);
+        assert_eq!(normalize_shape(&[5]), vec![5]);
+        assert_eq!(normalize_shape(&[1, 1, 1]), vec![1]);
+        assert_eq!(normalize_shape(&[1, 4]), vec![1, 4]);
+    }
+
+    #[test]
+    fn checked_ne_rejects_bad_shapes() {
+        assert!(checked_ne(DType::F32, &[]).is_err());
+        assert!(checked_ne(DType::F32, &[1, 2, 3, 4, 5]).is_err());
+        assert!(checked_ne(DType::F32, &[4, 0]).is_err());
+        assert!(checked_ne(DType::F32, &[usize::MAX, usize::MAX]).is_err());
+        let (ne, n) = checked_ne(DType::F32, &[4, 3]).unwrap();
+        assert_eq!((ne, n), (vec![4, 3], 12));
+    }
+
+    #[test]
+    fn checked_ne_enforces_quant_blocks() {
+        assert!(checked_ne(DType::Q4_0, &[30, 4]).is_err());
+        assert!(checked_ne(DType::Q4_0, &[32, 4]).is_ok());
+        assert!(checked_ne(DType::Q8_0, &[31]).is_err());
+        assert!(checked_ne(DType::F32, &[7]).is_ok());
+    }
 }

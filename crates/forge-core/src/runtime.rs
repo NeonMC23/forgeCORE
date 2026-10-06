@@ -1,4 +1,4 @@
-//! Eager tensor ops over [`Backend`](crate::backend::Backend) execution.
+//! Eager tensor ops over [`Backend`] execution.
 //!
 //! Every op builds a tiny ggml graph, computes it immediately on the
 //! tensors' backend, and returns the fresh result [`Tensor`]. Inputs
@@ -94,9 +94,7 @@ fn check_same_backend(inputs: &[&Tensor], op: &str) -> Result<()> {
     let first = inputs[0].backend_inner();
     for other in &inputs[1..] {
         if !Rc::ptr_eq(first, other.backend_inner()) {
-            return Err(Error::backend(format!(
-                "{op} needs tensors on one backend"
-            )));
+            return Err(Error::backend(format!("{op} needs tensors on one backend")));
         }
     }
     Ok(())
@@ -151,7 +149,10 @@ fn check_unary(a: &Tensor, op: &str) -> Result<()> {
 /// trip the native `eps >= 0` assert; +inf is arithmetic-sound).
 fn check_norm(a: &Tensor, eps: f32, op: &str) -> Result<()> {
     check_unary(a, op)?;
-    if !(eps >= 0.0) {
+    // NaN-safe spelling of `!(eps >= 0)`: NaN and negatives are
+    // rejected (both trip the native `eps >= 0` assert); +inf passes
+    // (pure arithmetic).
+    if eps.is_nan() || eps < 0.0 {
         return Err(Error::invalid(format!("{op} needs eps >= 0, got {eps}")));
     }
     Ok(())
@@ -162,6 +163,12 @@ fn check_norm(a: &Tensor, eps: f32, op: &str) -> Result<()> {
 /// precomputed `1 + inputs' bounds`: it sized the scratch graph (via
 /// [`new_exec_ctx`](crate::tensor::new_exec_ctx)) and becomes the
 /// result's bound. NULL op nodes (context OOM) unwind the context.
+/// The result retains `inputs`' storage (see
+/// [`Tensor`](crate::tensor::Tensor)): dropping an input never
+/// dangles later graphs over the result.
+// Private single-purpose runner: nine heterogeneous, all-used
+// parameters; bundling would obscure every op call site.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finish(
     op: &str,
     backend: &Backend,
@@ -171,6 +178,7 @@ pub(crate) fn finish(
     dtype: DType,
     shape: Vec<usize>,
     graph_size: usize,
+    inputs: &[&Tensor],
 ) -> Result<Tensor> {
     if raw.is_null() {
         // SAFETY: ctx is live and uniquely owned here.
@@ -189,7 +197,9 @@ pub(crate) fn finish(
         let buffer = forge_sys::ggml_backend_alloc_ctx_tensors(ctx, backend.raw());
         if buffer.is_null() {
             forge_sys::ggml_free(ctx);
-            return Err(Error::backend(format!("{op}: backend buffer allocation failed")));
+            return Err(Error::backend(format!(
+                "{op}: backend buffer allocation failed"
+            )));
         }
         let status = forge_sys::ggml_backend_graph_compute(backend.raw(), graph);
         if status != forge_sys::status::SUCCESS {
@@ -201,7 +211,7 @@ pub(crate) fn finish(
             )));
         }
         Ok(Tensor::wrap_computed(
-            backend, ctx, raw, buffer, dtype, shape, graph_size,
+            backend, ctx, raw, buffer, dtype, shape, graph_size, inputs,
         ))
     }
 }
@@ -216,7 +226,17 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     // SAFETY: ctx/inputs live; preconditions mirror the asserts.
     unsafe {
         let raw = forge_sys::ggml_add(ctx, a.raw(), b.raw());
-        finish("add", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "add",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a, b],
+        )
     }
 }
 
@@ -229,7 +249,17 @@ pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_sub(ctx, a.raw(), b.raw());
-        finish("sub", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "sub",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a, b],
+        )
     }
 }
 
@@ -242,7 +272,17 @@ pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_mul(ctx, a.raw(), b.raw());
-        finish("mul", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "mul",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a, b],
+        )
     }
 }
 
@@ -255,7 +295,17 @@ pub fn div(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_div(ctx, a.raw(), b.raw());
-        finish("div", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "div",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a, b],
+        )
     }
 }
 
@@ -302,8 +352,18 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let out_shape = vec![ashape[1], bshape[1]];
     unsafe {
         let raw = forge_sys::ggml_mul_mat(ctx, a.raw(), b.raw());
-       
-        finish("matmul", &backend, ctx, graph_cap, raw, DType::F32, out_shape, graph_size)
+
+        finish(
+            "matmul",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            out_shape,
+            graph_size,
+            &[a, b],
+        )
     }
 }
 
@@ -316,7 +376,17 @@ pub fn silu(a: &Tensor) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_silu(ctx, a.raw());
-        finish("silu", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "silu",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a],
+        )
     }
 }
 
@@ -329,7 +399,17 @@ pub fn sqr(a: &Tensor) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_sqr(ctx, a.raw());
-        finish("sqr", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "sqr",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a],
+        )
     }
 }
 
@@ -342,7 +422,17 @@ pub fn sqrt(a: &Tensor) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_sqrt(ctx, a.raw());
-        finish("sqrt", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "sqrt",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a],
+        )
     }
 }
 
@@ -355,7 +445,17 @@ pub fn scale(a: &Tensor, s: f32) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_scale(ctx, a.raw(), s);
-        finish("scale", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "scale",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a],
+        )
     }
 }
 /// RMS normalization over dim 0 (per column), `x / rms(x, eps)`.
@@ -367,7 +467,17 @@ pub fn rms_norm(a: &Tensor, eps: f32) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_rms_norm(ctx, a.raw(), eps);
-        finish("rms_norm", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "rms_norm",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a],
+        )
     }
 }
 
@@ -380,7 +490,17 @@ pub fn norm(a: &Tensor, eps: f32) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_norm(ctx, a.raw(), eps);
-        finish("norm", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "norm",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a],
+        )
     }
 }
 
@@ -393,7 +513,17 @@ pub fn soft_max(a: &Tensor) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(2, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_soft_max(ctx, a.raw());
-        finish("soft_max", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "soft_max",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a],
+        )
     }
 }
 
@@ -409,12 +539,7 @@ pub fn soft_max(a: &Tensor) -> Result<Tensor> {
 /// the constructor asserts — violations abort natively.
 /// `scale`/`max_bias` are pure arithmetic (any `f32`); NaN inputs
 /// propagate NaNs without aborting.
-pub fn soft_max_ext(
-    a: &Tensor,
-    mask: &Tensor,
-    scale: f32,
-    max_bias: f32,
-) -> Result<Tensor> {
+pub fn soft_max_ext(a: &Tensor, mask: &Tensor, scale: f32, max_bias: f32) -> Result<Tensor> {
     check_same_backend(&[a, mask], "soft_max_ext")?;
     check_unary(a, "soft_max_ext")?;
     if mask.dtype() != DType::F32 && mask.dtype() != DType::F16 {
@@ -452,7 +577,17 @@ pub fn soft_max_ext(
     let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_soft_max_ext(ctx, a.raw(), mask.raw(), scale, max_bias);
-        finish("soft_max_ext", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "soft_max_ext",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a, mask],
+        )
     }
 }
 /// Rotary position embeddings over dim 0 (`ggml_rope_ext`).
@@ -468,11 +603,7 @@ pub fn soft_max_ext(
 /// writes one element past each row (verified in source; see the
 /// Phase-6 report). The frequency-factors input `c` is always NULL
 /// in P6.
-pub fn rope(
-    a: &Tensor,
-    positions: &Tensor,
-    params: &RopeParams,
-) -> Result<Tensor> {
+pub fn rope(a: &Tensor, positions: &Tensor, params: &RopeParams) -> Result<Tensor> {
     check_same_backend(&[a, positions], "rope")?;
     check_unary(a, "rope")?;
     if a.shape().len() != 3 {
@@ -482,7 +613,7 @@ pub fn rope(
         )));
     }
     let ne0 = a.shape()[0];
-    if ne0 % 2 != 0 {
+    if !ne0.is_multiple_of(2) {
         return Err(Error::invalid(format!(
             "rope needs an even dim 0 (odd widths overrun the row), got {ne0}"
         )));
@@ -511,7 +642,7 @@ pub fn rope(
             positions.shape()[0]
         )));
     }
-    if params.n_dims < 2 || params.n_dims % 2 != 0 || params.n_dims > ne0 {
+    if params.n_dims < 2 || !params.n_dims.is_multiple_of(2) || params.n_dims > ne0 {
         return Err(Error::invalid(format!(
             "rope needs an even n_dims in 2..={ne0}, got {}",
             params.n_dims
@@ -547,7 +678,17 @@ pub fn rope(
             params.beta_fast,
             params.beta_slow,
         );
-        finish("rope", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
+        finish(
+            "rope",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            DType::F32,
+            a.shape().to_vec(),
+            graph_size,
+            &[a, positions],
+        )
     }
 }
 
@@ -631,7 +772,11 @@ pub fn get_rows(table: &Tensor, indices: &Tensor) -> Result<Tensor> {
             )));
         }
     }
-    let out_dtype = if table.dtype() == DType::I32 { DType::I32 } else { DType::F32 };
+    let out_dtype = if table.dtype() == DType::I32 {
+        DType::I32
+    } else {
+        DType::F32
+    };
     let out_shape = vec![
         extent(table.shape(), 0),
         extent(indices.shape(), 0),
@@ -644,7 +789,17 @@ pub fn get_rows(table: &Tensor, indices: &Tensor) -> Result<Tensor> {
     let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_get_rows(ctx, table.raw(), indices.raw());
-        finish("get_rows", &backend, ctx, graph_cap, raw, out_dtype, out_shape, graph_size)
+        finish(
+            "get_rows",
+            &backend,
+            ctx,
+            graph_cap,
+            raw,
+            out_dtype,
+            out_shape,
+            graph_size,
+            &[table, indices],
+        )
     }
 }
 
@@ -706,12 +861,17 @@ pub fn concat(a: &Tensor, b: &Tensor, dim: usize) -> Result<Tensor> {
     let graph_size = Tensor::child_graph_size(&[a, b])?;
     let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
-        let raw = forge_sys::ggml_concat(
+        let raw = forge_sys::ggml_concat(ctx, a.raw(), b.raw(), dim as std::os::raw::c_int);
+        finish(
+            "concat",
+            &backend,
             ctx,
-            a.raw(),
-            b.raw(),
-            dim as std::os::raw::c_int,
-        );
-        finish("concat", &backend, ctx, graph_cap, raw, a.dtype(), out_shape, graph_size)
+            graph_cap,
+            raw,
+            a.dtype(),
+            out_shape,
+            graph_size,
+            &[a, b],
+        )
     }
 }

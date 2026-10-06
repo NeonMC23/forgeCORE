@@ -513,19 +513,12 @@ unsafe extern "C" {
         a: *mut ggml_tensor,
         b: *mut ggml_tensor,
     ) -> *mut ggml_tensor;
-    pub fn ggml_scale(
-        ctx: *mut ggml_context,
-        a: *mut ggml_tensor,
-        s: f32,
-    ) -> *mut ggml_tensor;
+    pub fn ggml_scale(ctx: *mut ggml_context, a: *mut ggml_tensor, s: f32) -> *mut ggml_tensor;
     pub fn ggml_sqr(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     pub fn ggml_sqrt(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     pub fn ggml_silu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
-    pub fn ggml_rms_norm(
-        ctx: *mut ggml_context,
-        a: *mut ggml_tensor,
-        eps: f32,
-    ) -> *mut ggml_tensor;
+    pub fn ggml_rms_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32)
+        -> *mut ggml_tensor;
     pub fn ggml_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32) -> *mut ggml_tensor;
     pub fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     pub fn ggml_soft_max_ext(
@@ -555,11 +548,8 @@ unsafe extern "C" {
         a: *mut ggml_tensor,
         b: *mut ggml_tensor,
     ) -> *mut ggml_tensor;
-    pub fn ggml_cast(
-        ctx: *mut ggml_context,
-        a: *mut ggml_tensor,
-        type_: c_int,
-    ) -> *mut ggml_tensor;
+    pub fn ggml_cast(ctx: *mut ggml_context, a: *mut ggml_tensor, type_: c_int)
+        -> *mut ggml_tensor;
     // -- ggml.h: graph sizing / introspection ------------------------
     // `new_graph_custom` NULL-dereferences its context allocation on
     // failure (release SEGV / debug abort), so `forge-core` sizes the
@@ -625,27 +615,19 @@ unsafe extern "C" {
         backend: ggml_backend_t,
         cgraph: *mut ggml_cgraph,
     ) -> ggml_backend_graph_plan_t;
-    pub fn ggml_backend_graph_plan_free(
-        backend: ggml_backend_t,
-        plan: ggml_backend_graph_plan_t,
-    );
+    pub fn ggml_backend_graph_plan_free(backend: ggml_backend_t, plan: ggml_backend_graph_plan_t);
     pub fn ggml_backend_graph_plan_compute(
         backend: ggml_backend_t,
         plan: ggml_backend_graph_plan_t,
     ) -> c_int;
-    pub fn ggml_backend_tensor_copy(
-        src: *const ggml_tensor,
-        dst: *mut ggml_tensor,
-    );
+    pub fn ggml_backend_tensor_copy(src: *const ggml_tensor, dst: *mut ggml_tensor);
     // -- ggml-backend.h: buffer types / buffers (borrowed bufts are
     // owned by their backend or device; owned buffers free with
     // `buffer_free`; every getter below only asserts liveness) ------
     pub fn ggml_backend_get_default_buffer_type(
         backend: ggml_backend_t,
     ) -> ggml_backend_buffer_type_t;
-    pub fn ggml_backend_dev_buffer_type(
-        device: ggml_backend_dev_t,
-    ) -> ggml_backend_buffer_type_t;
+    pub fn ggml_backend_dev_buffer_type(device: ggml_backend_dev_t) -> ggml_backend_buffer_type_t;
     pub fn ggml_backend_buft_name(buft: ggml_backend_buffer_type_t) -> *const c_char;
     pub fn ggml_backend_buft_alloc_buffer(
         buft: ggml_backend_buffer_type_t,
@@ -671,10 +653,8 @@ unsafe extern "C" {
         device: ggml_backend_dev_t,
         props: *mut ggml_backend_dev_props,
     );
-    pub fn ggml_backend_dev_supports_op(
-        device: ggml_backend_dev_t,
-        op: *const ggml_tensor,
-    ) -> bool;
+    pub fn ggml_backend_dev_supports_op(device: ggml_backend_dev_t, op: *const ggml_tensor)
+        -> bool;
 
     // -- ggml-alloc.h: static graph/tensor allocation ------------------------
     pub fn ggml_backend_alloc_ctx_tensors(

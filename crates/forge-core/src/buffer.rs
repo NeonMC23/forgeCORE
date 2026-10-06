@@ -2,7 +2,7 @@
 //!
 //! A [`BufferType`] is a borrowed handle describing how one backend
 //! allocates memory (name, alignment, limits, host visibility); a
-//! [`Buffer`] is an owned allocation freed on drop. [`Tensor`](crate::tensor::Tensor)
+//! [`Buffer`] is an owned allocation freed on drop. [`Tensor`]
 //! storage is managed internally, so most callers only need
 //! [`BufferType`] for capacity questions
 //! ([`tensor_alloc_size`](BufferType::tensor_alloc_size),

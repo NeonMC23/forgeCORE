@@ -10,6 +10,7 @@ $FORGE_LLAMA_DIR/
   build/    CMake tree; shared libs land in build/bin/
   tools/    ephemeral cmake binary (if the system has none)
   models/   optional local test fixtures (never in the repo)
+  probes/   ephemeral C harnesses (e.g. the P6 abort battery; never in the repo)
 ```
 
 `/var/tmp` is the default instead of `/tmp` because `/tmp` is a ~1 GB

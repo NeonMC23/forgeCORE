@@ -1,6 +1,6 @@
 //! Multi-output ggml graphs and CPU execution plans.
 //!
-//! [`Graph`] collects output [`Tensor`](crate::tensor::Tensor)s into
+//! [`Graph`] collects output [`Tensor`]s into
 //! one `ggml_cgraph` so shared subexpressions compute once; [`Plan`]
 //! compiles a graph for repeated execution on the CPU backend.
 //!
@@ -23,7 +23,7 @@
 //!
 //! Capacity: the native graph overflows its node/leaf arrays with a
 //! release abort, and leaf counts have no public getter, so each
-//! [`Tensor`](crate::tensor::Tensor) carries an upper bound
+//! [`Tensor`] carries an upper bound
 //! (`1 + inputs' bounds`, covering both new nodes and new leafs) and
 //! [`Graph::add_output`] refuses expansions that could overflow. The
 //! bound is conservative (shared subexpressions counted twice),
@@ -216,9 +216,7 @@ impl<'t> Graph<'t> {
             }
             Some(backend) => {
                 if !Rc::ptr_eq(backend, output.backend_inner()) {
-                    return Err(Error::backend(
-                        "graph outputs must live on one backend",
-                    ));
+                    return Err(Error::backend("graph outputs must live on one backend"));
                 }
             }
         }
