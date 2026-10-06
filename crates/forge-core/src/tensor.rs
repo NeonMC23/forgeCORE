@@ -41,27 +41,43 @@ impl Drop for Allocation {
     fn drop(&mut self) {
         // SAFETY: buffer came from a successful allocation call, is
         // freed exactly once (Drop on the shared owner), and every
-        // tensor dottig data into it is gone (each holds an Rc share).
+        // tensor pointing data into it is gone (each holds an Rc share).
         unsafe { forge_sys::ggml_backend_buffer_free(self.buffer) };
     }
 }
 
-/// Scratch-graph capacity for eager single-op execution: one op
-/// node plus at most three leafs, with slack.
-pub(crate) const SCRATCH_GRAPH_CAPACITY: usize = 16;
-
 /// Allocate a metadata-only ggml context sized for `n_tensors`
-/// tensors plus one scratch graph. Returns the context and the
-/// graph capacity to pass to `ggml_new_graph_custom`.
-pub(crate) fn new_exec_ctx(n_tensors: usize) -> Result<(*mut forge_sys::ggml_context, usize)> {
+/// tensors plus one scratch graph of `graph_cap` nodes/leafs.
+/// Returns the context and the graph capacity to pass to
+/// `ggml_new_graph_custom`.
+///
+/// Eager ops expand the op node with `ggml_build_forward_expand`,
+/// which walks the whole ancestor DAG (recomputing it), so the cap
+/// must cover every reachable node and leaf — not just the op node.
+/// Callers pass `1 + inputs' graph bounds` (see
+/// [`Tensor::child_graph_size`]); a fixed cap would abort on deep
+/// chains once either array overflowed.
+pub(crate) fn new_exec_ctx(
+    n_tensors: usize,
+    graph_cap: usize,
+) -> Result<(*mut forge_sys::ggml_context, usize)> {
+    if graph_cap < 1 {
+        return Err(Error::invalid("exec graph capacity must be at least 1"));
+    }
+    if graph_cap > u32::MAX as usize {
+        // The native size polynomial (`nodes + leafs + hash(2*cap) + ...`)
+        // is wrap-free below 2^32 slots (every term stays under 2^38
+        // bytes); above that the context could be undersized while the
+        // node arrays stay huge — a heap overrun. No real graph comes
+        // close (2^32 nodes need 128 GiB for the arrays alone).
+        return Err(Error::invalid("exec graph capacity exceeds u32 range"));
+    }
     // SAFETY: no arguments / pure size computation.
     let per_tensor = unsafe { forge_sys::ggml_tensor_overhead() };
     let tensors = per_tensor
         .checked_mul(n_tensors.saturating_add(2))
         .ok_or_else(|| Error::invalid("tensor context size overflow"))?;
-    let graph = unsafe {
-        forge_sys::ggml_graph_overhead_custom(SCRATCH_GRAPH_CAPACITY, false)
-    };
+    let graph = unsafe { forge_sys::ggml_graph_overhead_custom(graph_cap, false) };
     let mem_size = tensors
         .checked_add(graph)
         .ok_or_else(|| Error::invalid("exec context size overflow"))?;
@@ -76,7 +92,7 @@ pub(crate) fn new_exec_ctx(n_tensors: usize) -> Result<(*mut forge_sys::ggml_con
     if ctx.is_null() {
         return Err(Error::backend("ggml context allocation failed"));
     }
-    Ok((ctx, SCRATCH_GRAPH_CAPACITY))
+    Ok((ctx, graph_cap))
 }
 
 /// Allocate a metadata-only ggml context sized for `n_tensors` tensors.
@@ -171,10 +187,15 @@ fn contiguous_nbytes(dtype: DType, ne: &[i64]) -> Option<usize> {
 
 /// An owned tensor living on one [`Backend`].
 pub struct Tensor {
+    // Field order is load-bearing: struct fields drop in declaration
+    // order, so `alloc` (the backend buffer) is declared before
+    // `backend` to guarantee the buffer is freed while the backend
+    // is still alive. (Buffer freeing on some backends needs a live
+    // backend; freeing the backend first would be use-after-free.)
+    alloc: Rc<Allocation>,
     backend: Rc<BackendInner>,
     ctx: *mut forge_sys::ggml_context,
     raw: *mut forge_sys::ggml_tensor,
-    alloc: Rc<Allocation>,
     dtype: DType,
     shape: Vec<usize>,
     /// Upper bound on reachable graph nodes + leafs (1 + the inputs'
@@ -299,7 +320,8 @@ impl Tensor {
     /// `bytes.len()` must equal the native byte size exactly; for
     /// quantized dtypes the caller supplies valid blocks (e.g. via a
     /// [`Tensor::cast`] from F32, or zeroed blocks, which decode to
-    /// finite zeros for every mapped quant type).
+    /// finite zeros for every mapped quant type with a dequantizer —
+    /// Q8_1/Q8_K have none and are rejected from dequantizing ops).
     pub fn from_bytes(
         backend: &Backend,
         dtype: DType,
@@ -360,8 +382,9 @@ impl Tensor {
         Ok(tensor)
     }
 
-    /// Upload F32 row data into this tensor (any shape/strides; views
-    /// write through to the parent region).
+    /// Upload F32 row data into a contiguous F32 tensor (packed
+    /// element order; a contiguous view writes through to the parent
+    /// region it covers).
     pub fn upload_f32(&self, data: &[f32]) -> Result<()> {
         if self.dtype != DType::F32 {
             return Err(Error::unsupported(format!(
@@ -656,7 +679,9 @@ impl Tensor {
     }
 
     /// Tensor name (`ggml_get_name`; empty unless [`set_name`](Self::set_name)
-    /// was called — ggml suffixes op results, e.g. `"x (reshaped)"`).
+    /// was called — ggml suffixes op results, e.g. `"x (reshaped)"`,
+    /// and names anonymous graph tensors `leaf_N`/`node_N` when they
+    /// are first added to a [`Graph`](crate::graph::Graph)).
     pub fn name(&self) -> String {
         // SAFETY: raw is live; the name array is always
         // NUL-terminated (zero-initialized, truncation-safe writes).
@@ -706,12 +731,6 @@ impl Tensor {
     /// Shared backend owner (identity checks).
     pub(crate) fn backend_inner(&self) -> &Rc<BackendInner> {
         &self.backend
-    }
-
-    /// Native `ggml_is_transposed` for a live tensor pointer.
-    pub(crate) fn is_transposed_native(raw: *mut forge_sys::ggml_tensor) -> bool {
-        // SAFETY: caller guarantees a live tensor.
-        unsafe { forge_sys::ggml_is_transposed(raw) }
     }
 
     /// Graph-size bound of this tensor (capacity planning).
@@ -961,9 +980,12 @@ impl Tensor {
     /// `packed_size <= parent_nbytes`, which overlapping views can
     /// violate.
     fn check_alias_footprint(&self, op: &str) -> Result<()> {
-        let ne: Vec<i64> = [0, 1, 2, 3]
-            .map(|dim| extent_of(&self.shape, dim) as i64)
-            .to_vec();
+        let mut ne = Vec::with_capacity(MAX_DIMS);
+        for dim in 0..MAX_DIMS {
+            ne.push(i64::try_from(extent_of(&self.shape, dim)).map_err(|_| {
+                Error::invalid(format!("{op}: extent exceeds i64 range"))
+            })?);
+        }
         let packed = contiguous_nbytes(self.dtype, &ne)
             .ok_or_else(|| Error::invalid(format!("{op}: packed size overflow")))?;
         if packed > self.nbytes() {
@@ -977,8 +999,10 @@ impl Tensor {
     /// Fresh contiguous copy (native `ggml_cont`, executed eagerly).
     ///
     /// Quantized tensors must already be contiguous: the strided copy
-    /// path sizes rows as `ne0 * type_size`, which under-counts
-    /// blocks. Non-quantized tensors may have any strides.
+    /// path sizes rows as `ne0 * block_bytes`, which over-counts a
+    /// block row by the block factor and overruns both ends.
+    /// Non-quantized tensors may have any strides (the strided path
+    /// copies element-wise, correctly but slowly).
     pub fn cont(&self) -> Result<Self> {
         if self.dtype.is_quantized() && !self.is_contiguous() {
             return Err(Error::invalid(format!(
@@ -987,7 +1011,8 @@ impl Tensor {
             )));
         }
         let backend = Backend::from_inner(Rc::clone(&self.backend));
-        let (ctx, graph_cap) = new_exec_ctx(1)?;
+        let graph_size = Tensor::child_graph_size(&[self])?;
+        let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
         unsafe {
             let raw = forge_sys::ggml_cont(ctx, self.raw);
             crate::runtime::finish(
@@ -998,7 +1023,7 @@ impl Tensor {
                 raw,
                 self.dtype,
                 self.shape.clone(),
-                &[self],
+                graph_size,
             )
         }
     }
@@ -1007,12 +1032,20 @@ impl Tensor {
     ///
     /// Supported pairs (the CPU kernel's implemented conversions;
     /// anything else aborts natively with "not implemented"):
-    /// same-type, F32 to F16/BF16/I32/Q4_0/Q8_0, F16 to F32/BF16,
-    /// BF16 to F32/F16, I32 to F32, and any mapped quantized type to
-    /// F32. The input must be contiguous (strided sources take the
-    /// aborting path). F32 to quant additionally needs a
-    /// block-divisible dim 0 (the quantizer integer-divides the row
-    /// into blocks). F32 to I32 discards the fractional part.
+    /// same-type, F32 to F16/BF16/I32/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, F16
+    /// to F32/BF16, BF16 to F32/F16, I32 to F32, and
+    /// Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K to F32.
+    /// Q8_1 and Q8_K have no dequantizer row (`to_float` is NULL in
+    /// the type table — converting out of them would call a NULL
+    /// pointer), and K-quant super-blocks are not quantizable into
+    /// (their hierarchical layout needs a deeper audit than the flat
+    /// one-scale-per-block family got). The input must be contiguous:
+    /// strided sources abort the quantizing path, and transposed
+    /// strides over-read the dequantizing path (block offsets scale
+    /// by row bytes instead of block bytes). F32 to quant
+    /// additionally needs a block-divisible dim
+    /// 0 (the quantizer integer-divides the row into blocks). F32 to
+    /// I32 truncates toward zero.
     pub fn cast(&self, dtype: DType) -> Result<Self> {
         let from = self.dtype;
         if !cast_pair_supported(from, dtype) {
@@ -1036,7 +1069,8 @@ impl Tensor {
             )));
         }
         let backend = Backend::from_inner(Rc::clone(&self.backend));
-        let (ctx, graph_cap) = new_exec_ctx(1)?;
+        let graph_size = Tensor::child_graph_size(&[self])?;
+        let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
         unsafe {
             let raw = forge_sys::ggml_cast(ctx, self.raw, dtype.ggml_type());
             crate::runtime::finish(
@@ -1047,7 +1081,7 @@ impl Tensor {
                 raw,
                 dtype,
                 self.shape.clone(),
-                &[self],
+                graph_size,
             )
         }
     }
@@ -1098,6 +1132,15 @@ impl std::fmt::Debug for Tensor {
 
 /// Whether `ggml_cast` implements `from -> to` (the CPU kernel's
 /// conversion table; shared by [`Tensor::cast`] and op probes).
+///
+/// Same-type pairs copy bytes (always sound). The float/int pairs
+/// mirror the kernel's option table exactly. `F32 -> Q*` covers the
+/// flat-block family only (`from_float` present, one scale per
+/// block); K-quant super-blocks need a deeper audit and `Q8_1` has
+/// no dequantizer, so quantizing into it would be a one-way trap.
+/// `Q* -> F32` covers every mapped quant type *with* a dequantizer —
+/// `Q8_1`/`Q8_K` have no `to_float` row (verified in the type table)
+/// and would call a NULL function pointer, so they are excluded.
 pub(crate) fn cast_pair_supported(from: DType, to: DType) -> bool {
     from == to
         || matches!(
@@ -1106,6 +1149,9 @@ pub(crate) fn cast_pair_supported(from: DType, to: DType) -> bool {
                 | (DType::F32, DType::BF16)
                 | (DType::F32, DType::I32)
                 | (DType::F32, DType::Q4_0)
+                | (DType::F32, DType::Q4_1)
+                | (DType::F32, DType::Q5_0)
+                | (DType::F32, DType::Q5_1)
                 | (DType::F32, DType::Q8_0)
                 | (DType::F16, DType::F32)
                 | (DType::F16, DType::BF16)
@@ -1113,7 +1159,20 @@ pub(crate) fn cast_pair_supported(from: DType, to: DType) -> bool {
                 | (DType::BF16, DType::F16)
                 | (DType::I32, DType::F32)
         )
-        || (from.is_quantized() && to == DType::F32)
+        || (to == DType::F32
+            && matches!(
+                from,
+                DType::Q4_0
+                    | DType::Q4_1
+                    | DType::Q5_0
+                    | DType::Q5_1
+                    | DType::Q8_0
+                    | DType::Q2_K
+                    | DType::Q3_K
+                    | DType::Q4_K
+                    | DType::Q5_K
+                    | DType::Q6_K
+            ))
 }
 
 /// Row byte size for `ne0` elements (`ggml_row_size`; the caller

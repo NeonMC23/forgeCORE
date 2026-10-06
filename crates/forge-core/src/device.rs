@@ -203,8 +203,10 @@ pub struct DeviceProps {
 ///
 /// Dtype-carrying variants exist where device support genuinely
 /// varies by dtype (different kernels per conversion/table type);
-/// the fixed variants are probed with the only P6-supported operand
-/// combination (F32 data, I32 positions/indices, F32 masks).
+/// the fixed variants are probed with representative P6 operands
+/// (F32 data, I32 positions/indices, F32 masks; RoPE is probed NeoX,
+/// full head dim — CPU and CUDA support verdicts are mode-agnostic,
+/// verified in source).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpSpec {
     Add,
@@ -444,10 +446,12 @@ impl DeviceInfo {
                 }
             }
             OpSpec::Cast { from, to } => {
-                // dim 0 = 32: block-divisible for every quant type on
-                // either end (creation rule for `from`, quantizer
-                // rule for `to`).
-                let a = input(ctx, from, &[32, 4]);
+                // dim 0 = 256: block-divisible for every quant type on
+                // either end, including the 256-wide K super-blocks
+                // (creation rule for `from`, quantizer rule for `to`;
+                // a ragged probe would carry truncated strides and
+                // could misreport on backends that inspect dim 0).
+                let a = input(ctx, from, &[256, 4]);
                 if a.is_null() {
                     None
                 } else {
@@ -455,7 +459,9 @@ impl DeviceInfo {
                 }
             }
             OpSpec::GetRows { table } => {
-                let t = input(ctx, table, &[32, 8]);
+                // dim 0 = 256: block-divisible for every quant table
+                // including K super-blocks (see the cast probe).
+                let t = input(ctx, table, &[256, 8]);
                 let idx = input(ctx, DType::I32, &[5]);
                 if t.is_null() || idx.is_null() {
                     None
@@ -464,8 +470,10 @@ impl DeviceInfo {
                 }
             }
             OpSpec::Concat { dtype } => {
-                let a = input(ctx, dtype, &[32, 3]);
-                let b = input(ctx, dtype, &[32, 5]);
+                // dim 0 = 256: block-divisible for every quant dtype
+                // including K super-blocks (see the cast probe).
+                let a = input(ctx, dtype, &[256, 3]);
+                let b = input(ctx, dtype, &[256, 5]);
                 if a.is_null() || b.is_null() {
                     None
                 } else {

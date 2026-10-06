@@ -61,8 +61,11 @@ impl<'a> BufferType<'a> {
         unsafe { forge_sys::ggml_backend_buft_is_host(self.raw) }
     }
 
-    /// Padded bytes this buffer type would reserve for `tensor`
-    /// (views report 0 — they reserve nothing).
+    /// Padded bytes this buffer type would reserve for `tensor` (a
+    /// metadata query reported verbatim: the base CPU type has no
+    /// padding hook and reports `nbytes`, including the span for
+    /// views — views still reserve nothing at allocation time, since
+    /// context allocation skips them).
     pub fn tensor_alloc_size(&self, tensor: &Tensor) -> usize {
         // SAFETY: buft is borrowed live and the tensor is live; the
         // query only reads metadata from both.

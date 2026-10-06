@@ -396,7 +396,6 @@ unsafe extern "C" {
     ) -> *mut ggml_tensor;
     pub fn ggml_build_forward_expand(cgraph: *mut ggml_cgraph, tensor: *mut ggml_tensor);
     pub fn ggml_tensor_overhead() -> usize;
-    pub fn ggml_graph_overhead() -> usize;
     pub fn ggml_nelements(tensor: *const ggml_tensor) -> i64;
     pub fn ggml_nbytes(tensor: *const ggml_tensor) -> usize;
     pub fn ggml_status_to_string(status: c_int) -> *const c_char;
@@ -413,8 +412,6 @@ unsafe extern "C" {
     pub fn ggml_n_dims(tensor: *const ggml_tensor) -> c_int;
     pub fn ggml_is_contiguous(tensor: *const ggml_tensor) -> bool;
     pub fn ggml_is_view(tensor: *const ggml_tensor) -> bool;
-    pub fn ggml_is_vector(tensor: *const ggml_tensor) -> bool;
-    pub fn ggml_is_transposed(tensor: *const ggml_tensor) -> bool;
     pub fn ggml_get_name(tensor: *const ggml_tensor) -> *const c_char;
     pub fn ggml_set_name(tensor: *mut ggml_tensor, name: *const c_char) -> *mut ggml_tensor;
     pub fn ggml_op_desc(tensor: *const ggml_tensor) -> *const c_char;
@@ -492,7 +489,6 @@ unsafe extern "C" {
         axis3: c_int,
     ) -> *mut ggml_tensor;
     pub fn ggml_cont(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
-    pub fn ggml_dup(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     pub fn ggml_concat(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
@@ -559,17 +555,11 @@ unsafe extern "C" {
         a: *mut ggml_tensor,
         b: *mut ggml_tensor,
     ) -> *mut ggml_tensor;
-    pub fn ggml_cpy(
-        ctx: *mut ggml_context,
-        a: *mut ggml_tensor,
-        b: *mut ggml_tensor,
-    ) -> *mut ggml_tensor;
     pub fn ggml_cast(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
         type_: c_int,
     ) -> *mut ggml_tensor;
-    pub fn ggml_fill(ctx: *mut ggml_context, a: *mut ggml_tensor, c: f32) -> *mut ggml_tensor;
     // -- ggml.h: graph sizing / introspection ------------------------
     // `new_graph_custom` NULL-dereferences its context allocation on
     // failure (release SEGV / debug abort), so `forge-core` sizes the
@@ -668,10 +658,6 @@ unsafe extern "C" {
         tensor: *const ggml_tensor,
     ) -> usize;
     pub fn ggml_backend_buft_is_host(buft: ggml_backend_buffer_type_t) -> bool;
-    pub fn ggml_backend_alloc_buffer(
-        backend: ggml_backend_t,
-        size: usize,
-    ) -> *mut ggml_backend_buffer;
     pub fn ggml_backend_buffer_name(buffer: *mut ggml_backend_buffer) -> *const c_char;
     pub fn ggml_backend_buffer_get_size(buffer: *mut ggml_backend_buffer) -> usize;
     pub fn ggml_backend_buffer_get_alignment(buffer: *mut ggml_backend_buffer) -> usize;
@@ -695,14 +681,6 @@ unsafe extern "C" {
         ctx: *mut ggml_context,
         backend: ggml_backend_t,
     ) -> *mut ggml_backend_buffer;
-    // Predicts (without allocating) the padded bytes
-    // `alloc_ctx_tensors_from_buft` would reserve for `ctx`. Asserts
-    // the context is `no_alloc` (always true for `forge-core`
-    // contexts); views and pre-allocated tensors count zero bytes.
-    pub fn ggml_backend_alloc_ctx_tensors_from_buft_size(
-        ctx: *mut ggml_context,
-        buft: ggml_backend_buffer_type_t,
-    ) -> usize;
     // Allocates every tensor in `ctx` from one buffer of type
     // `buft` (NULL on failure; NULL "all allocated" when `ctx`
     // holds only views, which `forge-core` never passes here).

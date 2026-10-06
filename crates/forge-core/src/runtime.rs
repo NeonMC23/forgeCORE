@@ -8,6 +8,11 @@
 //! asserts and dispatch tables exactly (see the Phase-6 report for
 //! the per-op audit): each rule names the abort, overrun, or silent
 //! misread it prevents.
+//!
+//! One cosmetic side effect: executing an op visits its inputs, and
+//! ggml names anonymous visited tensors (`leaf_N`/`node_N`), so an
+//! input's [`Tensor::name`](crate::tensor::Tensor::name) may change
+//! from `""` after it is used in an op. Names never affect execution.
 
 use crate::backend::Backend;
 use crate::dtype::DType;
@@ -153,8 +158,10 @@ fn check_norm(a: &Tensor, eps: f32, op: &str) -> Result<()> {
 }
 
 /// Run one scratch graph (op node already built in `ctx`) on
-/// `backend`, then wrap the result. `inputs` feeds the graph-size
-/// bound. NULL op nodes (context OOM) unwind the context.
+/// `backend`, then wrap the result. `graph_size` is the caller's
+/// precomputed `1 + inputs' bounds`: it sized the scratch graph (via
+/// [`new_exec_ctx`](crate::tensor::new_exec_ctx)) and becomes the
+/// result's bound. NULL op nodes (context OOM) unwind the context.
 pub(crate) fn finish(
     op: &str,
     backend: &Backend,
@@ -163,7 +170,7 @@ pub(crate) fn finish(
     raw: *mut forge_sys::ggml_tensor,
     dtype: DType,
     shape: Vec<usize>,
-    inputs: &[&Tensor],
+    graph_size: usize,
 ) -> Result<Tensor> {
     if raw.is_null() {
         // SAFETY: ctx is live and uniquely owned here.
@@ -193,7 +200,6 @@ pub(crate) fn finish(
                 Backend::status_message(status)
             )));
         }
-        let graph_size = Tensor::child_graph_size(inputs)?;
         Ok(Tensor::wrap_computed(
             backend, ctx, raw, buffer, dtype, shape, graph_size,
         ))
@@ -205,11 +211,12 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     check_pair(a, b, "add")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(3)?;
+    let graph_size = Tensor::child_graph_size(&[a, b])?;
+    let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     // SAFETY: ctx/inputs live; preconditions mirror the asserts.
     unsafe {
         let raw = forge_sys::ggml_add(ctx, a.raw(), b.raw());
-        finish("add", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a, b])
+        finish("add", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -218,10 +225,11 @@ pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     check_pair(a, b, "sub")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(3)?;
+    let graph_size = Tensor::child_graph_size(&[a, b])?;
+    let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_sub(ctx, a.raw(), b.raw());
-        finish("sub", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a, b])
+        finish("sub", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -230,10 +238,11 @@ pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     check_pair(a, b, "mul")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(3)?;
+    let graph_size = Tensor::child_graph_size(&[a, b])?;
+    let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_mul(ctx, a.raw(), b.raw());
-        finish("mul", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a, b])
+        finish("mul", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -242,10 +251,11 @@ pub fn div(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     check_pair(a, b, "div")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(3)?;
+    let graph_size = Tensor::child_graph_size(&[a, b])?;
+    let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_div(ctx, a.raw(), b.raw());
-        finish("div", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a, b])
+        finish("div", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -276,30 +286,24 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         )));
     }
     if !a.is_contiguous() {
-        // The `mul_mat` kernel indexes A by packed rows
-        // (`nb00 == sizeof(float)` reads); a strided A silently
-        // misreads. (P5 needed no such check: its tensors were
-        // always contiguous.)
+        // `vec_dot` reads A's rows packed (no within-row stride), so a
+        // strided A silently misreads. Contiguity also implies
+        // `!is_transposed` (packed `nb0 <= nb1` for non-empty dim 0),
+        // which is what the constructor asserts — `b` may be strided
+        // (the kernel strides it explicitly).
         return Err(Error::invalid(
             "matmul needs a contiguous first input (use `cont` first)",
         ));
     }
-    if Tensor::is_transposed_native(a.raw()) {
-        // `is_transposed(a)` takes the kernel's vector/dot path with
-        // B-row assumptions the strided layout does not meet; refuse
-        // instead of silently computing the wrong product.
-        return Err(Error::invalid(
-            "matmul refuses a transposed first input (use `cont` first)",
-        ));
-    }
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(3)?;
+    let graph_size = Tensor::child_graph_size(&[a, b])?;
+    let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     let out_shape = vec![ashape[1], bshape[1]];
     unsafe {
         let raw = forge_sys::ggml_mul_mat(ctx, a.raw(), b.raw());
        
-        finish("matmul", &backend, ctx, graph_cap, raw, DType::F32, out_shape, &[a, b])
+        finish("matmul", &backend, ctx, graph_cap, raw, DType::F32, out_shape, graph_size)
     }
 }
 
@@ -308,10 +312,11 @@ pub fn silu(a: &Tensor) -> Result<Tensor> {
     check_unary(a, "silu")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(1)?;
+    let graph_size = Tensor::child_graph_size(&[a])?;
+    let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_silu(ctx, a.raw());
-        finish("silu", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a])
+        finish("silu", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -320,10 +325,11 @@ pub fn sqr(a: &Tensor) -> Result<Tensor> {
     check_unary(a, "sqr")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(1)?;
+    let graph_size = Tensor::child_graph_size(&[a])?;
+    let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_sqr(ctx, a.raw());
-        finish("sqr", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a])
+        finish("sqr", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -332,10 +338,11 @@ pub fn sqrt(a: &Tensor) -> Result<Tensor> {
     check_unary(a, "sqrt")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(1)?;
+    let graph_size = Tensor::child_graph_size(&[a])?;
+    let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_sqrt(ctx, a.raw());
-        finish("sqrt", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a])
+        finish("sqrt", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -344,10 +351,11 @@ pub fn scale(a: &Tensor, s: f32) -> Result<Tensor> {
     check_unary(a, "scale")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(1)?;
+    let graph_size = Tensor::child_graph_size(&[a])?;
+    let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_scale(ctx, a.raw(), s);
-        finish("scale", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a])
+        finish("scale", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 /// RMS normalization over dim 0 (per column), `x / rms(x, eps)`.
@@ -355,10 +363,11 @@ pub fn rms_norm(a: &Tensor, eps: f32) -> Result<Tensor> {
     check_norm(a, eps, "rms_norm")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(1)?;
+    let graph_size = Tensor::child_graph_size(&[a])?;
+    let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_rms_norm(ctx, a.raw(), eps);
-        finish("rms_norm", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a])
+        finish("rms_norm", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -367,10 +376,11 @@ pub fn norm(a: &Tensor, eps: f32) -> Result<Tensor> {
     check_norm(a, eps, "norm")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(1)?;
+    let graph_size = Tensor::child_graph_size(&[a])?;
+    let (ctx, graph_cap) = new_exec_ctx(1, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_norm(ctx, a.raw(), eps);
-        finish("norm", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a])
+        finish("norm", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -379,10 +389,11 @@ pub fn soft_max(a: &Tensor) -> Result<Tensor> {
     check_unary(a, "soft_max")?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(2)?;
+    let graph_size = Tensor::child_graph_size(&[a])?;
+    let (ctx, graph_cap) = new_exec_ctx(2, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_soft_max(ctx, a.raw());
-        finish("soft_max", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a])
+        finish("soft_max", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
@@ -391,11 +402,13 @@ pub fn soft_max(a: &Tensor) -> Result<Tensor> {
 ///
 /// `mask` must be F32 or F16 (the kernel reads F16 masks through a
 /// dedicated path and any other dtype as F32 — silently wrong), must
-/// be contiguous (rows are read packed), and must cover `a`:
-/// `mask.ne0 >= a.ne0` and `mask.ne1 >= a.ne1` (the row loop indexes
-/// the mask directly in dim 1 and reads full rows in dim 0 — short
-/// masks over-read with no assert). Higher mask dims broadcast by
-/// modulo. `scale`/`max_bias` are pure arithmetic (any `f32`).
+/// be contiguous (rows are read packed), and must fit `a` exactly in
+/// dim 0 (`mask.ne0 == a.ne0`) while covering dim 1
+/// (`mask.ne1 >= a.ne1`); higher mask dims must divide `a`'s
+/// (`a.ne2 % mask.ne2 == 0`, `a.ne3 % mask.ne3 == 0`). These mirror
+/// the constructor asserts — violations abort natively.
+/// `scale`/`max_bias` are pure arithmetic (any `f32`); NaN inputs
+/// propagate NaNs without aborting.
 pub fn soft_max_ext(
     a: &Tensor,
     mask: &Tensor,
@@ -435,10 +448,11 @@ pub fn soft_max_ext(
     }
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(3)?;
+    let graph_size = Tensor::child_graph_size(&[a, mask])?;
+    let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_soft_max_ext(ctx, a.raw(), mask.raw(), scale, max_bias);
-        finish("soft_max_ext", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a, mask])
+        finish("soft_max_ext", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 /// Rotary position embeddings over dim 0 (`ggml_rope_ext`).
@@ -515,7 +529,8 @@ pub fn rope(
         .map_err(|_| Error::invalid("rope n_ctx_orig exceeds i32 range"))?;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(3)?;
+    let graph_size = Tensor::child_graph_size(&[a, positions])?;
+    let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_rope_ext(
             ctx,
@@ -532,13 +547,15 @@ pub fn rope(
             params.beta_fast,
             params.beta_slow,
         );
-        finish("rope", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), &[a, positions])
+        finish("rope", &backend, ctx, graph_cap, raw, DType::F32, a.shape().to_vec(), graph_size)
     }
 }
 
-/// Whether the `get_rows` kernel implements `dtype` tables
-/// (everything except the aborting Q8_K/I8/I16/F64; shared by
-/// [`get_rows`] and op probes).
+/// Whether the `get_rows` kernel implements `dtype` tables (shared
+/// by [`get_rows`] and op probes). Q8_K is absent from the kernel's
+/// dispatch (aborts); Q8_1 dispatches but has no dequantizer row
+/// (`to_float` is NULL — it would call a NULL pointer); I8/I16/F64
+/// abort as unimplemented.
 pub(crate) fn get_rows_table_supported(dtype: DType) -> bool {
     matches!(
         dtype,
@@ -551,7 +568,6 @@ pub(crate) fn get_rows_table_supported(dtype: DType) -> bool {
             | DType::Q5_0
             | DType::Q5_1
             | DType::Q8_0
-            | DType::Q8_1
             | DType::Q2_K
             | DType::Q3_K
             | DType::Q4_K
@@ -564,12 +580,13 @@ pub(crate) fn get_rows_table_supported(dtype: DType) -> bool {
 /// `[d, k, ...]` (same dtype for I32 tables, else F32).
 ///
 /// The table must be contiguous and its dtype must be one the kernel
-/// implements (F32/F16/BF16/I32/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K —
-/// Q8_K/I8/I16/F64 abort). Indices must be contiguous I32 with
-/// `indices.ne1 == table.ne2`, `indices.ne2 == table.ne3`,
-/// `indices.ne3 == 1` (the constructor asserts), and every index is
-/// range-checked against the row count (out-of-range indices
-/// over-read with no assert).
+/// implements (F32/F16/BF16/I32/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K —
+/// Q8_K/I8/I16/F64 abort in dispatch, Q8_1 has no dequantizer).
+/// Indices must be contiguous I32 with `indices.ne1 == table.ne2`,
+/// `indices.ne2 == table.ne3`, `indices.ne3 == 1` (the constructor
+/// asserts), and every index is range-checked against the row count
+/// (the kernel asserts bounds per row — prevalidation turns that
+/// abort into an error).
 pub fn get_rows(table: &Tensor, indices: &Tensor) -> Result<Tensor> {
     check_same_backend(&[table, indices], "get_rows")?;
     if !get_rows_table_supported(table.dtype()) {
@@ -623,16 +640,21 @@ pub fn get_rows(table: &Tensor, indices: &Tensor) -> Result<Tensor> {
     ];
 
     let backend = Backend::from_inner(Rc::clone(table.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(3)?;
+    let graph_size = Tensor::child_graph_size(&[table, indices])?;
+    let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_get_rows(ctx, table.raw(), indices.raw());
-        finish("get_rows", &backend, ctx, graph_cap, raw, out_dtype, out_shape, &[table, indices])
+        finish("get_rows", &backend, ctx, graph_cap, raw, out_dtype, out_shape, graph_size)
     }
 }
 
 /// Concatenate `a` and `b` along `dim` (shapes must match on every
-/// other axis; quantized inputs must both be contiguous — the
-/// strided path asserts packed rows per block size).
+/// other axis; dtypes must match). Non-quantized inputs may have any
+/// strides (the kernel copies element-wise through strides);
+/// quantized inputs must both be contiguous (the row path asserts
+/// packed rows and block-divisible dim-0 joins — the divisibility
+/// holds by construction since every quant tensor in the system is
+/// created block-divisible).
 pub fn concat(a: &Tensor, b: &Tensor, dim: usize) -> Result<Tensor> {
     check_same_backend(&[a, b], "concat")?;
     if dim >= crate::tensor::MAX_DIMS {
@@ -681,7 +703,8 @@ pub fn concat(a: &Tensor, b: &Tensor, dim: usize) -> Result<Tensor> {
     out_shape[dim] = joined;
 
     let backend = Backend::from_inner(Rc::clone(a.backend_inner()));
-    let (ctx, graph_cap) = new_exec_ctx(3)?;
+    let graph_size = Tensor::child_graph_size(&[a, b])?;
+    let (ctx, graph_cap) = new_exec_ctx(3, graph_size)?;
     unsafe {
         let raw = forge_sys::ggml_concat(
             ctx,
@@ -689,6 +712,6 @@ pub fn concat(a: &Tensor, b: &Tensor, dim: usize) -> Result<Tensor> {
             b.raw(),
             dim as std::os::raw::c_int,
         );
-        finish("concat", &backend, ctx, graph_cap, raw, a.dtype(), out_shape, &[a, b])
+        finish("concat", &backend, ctx, graph_cap, raw, a.dtype(), out_shape, graph_size)
     }
 }

@@ -60,6 +60,32 @@ pub struct NodeInfo {
     pub is_view: bool,
 }
 
+/// Snapshot a live graph node into owned [`NodeInfo`].
+///
+/// # Safety
+///
+/// The caller guarantees `node` points to a live tensor.
+unsafe fn snapshot_node(node: *mut forge_sys::ggml_tensor) -> NodeInfo {
+    // SAFETY: node is live per the caller contract; every getter
+    // only reads metadata; the name/op strings are NUL-terminated
+    // (ggml zero-initializes names and writes them truncation-safe).
+    unsafe {
+        NodeInfo {
+            name: CStr::from_ptr(forge_sys::ggml_get_name(node))
+                .to_string_lossy()
+                .into_owned(),
+            op: CStr::from_ptr(forge_sys::ggml_op_desc(node))
+                .to_string_lossy()
+                .into_owned(),
+            nelements: usize::try_from(forge_sys::ggml_nelements(node)).unwrap_or(0),
+            nbytes: forge_sys::ggml_nbytes(node),
+            n_dims: usize::try_from(forge_sys::ggml_n_dims(node)).unwrap_or(0),
+            is_contiguous: forge_sys::ggml_is_contiguous(node),
+            is_view: forge_sys::ggml_is_view(node),
+        }
+    }
+}
+
 /// A multi-output computation graph borrowing its output tensors.
 pub struct Graph<'t> {
     ctx: *mut forge_sys::ggml_context,
@@ -86,6 +112,12 @@ impl<'t> Graph<'t> {
     pub fn with_capacity(capacity: usize) -> Result<Self> {
         if capacity < 1 {
             return Err(Error::invalid("graph capacity must be at least 1"));
+        }
+        if capacity > u32::MAX as usize {
+            // The native size polynomial is wrap-free below 2^32 slots;
+            // above that the context could be undersized while the node
+            // arrays stay huge — a heap overrun (see `new_exec_ctx`).
+            return Err(Error::invalid("graph capacity exceeds u32 range"));
         }
         // SAFETY: pure size computation.
         let mem_size = unsafe { forge_sys::ggml_graph_overhead_custom(capacity, false) };
@@ -143,22 +175,10 @@ impl<'t> Graph<'t> {
         let index_i32 = std::os::raw::c_int::try_from(index)
             .map_err(|_| Error::invalid("node index exceeds i32 range"))?;
         // SAFETY: index is bounds-checked, so the node is live for
-        // the graph's lifetime; all getters only read metadata.
+        // the graph's lifetime.
         unsafe {
             let node = forge_sys::ggml_graph_node(self.raw, index_i32);
-            Ok(NodeInfo {
-                name: CStr::from_ptr(forge_sys::ggml_get_name(node))
-                    .to_string_lossy()
-                    .into_owned(),
-                op: CStr::from_ptr(forge_sys::ggml_op_desc(node))
-                    .to_string_lossy()
-                    .into_owned(),
-                nelements: usize::try_from(forge_sys::ggml_nelements(node)).unwrap_or(0),
-                nbytes: forge_sys::ggml_nbytes(node),
-                n_dims: usize::try_from(forge_sys::ggml_n_dims(node)).unwrap_or(0),
-                is_contiguous: forge_sys::ggml_is_contiguous(node),
-                is_view: forge_sys::ggml_is_view(node),
-            })
+            Ok(snapshot_node(node))
         }
     }
 
@@ -168,25 +188,13 @@ impl<'t> Graph<'t> {
     pub fn find(&self, name: &str) -> Option<NodeInfo> {
         let cname = CString::new(name).ok()?;
         // SAFETY: raw is a live graph; cname is NUL-terminated;
-        // NULL (absent) is checked.
+        // NULL (absent) is checked, so a found node is live.
         unsafe {
             let node = forge_sys::ggml_graph_get_tensor(self.raw, cname.as_ptr());
             if node.is_null() {
                 return None;
             }
-            Some(NodeInfo {
-                name: CStr::from_ptr(forge_sys::ggml_get_name(node))
-                    .to_string_lossy()
-                    .into_owned(),
-                op: CStr::from_ptr(forge_sys::ggml_op_desc(node))
-                    .to_string_lossy()
-                    .into_owned(),
-                nelements: usize::try_from(forge_sys::ggml_nelements(node)).unwrap_or(0),
-                nbytes: forge_sys::ggml_nbytes(node),
-                n_dims: usize::try_from(forge_sys::ggml_n_dims(node)).unwrap_or(0),
-                is_contiguous: forge_sys::ggml_is_contiguous(node),
-                is_view: forge_sys::ggml_is_view(node),
-            })
+            Some(snapshot_node(node))
         }
     }
 
@@ -195,9 +203,12 @@ impl<'t> Graph<'t> {
     /// Refuses mixed-backend outputs and expansions that could
     /// overflow the node or leaf arrays (a release abort natively):
     /// both `n_nodes + output.bound` and `leaf_high + output.bound`
-    /// must fit. Adding the same tensor twice duplicates its nodes
-    /// (native per-call visited sets — no cross-call dedup); the
-    /// bound accounts each call separately, so this stays sound.
+    /// must fit. Adding the same tensor twice adds nothing the second
+    /// time (the native visited set persists across calls); the bound
+    /// accounts each call separately, so this stays conservative.
+    /// Anonymous tensors are named `leaf_N`/`node_N` on first add
+    /// (native `ggml_format_name`), which is visible through
+    /// [`Tensor::name`](crate::tensor::Tensor::name) afterwards.
     pub fn add_output(&mut self, output: &'t Tensor) -> Result<()> {
         match &self.backend {
             None => {

@@ -172,7 +172,11 @@ impl Backend {
     }
 
     /// This backend's default buffer type (borrowed; owned by the
-    /// backend itself, so it cannot outlive `&self`).
+    /// backend itself, so it cannot outlive `&self`). Every backend
+    /// at the pin returns its context-owned type here (never NULL —
+    /// the same trust [`Tensor::empty`](crate::tensor::Tensor::empty)
+    /// already places via context allocation, which dereferences it
+    /// unconditionally).
     pub fn default_buffer_type(&self) -> crate::buffer::BufferType<'_> {
         // SAFETY: raw is live; the returned buft is owned by the
         // backend and stays valid while `self` is borrowed.
