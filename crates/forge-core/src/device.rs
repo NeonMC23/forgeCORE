@@ -62,34 +62,60 @@ pub(crate) fn device_count() -> usize {
     unsafe { forge_sys::ggml_backend_dev_count() }
 }
 
-/// Snapshot every device in the ggml backend registry.
+/// Snapshot one registry device by index (bounds- and NULL-checked).
+pub(crate) fn snapshot(index: usize) -> Result<DeviceInfo, crate::error::Error> {
+    ensure_registry();
+    if index >= device_count() {
+        return Err(crate::error::Error::invalid(format!(
+            "stale device index {index} (registry holds {})",
+            device_count()
+        )));
+    }
+    // SAFETY: index < dev_count, so the handle is valid for the
+    // registry's lifetime (process-wide); NULL (vanishing device) is
+    // checked, and every string is NULL-checked before reading.
+    unsafe {
+        let dev = forge_sys::ggml_backend_dev_get(index);
+        if dev.is_null() {
+            return Err(crate::error::Error::backend(format!(
+                "device {index} vanished from the registry"
+            )));
+        }
+        let name = optional_str(forge_sys::ggml_backend_dev_name(dev));
+        let description = optional_str(forge_sys::ggml_backend_dev_description(dev));
+        let device_type = DeviceType::from_ggml(forge_sys::ggml_backend_dev_type(dev));
+        let mut free = 0usize;
+        let mut total = 0usize;
+        forge_sys::ggml_backend_dev_memory(dev, &mut free, &mut total);
+        Ok(DeviceInfo {
+            index,
+            name,
+            description,
+            device_type,
+            memory_free: free,
+            memory_total: total,
+        })
+    }
+}
+
+/// Copy a native string pointer, tolerating NULL (yields `""`).
+unsafe fn optional_str(ptr: *const std::os::raw::c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    // SAFETY: non-NULL static native string.
+    CStr::from_ptr(ptr).to_string_lossy().into_owned()
+}
+
+/// Snapshot every device in the ggml backend registry (devices that
+/// vanish mid-scan are skipped).
 pub fn enumerate_devices() -> Vec<DeviceInfo> {
     ensure_registry();
-    let count =
-        // SAFETY: no arguments; valid once the registry is loaded.
-        unsafe { forge_sys::ggml_backend_dev_count() };
+    let count = device_count();
     let mut devices = Vec::with_capacity(count);
     for index in 0..count {
-        // SAFETY: index < dev_count, so the handle is valid for the
-        // registry's lifetime (process-wide); name/description/memory
-        // getters take a valid handle and plain out-pointers.
-        unsafe {
-            let dev = forge_sys::ggml_backend_dev_get(index);
-            let name = CStr::from_ptr(forge_sys::ggml_backend_dev_name(dev)).to_string_lossy();
-            let description =
-                CStr::from_ptr(forge_sys::ggml_backend_dev_description(dev)).to_string_lossy();
-            let device_type = DeviceType::from_ggml(forge_sys::ggml_backend_dev_type(dev));
-            let mut free = 0usize;
-            let mut total = 0usize;
-            forge_sys::ggml_backend_dev_memory(dev, &mut free, &mut total);
-            devices.push(DeviceInfo {
-                index,
-                name: name.into_owned(),
-                description: description.into_owned(),
-                device_type,
-                memory_free: free,
-                memory_total: total,
-            });
+        if let Ok(info) = snapshot(index) {
+            devices.push(info);
         }
     }
     devices
@@ -140,6 +166,333 @@ pub fn supports_mlock() -> bool {
 pub fn supports_gpu_offload() -> bool {
     // SAFETY: no arguments; loads the registry itself when needed.
     unsafe { forge_sys::llama_supports_gpu_offload() }
+}
+
+/// Functionality flags for one registry device
+/// (`ggml_backend_dev_caps`, copied out by value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceCaps {
+    /// Device supports asynchronous compute.
+    pub async_compute: bool,
+    /// Device can allocate host-visible buffers.
+    pub host_buffer: bool,
+    /// Device can wrap caller-owned host pointers.
+    pub buffer_from_host_ptr: bool,
+    /// Device supports events.
+    pub events: bool,
+    /// Backend build supports memory mapping.
+    pub mmap: bool,
+}
+
+/// Full property block for one registry device
+/// (`ggml_backend_dev_props`, copied out by value — no borrowed
+/// pointers escape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceProps {
+    pub name: String,
+    pub description: String,
+    pub memory_free: usize,
+    pub memory_total: usize,
+    pub device_type: DeviceType,
+    /// Backend device id (NULL natively — e.g. on CPU — maps to `None`).
+    pub device_id: Option<String>,
+    pub caps: DeviceCaps,
+}
+
+/// One ForgeCore op family for [`DeviceInfo::supports_op`].
+///
+/// Dtype-carrying variants exist where device support genuinely
+/// varies by dtype (different kernels per conversion/table type);
+/// the fixed variants are probed with the only P6-supported operand
+/// combination (F32 data, I32 positions/indices, F32 masks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpSpec {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Matmul,
+    Silu,
+    Sqr,
+    Sqrt,
+    Scale,
+    RmsNorm,
+    Norm,
+    Softmax,
+    SoftmaxExt,
+    Rope,
+    Cast { from: crate::dtype::DType, to: crate::dtype::DType },
+    GetRows { table: crate::dtype::DType },
+    Concat { dtype: crate::dtype::DType },
+}
+
+impl DeviceInfo {
+    /// Read this device's full property block (fails only for stale
+    /// indices or vanishing devices).
+    pub fn props(&self) -> Result<DeviceProps, crate::error::Error> {
+        ensure_registry();
+        if self.index >= device_count() {
+            return Err(crate::error::Error::invalid(format!(
+                "stale device index {} (registry holds {})",
+                self.index,
+                device_count()
+            )));
+        }
+        // SAFETY: index is bounds-checked; the props struct is a
+        // plain out-block (`get_props` memsets it first); every
+        // string is copied out immediately with NULL checks.
+        unsafe {
+            let dev = forge_sys::ggml_backend_dev_get(self.index);
+            if dev.is_null() {
+                return Err(crate::error::Error::backend(format!(
+                    "device {} ({}) vanished from the registry",
+                    self.index, self.name
+                )));
+            }
+            let mut raw: forge_sys::ggml_backend_dev_props = std::mem::zeroed();
+            forge_sys::ggml_backend_dev_get_props(dev, &mut raw);
+            let device_id = if raw.device_id.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(raw.device_id).to_string_lossy().into_owned())
+            };
+            Ok(DeviceProps {
+                name: optional_str(raw.name),
+                description: optional_str(raw.description),
+                memory_free: raw.memory_free,
+                memory_total: raw.memory_total,
+                device_type: DeviceType::from_ggml(raw.type_),
+                device_id,
+                caps: DeviceCaps {
+                    async_compute: raw.caps.r#async,
+                    host_buffer: raw.caps.host_buffer,
+                    buffer_from_host_ptr: raw.caps.buffer_from_host_ptr,
+                    events: raw.caps.events,
+                    mmap: raw.caps.mmap_support,
+                },
+            })
+        }
+    }
+
+    /// Query whether this device implements `op`
+    /// (`ggml_backend_dev_supports_op`) by building a fully
+    /// allocated probe node with representative P6 operands and
+    /// asking the device.
+    ///
+    /// The probe tensors are allocated from the device's own buffer
+    /// type (never computed — only queried): CPU support reads
+    /// metadata alone, but other devices' queries are only
+    /// source-audited, so allocated probes keep every device on its
+    /// safe path. Dtype-carrying specs outside the P6-supported
+    /// envelope fail instead of probing (a verdict there would be
+    /// meaningless — ForgeCore never issues such ops).
+    pub fn supports_op(&self, op: OpSpec) -> Result<bool, crate::error::Error> {
+        use crate::error::Error;
+        match op {
+            OpSpec::Cast { from, to } => {
+                if !crate::tensor::cast_pair_supported(from, to) {
+                    return Err(Error::invalid(format!(
+                        "cannot probe unsupported cast {} -> {}",
+                        from.name(),
+                        to.name()
+                    )));
+                }
+            }
+            OpSpec::GetRows { table } => {
+                if !crate::runtime::get_rows_table_supported(table) {
+                    return Err(Error::invalid(format!(
+                        "cannot probe unsupported get_rows table {}",
+                        table.name()
+                    )));
+                }
+            }
+            _ => {}
+        }
+        ensure_registry();
+        if self.index >= device_count() {
+            return Err(Error::invalid(format!(
+                "stale device index {} (registry holds {})",
+                self.index,
+                device_count()
+            )));
+        }
+        // SAFETY: index is bounds-checked; the probe builder checks
+        // every NULL return and frees its context and buffer on all
+        // paths; the device query only reads the probe's metadata.
+        unsafe {
+            let dev = forge_sys::ggml_backend_dev_get(self.index);
+            if dev.is_null() {
+                return Err(Error::backend(format!(
+                    "device {} ({}) vanished from the registry",
+                    self.index, self.name
+                )));
+            }
+            let buft = forge_sys::ggml_backend_dev_buffer_type(dev);
+            if buft.is_null() {
+                return Err(Error::backend(format!(
+                    "device {} ({}) has no buffer type",
+                    self.index, self.name
+                )));
+            }
+            self.probe_op(dev, buft, op)
+        }
+    }
+
+    /// Build one allocated probe node for `op` and query the device.
+    /// Caller guarantees live `dev`/`buft`; every failure path frees
+    /// what it allocated.
+    unsafe fn probe_op(
+        &self,
+        dev: forge_sys::ggml_backend_dev_t,
+        buft: forge_sys::ggml_backend_buffer_type_t,
+        op: OpSpec,
+    ) -> Result<bool, crate::error::Error> {
+        use crate::dtype::DType;
+        use crate::error::Error;
+        // Scratch metadata context (inputs + op node + slack).
+        let ctx = crate::tensor::new_ctx(6).map_err(|_| {
+            Error::backend("op probe context allocation failed")
+        })?;
+        // One probe input; NULL on context OOM.
+        unsafe fn input(
+            ctx: *mut forge_sys::ggml_context,
+            dtype: DType,
+            ne: &[i64],
+        ) -> *mut forge_sys::ggml_tensor {
+            // SAFETY: caller guarantees a live context; `ne` points
+            // to `ne.len()` valid extents; dtype ids are mapped.
+            forge_sys::ggml_new_tensor(
+                ctx,
+                dtype.ggml_type(),
+                ne.len() as std::os::raw::c_int,
+                ne.as_ptr(),
+            )
+        }
+        // Build the probe node; `None` = input/node creation failed.
+        let node = match op {
+            OpSpec::Add | OpSpec::Sub | OpSpec::Mul | OpSpec::Div => {
+                let a = input(ctx, DType::F32, &[4, 3]);
+                let b = input(ctx, DType::F32, &[4, 3]);
+                if a.is_null() || b.is_null() {
+                    None
+                } else {
+                    Some(match op {
+                        OpSpec::Add => forge_sys::ggml_add(ctx, a, b),
+                        OpSpec::Sub => forge_sys::ggml_sub(ctx, a, b),
+                        OpSpec::Mul => forge_sys::ggml_mul(ctx, a, b),
+                        _ => forge_sys::ggml_div(ctx, a, b),
+                    })
+                }
+            }
+            OpSpec::Matmul => {
+                let a = input(ctx, DType::F32, &[8, 4]);
+                let b = input(ctx, DType::F32, &[8, 5]);
+                if a.is_null() || b.is_null() {
+                    None
+                } else {
+                    Some(forge_sys::ggml_mul_mat(ctx, a, b))
+                }
+            }
+            OpSpec::Silu | OpSpec::Sqr | OpSpec::Sqrt | OpSpec::Scale | OpSpec::RmsNorm
+            | OpSpec::Norm | OpSpec::Softmax => {
+                let a = input(ctx, DType::F32, &[8, 5]);
+                if a.is_null() {
+                    None
+                } else {
+                    Some(match op {
+                        OpSpec::Silu => forge_sys::ggml_silu(ctx, a),
+                        OpSpec::Sqr => forge_sys::ggml_sqr(ctx, a),
+                        OpSpec::Sqrt => forge_sys::ggml_sqrt(ctx, a),
+                        OpSpec::Scale => forge_sys::ggml_scale(ctx, a, 2.0),
+                        OpSpec::RmsNorm => forge_sys::ggml_rms_norm(ctx, a, 1e-5),
+                        OpSpec::Norm => forge_sys::ggml_norm(ctx, a, 1e-5),
+                        _ => forge_sys::ggml_soft_max(ctx, a),
+                    })
+                }
+            }
+            OpSpec::SoftmaxExt => {
+                let a = input(ctx, DType::F32, &[8, 5]);
+                let mask = input(ctx, DType::F32, &[8, 5]);
+                if a.is_null() || mask.is_null() {
+                    None
+                } else {
+                    Some(forge_sys::ggml_soft_max_ext(ctx, a, mask, 1.0, 0.0))
+                }
+            }
+            OpSpec::Rope => {
+                let a = input(ctx, DType::F32, &[8, 4, 6]);
+                let pos = input(ctx, DType::I32, &[6]);
+                if a.is_null() || pos.is_null() {
+                    None
+                } else {
+                    Some(forge_sys::ggml_rope_ext(
+                        ctx,
+                        a,
+                        pos,
+           
+                        std::ptr::null_mut(),
+                        8,
+                        forge_sys::rope_type::NEOX,
+                        32,
+                        10_000.0,
+                        1.0,
+                        0.0,
+                        1.0,
+                        32.0,
+                        1.0,
+                    ))
+                }
+            }
+            OpSpec::Cast { from, to } => {
+                // dim 0 = 32: block-divisible for every quant type on
+                // either end (creation rule for `from`, quantizer
+                // rule for `to`).
+                let a = input(ctx, from, &[32, 4]);
+                if a.is_null() {
+                    None
+                } else {
+                    Some(forge_sys::ggml_cast(ctx, a, to.ggml_type()))
+                }
+            }
+            OpSpec::GetRows { table } => {
+                let t = input(ctx, table, &[32, 8]);
+                let idx = input(ctx, DType::I32, &[5]);
+                if t.is_null() || idx.is_null() {
+                    None
+                } else {
+                    Some(forge_sys::ggml_get_rows(ctx, t, idx))
+                }
+            }
+            OpSpec::Concat { dtype } => {
+                let a = input(ctx, dtype, &[32, 3]);
+                let b = input(ctx, dtype, &[32, 5]);
+                if a.is_null() || b.is_null() {
+                    None
+                } else {
+                    Some(forge_sys::ggml_concat(ctx, a, b, 1))
+                }
+            }
+        };
+        let node = match node {
+            Some(node) if !node.is_null() => node,
+            _ => {
+                forge_sys::ggml_free(ctx);
+                return Err(Error::backend("op probe node creation failed"));
+            }
+        };
+        // Allocate the probe from the device's own buffer type so
+        // the support query runs on the device's safe path.
+        let buffer =
+            forge_sys::ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if buffer.is_null() {
+            forge_sys::ggml_free(ctx);
+            return Err(Error::backend("op probe allocation failed"));
+        }
+        let verdict = forge_sys::ggml_backend_dev_supports_op(dev, node);
+        forge_sys::ggml_backend_buffer_free(buffer);
+        forge_sys::ggml_free(ctx);
+        Ok(verdict)
+    }
 }
 
 #[cfg(test)]

@@ -17,10 +17,12 @@
 
 pub mod backend;
 pub mod batch;
+pub mod buffer;
 pub mod context;
 pub mod device;
 pub mod dtype;
 pub mod error;
+pub mod graph;
 pub mod memory;
 pub mod model;
 pub mod reference;
@@ -31,18 +33,23 @@ pub mod tokenizer;
 
 pub use backend::Backend;
 pub use batch::{Batch, BatchBuilder, SeqId, TokenId};
+pub use buffer::{Buffer, BufferType};
 pub use context::{
     AttentionType, Context, ContextOptions, Embeddings, FlashAttnType, Logits, PoolingType,
 };
 pub use device::{
     enumerate_devices, max_devices, supports_gpu_offload, supports_mlock, supports_mmap,
-    DeviceInfo, DeviceType,
+    DeviceCaps, DeviceInfo, DeviceProps, DeviceType, OpSpec,
 };
 pub use dtype::DType;
 pub use error::{Error, Result};
+pub use graph::{Graph, NodeInfo, Plan, DEFAULT_GRAPH_CAPACITY};
 pub use memory::{Memory, SeqState, State};
 pub use model::{GpuLayers, Model, ModelLoadMode, ModelOptions, SplitMode};
-pub use runtime::{add, matmul};
+pub use runtime::{
+    add, concat, div, get_rows, matmul, mul, norm, rms_norm, rope, scale, silu, soft_max,
+    soft_max_ext, sqr, sqrt, sub, RopeMode, RopeParams,
+};
 pub use sampler::{SampleConfig, SamplerChain};
-pub use tensor::Tensor;
+pub use tensor::{Tensor, MAX_DIMS};
 pub use tokenizer::{DecodeOptions, EncodeOptions, SpecialTokens, TokenAttr, Tokenizer, VocabType};

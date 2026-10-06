@@ -34,6 +34,7 @@ opaque! {
     ggml_backend,
     ggml_backend_dev,
     ggml_backend_buffer,
+    ggml_backend_buffer_type,
     llama_model,
     llama_vocab,
     llama_context,
@@ -45,6 +46,12 @@ opaque! {
 pub type ggml_backend_t = *mut ggml_backend;
 /// `ggml_backend_dev_t` — pointer to an opaque backend device.
 pub type ggml_backend_dev_t = *mut ggml_backend_dev;
+/// `ggml_backend_buffer_type_t` — borrowed buffer-type handle (owned by
+/// the backend or device that produced it; never freed by callers).
+pub type ggml_backend_buffer_type_t = *mut ggml_backend_buffer_type;
+/// `ggml_backend_graph_plan_t` — opaque execution plan (`void *`
+/// upstream); freed with [`ggml_backend_graph_plan_free`].
+pub type ggml_backend_graph_plan_t = *mut c_void;
 /// `llama_memory_t` — the context-owned memory object (`llama.h`).
 /// Borrowed from the context via `llama_get_memory`; NULL when the
 /// model architecture has no memory (e.g. BERT encoders). Must never
@@ -198,6 +205,35 @@ pub struct ggml_init_params {
     pub mem_size: usize,
     pub mem_buffer: *mut c_void,
     pub no_alloc: bool,
+}
+
+/// `struct ggml_backend_dev_caps` (`ggml-backend.h`): functionality
+/// flags for one registry device. Plain data (5 bytes); `forge-core`
+/// copies it out by value and never stores the pointers.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ggml_backend_dev_caps {
+    pub r#async: bool,
+    pub host_buffer: bool,
+    pub buffer_from_host_ptr: bool,
+    pub events: bool,
+    pub mmap_support: bool,
+}
+
+/// `struct ggml_backend_dev_props` (`ggml-backend.h`): the full
+/// property block for one registry device. `name`/`description` are
+/// borrowed static strings; `device_id` is NULL when unknown.
+/// `forge-core` copies every field out immediately.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ggml_backend_dev_props {
+    pub name: *const c_char,
+    pub description: *const c_char,
+    pub memory_free: usize,
+    pub memory_total: usize,
+    pub type_: c_int,
+    pub device_id: *const c_char,
+    pub caps: ggml_backend_dev_caps,
 }
 
 /// `struct llama_model_params` (`llama.h`). Construct via
@@ -358,7 +394,6 @@ unsafe extern "C" {
         a: *mut ggml_tensor,
         b: *mut ggml_tensor,
     ) -> *mut ggml_tensor;
-    pub fn ggml_new_graph(ctx: *mut ggml_context) -> *mut ggml_cgraph;
     pub fn ggml_build_forward_expand(cgraph: *mut ggml_cgraph, tensor: *mut ggml_tensor);
     pub fn ggml_tensor_overhead() -> usize;
     pub fn ggml_graph_overhead() -> usize;
@@ -366,6 +401,194 @@ unsafe extern "C" {
     pub fn ggml_nbytes(tensor: *const ggml_tensor) -> usize;
     pub fn ggml_status_to_string(status: c_int) -> *const c_char;
     pub fn ggml_log_set(log_callback: ggml_log_callback, user_data: *mut c_void);
+    // -- ggml.h: dtype facts (pure table lookups; total for valid
+    // type ids, which `DType` guarantees; `row_size` additionally
+    // debug-asserts block divisibility, prevalidated by callers) ----
+    pub fn ggml_blck_size(type_: c_int) -> c_longlong;
+    pub fn ggml_type_size(type_: c_int) -> usize;
+    pub fn ggml_row_size(type_: c_int, ne: c_longlong) -> usize;
+    pub fn ggml_is_quantized(type_: c_int) -> bool;
+    // -- ggml.h: tensor metadata (pure predicates/getters off live
+    // tensors; total) ----------------------------------------------
+    pub fn ggml_n_dims(tensor: *const ggml_tensor) -> c_int;
+    pub fn ggml_is_contiguous(tensor: *const ggml_tensor) -> bool;
+    pub fn ggml_is_view(tensor: *const ggml_tensor) -> bool;
+    pub fn ggml_is_vector(tensor: *const ggml_tensor) -> bool;
+    pub fn ggml_is_transposed(tensor: *const ggml_tensor) -> bool;
+    pub fn ggml_get_name(tensor: *const ggml_tensor) -> *const c_char;
+    pub fn ggml_set_name(tensor: *mut ggml_tensor, name: *const c_char) -> *mut ggml_tensor;
+    pub fn ggml_op_desc(tensor: *const ggml_tensor) -> *const c_char;
+    // -- ggml.h: shape ops (constructors; every assert below is
+    // prevalidated in `forge-core`, see the Phase-6 report) ---------
+    pub fn ggml_reshape_1d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: c_longlong,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_reshape_2d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: c_longlong,
+        ne1: c_longlong,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_reshape_3d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: c_longlong,
+        ne1: c_longlong,
+        ne2: c_longlong,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_reshape_4d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: c_longlong,
+        ne1: c_longlong,
+        ne2: c_longlong,
+        ne3: c_longlong,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_view_1d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: c_longlong,
+        offset: usize,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_view_2d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: c_longlong,
+        ne1: c_longlong,
+        nb1: usize,
+        offset: usize,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_view_3d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: c_longlong,
+        ne1: c_longlong,
+        ne2: c_longlong,
+        nb1: usize,
+        nb2: usize,
+        offset: usize,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_view_4d(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        ne0: c_longlong,
+        ne1: c_longlong,
+        ne2: c_longlong,
+        ne3: c_longlong,
+        nb1: usize,
+        nb2: usize,
+        nb3: usize,
+        offset: usize,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_transpose(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    pub fn ggml_permute(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        axis0: c_int,
+        axis1: c_int,
+        axis2: c_int,
+        axis3: c_int,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_cont(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    pub fn ggml_dup(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    pub fn ggml_concat(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        dim: c_int,
+    ) -> *mut ggml_tensor;
+    // -- ggml.h: compute ops (constructors; asserts prevalidated in
+    // `forge-core`; compute-side dispatch audited per op, see the
+    // Phase-6 report) ------------------------------------------------
+    pub fn ggml_sub(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_mul(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_div(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_scale(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        s: f32,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_sqr(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    pub fn ggml_sqrt(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    pub fn ggml_silu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    pub fn ggml_rms_norm(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        eps: f32,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_norm(ctx: *mut ggml_context, a: *mut ggml_tensor, eps: f32) -> *mut ggml_tensor;
+    pub fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+    pub fn ggml_soft_max_ext(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        mask: *mut ggml_tensor,
+        scale: f32,
+        max_bias: f32,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_rope_ext(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+        c: *mut ggml_tensor,
+        n_dims: c_int,
+        mode: c_int,
+        n_ctx_orig: c_int,
+        freq_base: f32,
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_get_rows(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_cpy(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_cast(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        type_: c_int,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_fill(ctx: *mut ggml_context, a: *mut ggml_tensor, c: f32) -> *mut ggml_tensor;
+    // -- ggml.h: graph sizing / introspection ------------------------
+    // `new_graph_custom` NULL-dereferences its context allocation on
+    // failure (release SEGV / debug abort), so `forge-core` sizes the
+    // graph context with `graph_overhead_custom` exactly and still
+    // NULL-checks. `graph_node` asserts only the lower bound, so
+    // `forge-core` bounds-checks both ends. `n_nodes`/`get_tensor`
+    // are total.
+    pub fn ggml_new_graph_custom(
+        ctx: *mut ggml_context,
+        size: usize,
+        grads: bool,
+    ) -> *mut ggml_cgraph;
+    pub fn ggml_graph_overhead_custom(size: usize, grads: bool) -> usize;
+    pub fn ggml_graph_n_nodes(cgraph: *mut ggml_cgraph) -> c_int;
+    pub fn ggml_graph_node(cgraph: *mut ggml_cgraph, i: c_int) -> *mut ggml_tensor;
+    pub fn ggml_graph_get_tensor(
+        cgraph: *const ggml_cgraph,
+        name: *const c_char,
+    ) -> *mut ggml_tensor;
 
     // -- ggml-backend.h: devices / buffers / execution ----------------------
     pub fn ggml_backend_load_all();
@@ -397,16 +620,108 @@ unsafe extern "C" {
     );
     pub fn ggml_backend_graph_compute(backend: ggml_backend_t, cgraph: *mut ggml_cgraph) -> c_int;
     pub fn ggml_backend_synchronize(backend: ggml_backend_t);
+    // -- ggml-backend.h: association / plans / copies (Phase 6) -----
+    // `get_device` only asserts liveness. Plan creation asserts the
+    // backend implements the plan interface — true for CPU, NULL for
+    // every other backend at the pin (verified in source), so
+    // `forge-core` only plans on CPU backends (`is_cpu`-gated) and
+    // NULL-checks the OOM path. `tensor_copy` asserts identical
+    // layout (non-public predicate: same type/ne/nb) and dereferences
+    // both buffers without resolving views (NULL deref on views), so
+    // `forge-core` requires same dtype+shape, contiguity, and
+    // non-views on both ends.
+    pub fn ggml_backend_get_device(backend: ggml_backend_t) -> ggml_backend_dev_t;
+    pub fn ggml_backend_graph_plan_create(
+        backend: ggml_backend_t,
+        cgraph: *mut ggml_cgraph,
+    ) -> ggml_backend_graph_plan_t;
+    pub fn ggml_backend_graph_plan_free(
+        backend: ggml_backend_t,
+        plan: ggml_backend_graph_plan_t,
+    );
+    pub fn ggml_backend_graph_plan_compute(
+        backend: ggml_backend_t,
+        plan: ggml_backend_graph_plan_t,
+    ) -> c_int;
+    pub fn ggml_backend_tensor_copy(
+        src: *const ggml_tensor,
+        dst: *mut ggml_tensor,
+    );
+    // -- ggml-backend.h: buffer types / buffers (borrowed bufts are
+    // owned by their backend or device; owned buffers free with
+    // `buffer_free`; every getter below only asserts liveness) ------
+    pub fn ggml_backend_get_default_buffer_type(
+        backend: ggml_backend_t,
+    ) -> ggml_backend_buffer_type_t;
+    pub fn ggml_backend_dev_buffer_type(
+        device: ggml_backend_dev_t,
+    ) -> ggml_backend_buffer_type_t;
+    pub fn ggml_backend_buft_name(buft: ggml_backend_buffer_type_t) -> *const c_char;
+    pub fn ggml_backend_buft_alloc_buffer(
+        buft: ggml_backend_buffer_type_t,
+        size: usize,
+    ) -> *mut ggml_backend_buffer;
+    pub fn ggml_backend_buft_get_alignment(buft: ggml_backend_buffer_type_t) -> usize;
+    pub fn ggml_backend_buft_get_max_size(buft: ggml_backend_buffer_type_t) -> usize;
+    pub fn ggml_backend_buft_get_alloc_size(
+        buft: ggml_backend_buffer_type_t,
+        tensor: *const ggml_tensor,
+    ) -> usize;
+    pub fn ggml_backend_buft_is_host(buft: ggml_backend_buffer_type_t) -> bool;
+    pub fn ggml_backend_alloc_buffer(
+        backend: ggml_backend_t,
+        size: usize,
+    ) -> *mut ggml_backend_buffer;
+    pub fn ggml_backend_buffer_name(buffer: *mut ggml_backend_buffer) -> *const c_char;
+    pub fn ggml_backend_buffer_get_size(buffer: *mut ggml_backend_buffer) -> usize;
+    pub fn ggml_backend_buffer_get_alignment(buffer: *mut ggml_backend_buffer) -> usize;
+    pub fn ggml_backend_buffer_get_max_size(buffer: *mut ggml_backend_buffer) -> usize;
+    pub fn ggml_backend_buffer_is_host(buffer: *mut ggml_backend_buffer) -> bool;
+    // -- ggml-backend.h: device properties / op support -------------
+    // `get_props` memsets then fills (device_id NULL when unknown).
+    // `supports_op` reads op/src metadata only (verified for CPU;
+    // `forge-core` passes fully allocated probes regardless).
+    pub fn ggml_backend_dev_get_props(
+        device: ggml_backend_dev_t,
+        props: *mut ggml_backend_dev_props,
+    );
+    pub fn ggml_backend_dev_supports_op(
+        device: ggml_backend_dev_t,
+        op: *const ggml_tensor,
+    ) -> bool;
 
     // -- ggml-alloc.h: static graph/tensor allocation ------------------------
     pub fn ggml_backend_alloc_ctx_tensors(
         ctx: *mut ggml_context,
         backend: ggml_backend_t,
     ) -> *mut ggml_backend_buffer;
+    // Predicts (without allocating) the padded bytes
+    // `alloc_ctx_tensors_from_buft` would reserve for `ctx`. Asserts
+    // the context is `no_alloc` (always true for `forge-core`
+    // contexts); views and pre-allocated tensors count zero bytes.
+    pub fn ggml_backend_alloc_ctx_tensors_from_buft_size(
+        ctx: *mut ggml_context,
+        buft: ggml_backend_buffer_type_t,
+    ) -> usize;
+    // Allocates every tensor in `ctx` from one buffer of type
+    // `buft` (NULL on failure; NULL "all allocated" when `ctx`
+    // holds only views, which `forge-core` never passes here).
+    pub fn ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx: *mut ggml_context,
+        buft: ggml_backend_buffer_type_t,
+    ) -> *mut ggml_backend_buffer;
 
     // -- ggml-cpu.h: CPU backend controls ------------------------------------
     pub fn ggml_backend_cpu_init() -> ggml_backend_t;
     pub fn ggml_backend_cpu_set_n_threads(backend_cpu: ggml_backend_t, n_threads: c_int);
+    // NULL-safe guid comparison; total.
+    pub fn ggml_backend_is_cpu(backend: ggml_backend_t) -> bool;
+    // Fills every element of `tensor` with `value`. Aborts for
+    // quantized dtypes (only I8/I16/I32/F16/BF16/F32 are
+    // implemented); debug-asserts packed dim 0 and reads row strides
+    // that are only correct for contiguous higher dims, so
+    // `forge-core` requires F32 + contiguity and a live allocation.
+    pub fn ggml_set_f32(tensor: *mut ggml_tensor, value: f32) -> *mut ggml_tensor;
 
     // -- llama.h: model loading / metadata ----------------------------------
     pub fn llama_model_default_params() -> llama_model_params;
@@ -754,5 +1069,27 @@ mod layout_tests {
     fn llama_sampler_chain_params_layout() {
         assert_eq!(size_of::<llama_sampler_chain_params>(), 1);
         assert_eq!(offset_of!(llama_sampler_chain_params, no_perf), 0);
+    }
+
+    #[test]
+    fn ggml_backend_dev_caps_layout() {
+        assert_eq!(size_of::<ggml_backend_dev_caps>(), 5);
+        assert_eq!(offset_of!(ggml_backend_dev_caps, r#async), 0);
+        assert_eq!(offset_of!(ggml_backend_dev_caps, host_buffer), 1);
+        assert_eq!(offset_of!(ggml_backend_dev_caps, buffer_from_host_ptr), 2);
+        assert_eq!(offset_of!(ggml_backend_dev_caps, events), 3);
+        assert_eq!(offset_of!(ggml_backend_dev_caps, mmap_support), 4);
+    }
+
+    #[test]
+    fn ggml_backend_dev_props_layout() {
+        assert_eq!(size_of::<ggml_backend_dev_props>(), 56);
+        assert_eq!(offset_of!(ggml_backend_dev_props, name), 0);
+        assert_eq!(offset_of!(ggml_backend_dev_props, description), 8);
+        assert_eq!(offset_of!(ggml_backend_dev_props, memory_free), 16);
+        assert_eq!(offset_of!(ggml_backend_dev_props, memory_total), 24);
+        assert_eq!(offset_of!(ggml_backend_dev_props, type_), 32);
+        assert_eq!(offset_of!(ggml_backend_dev_props, device_id), 40);
+        assert_eq!(offset_of!(ggml_backend_dev_props, caps), 48);
     }
 }

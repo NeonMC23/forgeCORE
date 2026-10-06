@@ -66,6 +66,31 @@ impl DType {
         Ok(dtype)
     }
 
+    /// Whether ggml stores this type in quantized blocks
+    /// (`ggml_is_quantized`; total for mapped ids).
+    pub fn is_quantized(self) -> bool {
+        // SAFETY: the discriminant is a valid ggml type id by
+        // construction, which is all the lookup needs.
+        unsafe { forge_sys::ggml_is_quantized(self.ggml_type()) }
+    }
+
+    /// Elements per block (`ggml_blck_size`; 1 for plain types).
+    pub fn block_len(self) -> usize {
+        // SAFETY: valid type id; the result is a small positive
+        // constant per type.
+        let blck = unsafe { forge_sys::ggml_blck_size(self.ggml_type()) };
+        debug_assert!(blck > 0, "ggml block size is positive");
+        blck as usize
+    }
+
+    /// Bytes per block (`ggml_type_size`; bytes per element for plain
+    /// types).
+    pub fn type_size(self) -> usize {
+        // SAFETY: valid type id; the result is a small positive
+        // constant per type.
+        unsafe { forge_sys::ggml_type_size(self.ggml_type()) }
+    }
+
     /// Short stable name (matches the ggml spelling).
     pub fn name(self) -> &'static str {
         match self {

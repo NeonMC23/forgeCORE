@@ -133,6 +133,63 @@ impl Backend {
         &self.inner.name
     }
 
+    /// Whether this is the CPU backend (native guid comparison;
+    /// total, NULL-safe). Only CPU backends implement graph plans.
+    pub fn is_cpu(&self) -> bool {
+        // SAFETY: raw is a live backend; the check reads its guid.
+        unsafe { forge_sys::ggml_backend_is_cpu(self.inner.raw) }
+    }
+
+    /// Block until all work queued on this backend completes. The
+    /// native wrapper NULL-checks the interface pointer, so this is
+    /// total (a no-op on synchronous backends such as CPU).
+    pub fn synchronize(&self) {
+        // SAFETY: raw is a live backend.
+        unsafe { forge_sys::ggml_backend_synchronize(self.inner.raw) };
+    }
+
+    /// Resolve this backend to its registry [`DeviceInfo`].
+    ///
+    /// Matches the backend's device handle against the registry by
+    /// pointer; fails only if the device vanished (practically
+    /// unreachable — the registry outlives every backend).
+    pub fn device(&self) -> Result<DeviceInfo> {
+        device::ensure_registry();
+        // SAFETY: raw is live, so its device handle is valid; the
+        // registry scan below only compares pointers.
+        let dev = unsafe { forge_sys::ggml_backend_get_device(self.inner.raw) };
+        let count = device::device_count();
+        for index in 0..count {
+            // SAFETY: index < dev_count.
+            let candidate = unsafe { forge_sys::ggml_backend_dev_get(index) };
+            if candidate == dev {
+                return device::snapshot(index);
+            }
+        }
+        Err(Error::backend(
+            "backend device is not in the registry".to_string(),
+        ))
+    }
+
+    /// This backend's default buffer type (borrowed; owned by the
+    /// backend itself, so it cannot outlive `&self`).
+    pub fn default_buffer_type(&self) -> crate::buffer::BufferType<'_> {
+        // SAFETY: raw is live; the returned buft is owned by the
+        // backend and stays valid while `self` is borrowed.
+        let buft = unsafe { forge_sys::ggml_backend_get_default_buffer_type(self.inner.raw) };
+        crate::buffer::BufferType::from_raw(buft)
+    }
+
+    /// Map a native graph-compute status code to its message.
+    pub(crate) fn status_message(status: std::os::raw::c_int) -> String {
+        // SAFETY: the lookup only reads a static table.
+        unsafe {
+            std::ffi::CStr::from_ptr(forge_sys::ggml_status_to_string(status))
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
     pub(crate) fn from_inner(inner: Rc<BackendInner>) -> Self {
         Self { inner }
     }
