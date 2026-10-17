@@ -86,6 +86,12 @@ impl Error {
     pub fn state(message: impl Into<String>) -> Self {
         Self(format!("state error: {}", message.into()))
     }
+
+    /// GGUF inspection failure (malformed, truncated, unsupported, or
+    /// out-of-bounds metadata and tensor descriptors).
+    pub fn gguf(message: impl Into<String>) -> Self {
+        Self(format!("gguf error: {}", message.into()))
+    }
 }
 
 impl fmt::Display for Error {
@@ -118,5 +124,6 @@ mod tests {
         assert_eq!(Error::embeddings("x").0, "embeddings error: x");
         assert_eq!(Error::memory("x").0, "memory error: x");
         assert_eq!(Error::state("x").0, "state error: x");
+        assert_eq!(Error::gguf("x").0, "gguf error: x");
     }
 }

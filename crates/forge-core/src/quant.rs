@@ -1,4 +1,8 @@
-//! Quantization interface and scalar reference decoders.
+//! Checked quantization geometry plus crate-private scalar reference decoders.
+//!
+//! The public surface in this module is the format identity and checked
+//! storage geometry. Scalar decoders remain internal validation helpers; they
+//! do not replace the native execution path.
 //!
 //! ## Scope of this phase
 //!
@@ -18,7 +22,7 @@
 //! ## Implemented formats
 //!
 //! * [`QuantFormat::F16`] / [`QuantFormat::BF16`]: 2 bytes per value,
-//!   decoded through [`crate::dtype`].
+//!   decoded through the frozen scalar conversion helpers.
 //! * [`QuantFormat::Q4_0`]: 32 values per 18-byte block: little-endian F16
 //!   scale `d`, then 16 bytes of packed 4-bit nibbles (low nibble first);
 //!   `value = (nibble - 8) * d`.
@@ -32,26 +36,40 @@
 //!
 //! ## Row geometry
 //!
-//! A quantized matrix with [`MatrixShape`](crate::shape::MatrixShape)
+//! A quantized matrix with [`MatrixShape`]
 //! `[input, output]` stores `output` consecutive rows of
 //! [`row_bytes`] bytes; row `o` starts at byte `o * row_bytes`. The number
 //! of blocks per row is `input / values_per_block`, so `input` must be an
 //! exact multiple of the block width.
 
-use crate::dtype::{bf16_bits_to_f32, f16_bits_to_f32};
+use crate::dtype::DType;
 use crate::error::{Error, Result};
-use crate::shape::MatrixShape;
+use crate::reference::convert::{bf16_bits_to_f32, f16_bits_to_f32};
+use crate::reference::shape::MatrixShape;
 
-/// Quantized or narrow storage formats in ForgeCore's target set.
+/// GGUF storage formats with checked block geometry.
 ///
 /// Variant names intentionally mirror the GGML format spellings (`Q4_0`,
 /// `Q6_K`, ...) instead of UpperCamelCase so code, errors, and GGUF
-/// tooling all name the same format the same way.
+/// tooling all name the same format the same way. The safe inspection subset
+/// is the set accepted by [`QuantFormat::from_dtype`].
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuantFormat {
+    /// 32-bit IEEE float, one value per encoded element.
+    F32,
+    /// 16-bit IEEE float.
+    F16,
+    /// 16-bit brain float.
+    BF16,
     /// 4-bit, 32 values per block.
     Q4_0,
+    /// 8-bit, 32 values per block.
+    Q8_0,
+    /// 2-bit K-quant, 256 values per super-block.
+    Q2_K,
+    /// 3-bit K-quant, 256 values per super-block.
+    Q3_K,
     /// 4-bit K-quant, 256 values per super-block.
     Q4_K,
     /// 5-bit, 32 values per block.
@@ -60,29 +78,70 @@ pub enum QuantFormat {
     Q5_K,
     /// 6-bit K-quant, 256 values per super-block.
     Q6_K,
-    /// 8-bit, 32 values per block.
-    Q8_0,
     /// 8-bit K-quant, 256 values per super-block.
     Q8_K,
-    /// 16-bit IEEE float.
-    F16,
-    /// 16-bit brain float.
-    BF16,
 }
 
 impl QuantFormat {
     /// Short stable format name used in diagnostics and errors.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::BF16 => "BF16",
             Self::Q4_0 => "Q4_0",
+            Self::Q8_0 => "Q8_0",
+            Self::Q2_K => "Q2_K",
+            Self::Q3_K => "Q3_K",
             Self::Q4_K => "Q4_K",
             Self::Q5_0 => "Q5_0",
             Self::Q5_K => "Q5_K",
             Self::Q6_K => "Q6_K",
-            Self::Q8_0 => "Q8_0",
             Self::Q8_K => "Q8_K",
-            Self::F16 => "F16",
-            Self::BF16 => "BF16",
+        }
+    }
+
+    /// Convert the GGML dtype set supported by ForgeCore's inspection
+    /// contract into its checked storage-geometry format.
+    ///
+    /// Other GGML ids remain representable by [`DType`] for the native API,
+    /// but are intentionally rejected here until their safe geometry is part
+    /// of this contract.
+    pub fn from_dtype(dtype: DType) -> Result<Self> {
+        match dtype {
+            DType::F32 => Ok(Self::F32),
+            DType::F16 => Ok(Self::F16),
+            DType::BF16 => Ok(Self::BF16),
+            DType::Q4_0 => Ok(Self::Q4_0),
+            DType::Q8_0 => Ok(Self::Q8_0),
+            DType::Q2_K => Ok(Self::Q2_K),
+            DType::Q3_K => Ok(Self::Q3_K),
+            DType::Q4_K => Ok(Self::Q4_K),
+            DType::Q5_K => Ok(Self::Q5_K),
+            DType::Q6_K => Ok(Self::Q6_K),
+            DType::Q8_K => Ok(Self::Q8_K),
+            unsupported => Err(Error::unsupported(format!(
+                "{} has no checked GGUF geometry",
+                unsupported.name()
+            ))),
+        }
+    }
+
+    /// The corresponding safe-Rust GGML dtype.
+    pub const fn dtype(self) -> DType {
+        match self {
+            Self::F32 => DType::F32,
+            Self::F16 => DType::F16,
+            Self::BF16 => DType::BF16,
+            Self::Q4_0 => DType::Q4_0,
+            Self::Q8_0 => DType::Q8_0,
+            Self::Q2_K => DType::Q2_K,
+            Self::Q3_K => DType::Q3_K,
+            Self::Q4_K => DType::Q4_K,
+            Self::Q5_0 => DType::Q5_0,
+            Self::Q5_K => DType::Q5_K,
+            Self::Q6_K => DType::Q6_K,
+            Self::Q8_K => DType::Q8_K,
         }
     }
 }
@@ -105,6 +164,14 @@ pub struct BlockSpec {
 /// be re-verified against GGML headers when its decoder is implemented.
 pub const fn block_spec(format: QuantFormat) -> BlockSpec {
     match format {
+        QuantFormat::F32 => BlockSpec {
+            values_per_block: 1,
+            bytes_per_block: 4,
+        },
+        QuantFormat::F16 | QuantFormat::BF16 => BlockSpec {
+            values_per_block: 1,
+            bytes_per_block: 2,
+        },
         QuantFormat::Q4_0 => BlockSpec {
             values_per_block: 32,
             bytes_per_block: 18,
@@ -113,9 +180,21 @@ pub const fn block_spec(format: QuantFormat) -> BlockSpec {
             values_per_block: 32,
             bytes_per_block: 34,
         },
+        QuantFormat::Q2_K => BlockSpec {
+            values_per_block: 256,
+            bytes_per_block: 84,
+        },
+        QuantFormat::Q3_K => BlockSpec {
+            values_per_block: 256,
+            bytes_per_block: 110,
+        },
         QuantFormat::Q4_K => BlockSpec {
             values_per_block: 256,
             bytes_per_block: 144,
+        },
+        QuantFormat::Q5_0 => BlockSpec {
+            values_per_block: 32,
+            bytes_per_block: 22,
         },
         QuantFormat::Q5_K => BlockSpec {
             values_per_block: 256,
@@ -129,37 +208,49 @@ pub const fn block_spec(format: QuantFormat) -> BlockSpec {
             values_per_block: 256,
             bytes_per_block: 292,
         },
-        QuantFormat::Q5_0 => BlockSpec {
-            values_per_block: 32,
-            bytes_per_block: 22,
-        },
-        QuantFormat::F16 | QuantFormat::BF16 => BlockSpec {
-            values_per_block: 1,
-            bytes_per_block: 2,
-        },
     }
+}
+
+/// Checked encoded byte length for `element_count` values.
+///
+/// Quantized formats require an exact whole-block element count. Plain F32,
+/// F16, and BF16 formats use one value per block. Zero is valid and produces a
+/// zero-length payload, matching GGML's zero-element tensor representation.
+pub fn tensor_bytes(format: QuantFormat, element_count: u64) -> Result<u64> {
+    let spec = block_spec(format);
+    let values_per_block = u64::try_from(spec.values_per_block)
+        .map_err(|_| Error(format!("{} block width does not fit in u64", format.name())))?;
+    if element_count % values_per_block != 0 {
+        return Err(Error(format!(
+            "{} element count {element_count} is not a multiple of block width {}",
+            format.name(),
+            spec.values_per_block
+        )));
+    }
+    let blocks = element_count / values_per_block;
+    let bytes_per_block = u64::try_from(spec.bytes_per_block)
+        .map_err(|_| Error(format!("{} block size does not fit in u64", format.name())))?;
+    blocks.checked_mul(bytes_per_block).ok_or_else(|| {
+        Error(format!(
+            "{} tensor byte length overflows for {element_count} elements",
+            format.name()
+        ))
+    })
 }
 
 /// Encoded bytes of one matrix row of width `input_dim`.
 ///
 /// `input_dim` must be an exact multiple of the format's block width.
 pub fn row_bytes(format: QuantFormat, input_dim: usize) -> Result<usize> {
-    let spec = block_spec(format);
-    if input_dim == 0 || !input_dim.is_multiple_of(spec.values_per_block) {
-        return Err(Error(format!(
-            "{} input dimension {input_dim} is not a positive multiple of block width {}",
-            format.name(),
-            spec.values_per_block
-        )));
-    }
-    (input_dim / spec.values_per_block)
-        .checked_mul(spec.bytes_per_block)
-        .ok_or_else(|| {
-            Error(format!(
-                "{} row size overflows for input {input_dim}",
-                format.name()
-            ))
-        })
+    let input = u64::try_from(input_dim)
+        .map_err(|_| Error(format!("{} input dimension does not fit in u64", format.name())))?;
+    let bytes = tensor_bytes(format, input)?;
+    usize::try_from(bytes).map_err(|_| {
+        Error(format!(
+            "{} row size {bytes} does not fit in usize",
+            format.name()
+        ))
+    })
 }
 
 /// Scalar reference dequantization of exactly one matrix row.
@@ -167,7 +258,7 @@ pub fn row_bytes(format: QuantFormat, input_dim: usize) -> Result<usize> {
 /// `bytes` must hold exactly [`row_bytes`] bytes and `out` exactly
 /// `input_dim` values. Formats without a reviewed decoder return an
 /// explicit unsupported error.
-pub fn dequantize_row(
+pub(crate) fn dequantize_row(
     format: QuantFormat,
     bytes: &[u8],
     input_dim: usize,
@@ -221,7 +312,7 @@ pub fn dequantize_row(
 /// Each output row is dequantized by [`dequantize_row`] and dotted with `x`
 /// in F32 in input order. `raw` must hold exactly
 /// `row_bytes * shape.output` bytes.
-pub fn matvec_reference(
+pub(crate) fn matvec_reference(
     format: QuantFormat,
     raw: &[u8],
     shape: MatrixShape,
@@ -356,7 +447,7 @@ fn dequantize_row_bf16(bytes: &[u8], out: &mut [f32]) {
 /// Each output is `d * scale * (six_bit_quant - 32)` in F32 with
 /// left-to-right multiplication, exactly as GGML computes it.
 /// Reconstructed quants span `[-32, 31]`.
-pub fn dequantize_block_q6_k(block: &[u8], out: &mut [f32]) -> Result<()> {
+pub(crate) fn dequantize_block_q6_k(block: &[u8], out: &mut [f32]) -> Result<()> {
     if block.len() != Q6_K_BLOCK_BYTES {
         return Err(Error(format!(
             "Q6_K block byte mismatch: expected {Q6_K_BLOCK_BYTES}, got {}",
@@ -377,7 +468,7 @@ pub fn dequantize_block_q6_k(block: &[u8], out: &mut [f32]) -> Result<()> {
 ///
 /// Decodes the block with [`dequantize_block_q6_k`], then accumulates
 /// `sum(decoded[i] * x[i])` in F32 in index order.
-pub fn dot_block_q6_k(block: &[u8], x: &[f32]) -> Result<f32> {
+pub(crate) fn dot_block_q6_k(block: &[u8], x: &[f32]) -> Result<f32> {
     if x.len() != Q6_K_BLOCK_VALUES {
         return Err(Error(format!(
             "Q6_K block dot input mismatch: expected {Q6_K_BLOCK_VALUES}, got {}",
@@ -398,7 +489,7 @@ pub fn dot_block_q6_k(block: &[u8], x: &[f32]) -> Result<f32> {
 /// `row` must hold exactly `row_bytes(Q6_K, x.len())` bytes. Accumulation
 /// is one F32 running sum in global index order, identical to decoding
 /// the whole row and then dotting it.
-pub fn dot_row_q6_k(row: &[u8], x: &[f32]) -> Result<f32> {
+pub(crate) fn dot_row_q6_k(row: &[u8], x: &[f32]) -> Result<f32> {
     let expected = row_bytes(QuantFormat::Q6_K, x.len())?;
     if row.len() != expected {
         return Err(Error(format!(
@@ -580,7 +671,7 @@ mod tests {
         assert_eq!(row_bytes(QuantFormat::Q4_0, 64).unwrap(), 36);
         assert_eq!(row_bytes(QuantFormat::Q8_0, 32).unwrap(), 34);
         assert!(row_bytes(QuantFormat::Q4_0, 33).is_err());
-        assert!(row_bytes(QuantFormat::Q6_K, 0).is_err());
+        assert_eq!(row_bytes(QuantFormat::Q6_K, 0).unwrap(), 0);
     }
 
     /// Uniform Q6_K block: super-scale `d`, one int8 scale everywhere,
