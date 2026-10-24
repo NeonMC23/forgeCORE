@@ -233,6 +233,22 @@ pub struct ModelOptions {
     pub devices: Option<Vec<DeviceInfo>>,
     /// How the model file is mapped into memory.
     pub load_mode: ModelLoadMode,
+    /// Whether to use upstream's extra CPU buffer types (weight repacking).
+    ///
+    /// `None` preserves the upstream default (enabled). `Some(false)` keeps
+    /// quantized weights in the file-backed mapping instead of building an
+    /// anonymous repacked copy. This lowers anonymous residency at the cost
+    /// of slower CPU kernels for the affected quantization types.
+    pub use_extra_bufts: Option<bool>,
+}
+
+impl ModelOptions {
+    /// Disable upstream CPU weight repacking so quantized weights stay in
+    /// the file-backed mapping. Execution uses the generic kernels.
+    pub fn without_cpu_weight_repacking(mut self) -> Self {
+        self.use_extra_bufts = Some(false);
+        self
+    }
 }
 
 /// An owned libllama model (`.gguf` weights + metadata).
@@ -354,6 +370,7 @@ impl Model {
             params.load_mode = options.load_mode.as_native();
             params.main_gpu = main_gpu;
             params.check_tensors = options.check_tensors;
+            params.use_extra_bufts = options.use_extra_bufts.unwrap_or(params.use_extra_bufts);
             params.tensor_split = options
                 .tensor_split
                 .as_deref()
@@ -536,6 +553,17 @@ mod tests {
         assert_eq!(options.main_gpu, 0);
         assert!(options.tensor_split.is_none());
         assert!(options.devices.is_none());
+        assert_eq!(options.use_extra_bufts, None);
+    }
+
+    #[test]
+    fn repacking_can_be_disabled_without_changing_the_default() {
+        let options = ModelOptions::default();
+        assert_eq!(options.use_extra_bufts, None);
+        assert_eq!(
+            options.without_cpu_weight_repacking().use_extra_bufts,
+            Some(false)
+        );
     }
 
     #[test]
