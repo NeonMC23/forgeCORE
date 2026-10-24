@@ -116,9 +116,25 @@ PYTHONPATH="$FORGE_LLAMA_DIR/py" python3 scripts/make-tiny-gguf.py --tok \
 FORGE_TEST_MODEL_TOK="$FORGE_LLAMA_DIR/models/tiny-tok.gguf" cargo test -p forge-core --test tokenizer
 ```
 
+## BPE tokenizer fixture (optional)
+
+The same tokenizer suite also covers a live GPT-2-style BPE vocabulary.
+The fixture has vocab 11 (`<unk> <s> </s>`, `h e l o`, `he lo hel
+hello`), explicit merge ranks, `tokenizer.ggml.pre = "default"`, and no
+implicit BOS/EOS. It verifies that native BPE merge ranks produce exact
+token ids and that decode reconstructs the pieces.
+
+```sh
+. scripts/env.sh
+mkdir -p "$FORGE_LLAMA_DIR/models"
+PYTHONPATH="$FORGE_LLAMA_DIR/py" python3 scripts/make-tiny-gguf.py --bpe \
+    "$FORGE_LLAMA_DIR/models/tiny-bpe.gguf"
+FORGE_TEST_MODEL_BPE="$FORGE_LLAMA_DIR/models/tiny-bpe.gguf" cargo test -p forge-core --test tokenizer bpe
+```
+
 ## DSV4 fixture (optional)
 
-The `tests/kv_state.rs` DeepSeek-V4 regression tests need a third
+The `tests/kv_state.rs` DeepSeek-V4 regression tests need a fourth
 fixture: a minimal loadable `deepseek4`-architecture model (2 layers,
 compress ratios 4/128, 2 experts, seed 9) exercising the native
 `llama_kv_cache_dsv4` memory class, which asserts `seq < n_seq_max`

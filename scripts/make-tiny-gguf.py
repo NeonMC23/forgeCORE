@@ -3,11 +3,14 @@
 
 Deterministic (seed 7/8). Default mode writes the decode-path fixture:
 tiny dims vocab=32, embd=8, heads=2, kv=2, layers=1, ff=16, ctx=64 —
-about 7 KB. `--tok` mode writes the tokenizer fixture instead: same
+about 7 KB. `--tok` mode writes the SPM tokenizer fixture instead: same
 dims except vocab=269 (`<unk> <s> </s>`, ten `tokN` pieces, full
 `<0xXX>` byte coverage so SPM byte fallback never throws) with
-add_bos/add_eos both true. Files must be written OUTSIDE the repo
-(e.g. $FORGE_LLAMA_DIR/models); see docs/NATIVE.md.
+add_bos/add_eos both true. `--bpe` mode writes a GPT-2-style BPE
+fixture (vocab 11: `<unk> <s> </s>`, `h e l o`, `he lo hel hello`)
+with no add_bos/add_eos. `--dsv4` writes the DeepSeek-V4 KV fixture.
+Files must be written OUTSIDE the repo (e.g. $FORGE_LLAMA_DIR/models);
+see docs/NATIVE.md.
 
 Requires: pip install gguf numpy (with PIP_TARGET outside the repo).
 
@@ -16,6 +19,8 @@ Usage:
         "$FORGE_LLAMA_DIR/models/tiny-llama.gguf"
     PYTHONPATH="$FORGE_LLAMA_DIR/py" python3 scripts/make-tiny-gguf.py --tok \
         "$FORGE_LLAMA_DIR/models/tiny-tok.gguf"
+    PYTHONPATH="$FORGE_LLAMA_DIR/py" python3 scripts/make-tiny-gguf.py --bpe \
+        "$FORGE_LLAMA_DIR/models/tiny-bpe.gguf"
 """
 import sys
 
@@ -132,6 +137,70 @@ def main_tok(path):
         writer.add_tensor(prefix + "ffn_down.weight", trand(EMBD, N_FF))
     writer.add_tensor("output_norm.weight", trand(EMBD))
     writer.add_tensor("output.weight", trand(TOK_VOCAB, EMBD))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    print(f"wrote {path}")
+
+
+# BPE fixture: GPT-2-style vocabulary and merge ranks. The merge order
+# is significant: "hello" must merge h+e, then he+l, then l+o, then
+# hel+lo, producing the single id 10 token. add_bos/add_eos are false,
+# matching the GPT-2 convention and exercising the non-SPM metadata path.
+BPE_VOCAB = 11
+BPE_TOKENS = [
+    "<unk>", "<s>", "</s>", "h", "e", "l", "o",
+    "he", "lo", "hel", "hello",
+]
+BPE_MERGES = ["h e", "he l", "l o", "hel lo"]
+
+
+def main_bpe(path):
+    local_rng = np.random.default_rng(10)
+
+    def brand(*shape):
+        return (local_rng.standard_normal(shape) * 0.1).astype(np.float32)
+
+    writer = gguf.GGUFWriter(path, arch="llama", use_temp_file=False)
+    writer.add_vocab_size(BPE_VOCAB)
+    writer.add_context_length(N_CTX)
+    writer.add_embedding_length(EMBD)
+    writer.add_block_count(N_LAYER)
+    writer.add_feed_forward_length(N_FF)
+    writer.add_head_count(N_HEAD)
+    writer.add_head_count_kv(N_KV)
+    writer.add_rope_freq_base(10000.0)
+    writer.add_layer_norm_rms_eps(1e-5)
+
+    writer.add_tokenizer_model("gpt2")
+    writer.add_tokenizer_pre("default")
+    writer.add_token_list(BPE_TOKENS)
+    writer.add_token_scores([0.0] * BPE_VOCAB)
+    writer.add_token_types([2, 3, 3] + [1] * (BPE_VOCAB - 3))
+    writer.add_token_merges(BPE_MERGES)
+    writer.add_bos_token_id(1)
+    writer.add_eos_token_id(2)
+    writer.add_unk_token_id(0)
+    writer.add_add_bos_token(False)
+    writer.add_add_eos_token(False)
+
+    # numpy shape (d1, d0) -> gguf ne [d0, d1]
+    writer.add_tensor("token_embd.weight", brand(BPE_VOCAB, EMBD))
+    for i in range(N_LAYER):
+        prefix = f"blk.{i}."
+        writer.add_tensor(prefix + "attn_norm.weight", brand(EMBD))
+        writer.add_tensor(prefix + "attn_q.weight", brand(EMBD, EMBD))
+        writer.add_tensor(prefix + "attn_k.weight", brand(EMBD, EMBD))
+        writer.add_tensor(prefix + "attn_v.weight", brand(EMBD, EMBD))
+        writer.add_tensor(prefix + "attn_output.weight", brand(EMBD, EMBD))
+        writer.add_tensor(prefix + "ffn_norm.weight", brand(EMBD))
+        writer.add_tensor(prefix + "ffn_gate.weight", brand(N_FF, EMBD))
+        writer.add_tensor(prefix + "ffn_up.weight", brand(N_FF, EMBD))
+        writer.add_tensor(prefix + "ffn_down.weight", brand(EMBD, N_FF))
+    writer.add_tensor("output_norm.weight", brand(EMBD))
+    writer.add_tensor("output.weight", brand(BPE_VOCAB, EMBD))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -281,9 +350,13 @@ def main_dsv4(path):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "--tok":
-        main_tok(sys.argv[2])
-    elif sys.argv[1] == "--dsv4":
-        main_dsv4(sys.argv[2])
-    else:
+    if len(sys.argv) == 2:
         main(sys.argv[1])
+    elif len(sys.argv) == 3 and sys.argv[1] == "--tok":
+        main_tok(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "--dsv4":
+        main_dsv4(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "--bpe":
+        main_bpe(sys.argv[2])
+    else:
+        raise SystemExit(__doc__)

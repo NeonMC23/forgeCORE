@@ -6,8 +6,11 @@
 //! throws `std::out_of_range` upstream — see the phase-1 report §7),
 //! so that path is deliberately untested here. `FORGE_TEST_MODEL_TOK`
 //! (tiny-tok: vocab 269, full `<0xXX>` byte coverage, `add_bos` and
-//! `add_eos`) covers real encodes, decodes and round-trips. Each
-//! suite skips when its fixture is unset (see `docs/NATIVE.md`).
+//! `add_eos`) covers real encodes, decodes and round-trips.
+//! `FORGE_TEST_MODEL_BPE` (tiny-bpe: GPT-2-style vocab 11 with explicit
+//! merge ranks) covers the live BPE path without any native byte
+//! fallback. Each suite skips when its fixture is unset (see
+//! `docs/NATIVE.md`).
 
 use forge_core::{
     DecodeOptions, EncodeOptions, Model, SpecialTokens, TokenAttr, Tokenizer, VocabType,
@@ -377,4 +380,79 @@ fn tiny_encode_empty_only() {
     // has no byte pieces, so upstream byte fallback throws
     // std::out_of_range (observed SIGABRT; see report §7). Real
     // encodes are covered by the tiny-tok suite above.
+}
+
+// -- G. live BPE fixture (tiny-bpe) -------------------------------------------
+
+#[test]
+fn bpe_fixture_metadata_is_correct() {
+    let Some(model) = load("FORGE_TEST_MODEL_BPE") else {
+        return;
+    };
+    let tok = Tokenizer::open(&model).expect("open");
+    assert_eq!(tok.n_vocab(), 11);
+    assert_eq!(tok.vocab_type(), VocabType::Bpe);
+    assert!(!tok.adds_bos(), "GPT-2 BPE fixture leaves add_bos false");
+    assert!(!tok.adds_eos(), "GPT-2 BPE fixture leaves add_eos false");
+    assert_eq!(tok.special_tokens().bos, Some(1));
+    assert_eq!(tok.special_tokens().eos, Some(2));
+    let cases = [
+        (0, "<unk>", TokenAttr::UNKNOWN),
+        (1, "<s>", TokenAttr::CONTROL),
+        (2, "</s>", TokenAttr::CONTROL),
+        (3, "h", TokenAttr::NORMAL),
+        (10, "hello", TokenAttr::NORMAL),
+    ];
+    for (id, text, attr) in cases {
+        assert_eq!(tok.token_text(id).expect("text"), text, "id {id}");
+        assert_eq!(tok.token_attr(id).expect("attr"), attr, "id {id}");
+    }
+}
+
+#[test]
+fn bpe_merges_produce_exact_ids() {
+    let Some(model) = load("FORGE_TEST_MODEL_BPE") else {
+        return;
+    };
+    let tok = Tokenizer::open(&model).expect("open");
+    // Rank order: h+e -> he, he+l -> hel, l+o -> lo, hel+lo -> hello.
+    assert_eq!(tok.encode("h", &plain_options()).expect("h"), vec![3]);
+    assert_eq!(tok.encode("he", &plain_options()).expect("he"), vec![7]);
+    assert_eq!(tok.encode("hel", &plain_options()).expect("hel"), vec![9]);
+    assert_eq!(
+        tok.encode("hello", &plain_options()).expect("hello"),
+        vec![10]
+    );
+    assert_eq!(
+        tok.decode(&[10], &DecodeOptions::default())
+            .expect("decode"),
+        "hello"
+    );
+    assert_eq!(
+        tok.decode(&[3, 4, 5, 5, 6], &DecodeOptions::default())
+            .expect("decode pieces"),
+        "hello"
+    );
+}
+
+#[test]
+fn bpe_has_no_implicit_special_tokens() {
+    let Some(model) = load("FORGE_TEST_MODEL_BPE") else {
+        return;
+    };
+    let tok = Tokenizer::open(&model).expect("open");
+    assert_eq!(
+        tok.encode("", &plain_options()).expect("plain empty"),
+        Vec::<u32>::new()
+    );
+    assert_eq!(
+        tok.encode("", &EncodeOptions::default())
+            .expect("special empty"),
+        Vec::<u32>::new()
+    );
+    assert_eq!(
+        tok.encode("hello", &EncodeOptions::default())
+            .expect("default"),
+        vec![10]
+    );
 }

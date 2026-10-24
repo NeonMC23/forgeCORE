@@ -66,16 +66,17 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
 
 Native tree: workspace `native/` at the pinned v0.5.0 commit. Fixtures were
 generated with `scripts/make-tiny-gguf.py` into `/tmp` (default, `--tok`,
-`--dsv4`); no fixture is stored in the repository.
+`--bpe`, `--dsv4`); no fixture is stored in the repository.
 
 ```sh
 export FORGE_LLAMA_DIR="$PWD/../native"
 export FORGE_TEST_MODEL=/tmp/forge-native-models/tiny-llama.gguf
 export FORGE_TEST_MODEL_TOK=/tmp/forge-native-models/tiny-tok.gguf
+export FORGE_TEST_MODEL_BPE=/tmp/forge-native-models/tiny-bpe.gguf
 export FORGE_TEST_MODEL_DSV4=/tmp/forge-native-models/tiny-dsv4.gguf
 cargo fmt --all -- --check
 cargo check --workspace --locked
-cargo test --workspace --locked            # 366 tests, 5 GPU/multi-device skips
+cargo test --workspace --locked            # 369 tests, 5 GPU/multi-device skips
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
@@ -84,6 +85,7 @@ The fixtures are not stored in the repository. They were generated with:
 ```sh
 PYTHONPATH=/tmp/forge-audit-py python3 scripts/make-tiny-gguf.py /tmp/forge-native-models/tiny-llama.gguf
 PYTHONPATH=/tmp/forge-audit-py python3 scripts/make-tiny-gguf.py --tok /tmp/forge-native-models/tiny-tok.gguf
+PYTHONPATH=/tmp/forge-audit-py python3 scripts/make-tiny-gguf.py --bpe /tmp/forge-native-models/tiny-bpe.gguf
 PYTHONPATH=/tmp/forge-audit-py python3 scripts/make-tiny-gguf.py --dsv4 /tmp/forge-native-models/tiny-dsv4.gguf
 ```
 
@@ -95,10 +97,10 @@ Results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo check --workspace --locked`: passed.
-- `cargo test --workspace --locked` with all three fixtures: **366 passed, 0
-  failed, 5 skipped** (GPU absence and a two-device split test). Without
-  fixtures, 110 fixture-dependent tests report `SKIP`; they must not be counted
-  as executed coverage.
+- `cargo test --workspace --locked` with all four fixtures: **369 passed, 0
+  failed, 5 skipped** (GPU absence and a two-device split test). Without any
+  fixture environment, 113 `SKIP` lines are emitted (including the same 5
+  GPU/multi-device skips); they must not be counted as executed coverage.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 
 ## Explicit limitations
@@ -112,9 +114,9 @@ Results:
 - Model-path out-of-core weight streaming is not possible at the pin: libllama
   loads model weights eagerly. This is an architectural constraint, not a
   forgeCORE wrapper gap.
-- BPE tokenizer behavior is covered by source-level/unit tests only; the live
-  native tokenizer fixtures are SPM. A live BPE GGUF fixture remains future
-  work.
+- The live BPE fixture covers a small ASCII vocabulary with the `default`
+  GPT-2 pre-tokenizer. Byte-level BPE edge cases and other pre-tokenizer
+  variants (for example llama3) remain unverified.
 - The three pre-ggml pure-Rust integration tests are archived under
   `docs/archive/forge-core-legacy/tests/`; they are intentionally outside
   Cargo's test graph.

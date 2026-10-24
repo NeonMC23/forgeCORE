@@ -2,6 +2,8 @@
 **/target/
 *.gguf
 *.bin
+__pycache__/
+*.pyc
 *~
 *.swp
 *.swo
