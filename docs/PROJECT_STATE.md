@@ -76,7 +76,7 @@ export FORGE_TEST_MODEL_BPE=/tmp/forge-native-models/tiny-bpe.gguf
 export FORGE_TEST_MODEL_DSV4=/tmp/forge-native-models/tiny-dsv4.gguf
 cargo fmt --all -- --check
 cargo check --workspace --locked
-cargo test --workspace --locked            # 369 tests, 5 GPU/multi-device skips
+cargo test --workspace --locked            # 370 tests with all four fixtures
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
@@ -97,11 +97,34 @@ Results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo check --workspace --locked`: passed.
-- `cargo test --workspace --locked` with all four fixtures: **369 passed, 0
-  failed, 5 skipped** (GPU absence and a two-device split test). Without any
-  fixture environment, 113 `SKIP` lines are emitted (including the same 5
-  GPU/multi-device skips); they must not be counted as executed coverage.
+- `cargo test --workspace --locked` with all four fixtures: **370 passed, 0
+  failed, 0 ignored, and no `SKIP` lines**. Without any fixture environment,
+  113 `SKIP` lines are emitted; they must not be counted as executed coverage.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+
+## Downstream real-model smoke evidence (2026-10-24)
+
+RAMforge exercised this `forge-core` pin through its explicit
+`--backend forgecore` path on the two real GGUFs in the shared workspace. Each
+run was a separate CPU process; the two large models were never loaded
+together. Evidence:
+`/tmp/ramforge-real-model-smoke/20261024-184439`.
+
+| Model | Exit | Wall | Max RSS | Native compute buffer |
+|---|---:|---:|---:|---:|
+| SmolLM2-135M Q4_K_M | 0 | 0.30 s | 367,176 KiB | 98.25 MiB |
+| Qwen2.5-1.5B Q4_0 | 0 | 1.87 s | 2,815,624 KiB | 302.75 MiB |
+
+Both runs generated 8 tokens and reported `Swaps: 0`. ForgeCore's requested
+4 GiB budget is diagnostic only and is not enforced. RSS includes the loader,
+page-cache effects, Rust heap, and native allocations; it is not model
+residency. The GPU stayed at 40 MiB used / 3731 MiB free before and after every
+run, which confirms no GPU execution occurred; it is not GPU validation.
+
+Qwen2.5 received a raw `Hello` prompt without a chat template, so its text is
+not quality evidence. SmolLM2 output was coherent. Model inputs were hashed
+read-only; the recorded SHA-256 values are in RAMforge's
+`scripts/smoke-real-models.sh` run directory.
 
 ## Explicit limitations
 
