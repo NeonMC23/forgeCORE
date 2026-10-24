@@ -22,8 +22,8 @@ pub mod context;
 pub mod device;
 pub mod dtype;
 pub mod error;
-pub mod graph;
 pub mod gguf;
+pub mod graph;
 pub mod memory;
 pub mod model;
 pub mod quant;
@@ -45,14 +45,15 @@ pub use device::{
 };
 pub use dtype::DType;
 pub use error::{Error, Result};
-pub use graph::{Graph, NodeInfo, Plan, DEFAULT_GRAPH_CAPACITY};
 pub use gguf::{
-    inspect as inspect_gguf, inspect_bytes as inspect_gguf_bytes, inspect_path as inspect_gguf_path,
-    GgufInspection, GgufValueType, MetadataValue, TensorDescriptor,
+    inspect as inspect_gguf, inspect_bytes as inspect_gguf_bytes,
+    inspect_path as inspect_gguf_path, GgufInspection, GgufValueType, MetadataValue,
+    TensorDescriptor,
 };
+pub use graph::{Graph, NodeInfo, Plan, DEFAULT_GRAPH_CAPACITY};
 pub use memory::{Memory, SeqState, State};
-pub use quant::{block_spec, row_bytes, tensor_bytes, BlockSpec, QuantFormat};
 pub use model::{GpuLayers, Model, ModelLoadMode, ModelOptions, SplitMode};
+pub use quant::{block_spec, row_bytes, tensor_bytes, BlockSpec, QuantFormat};
 pub use runtime::{
     add, concat, div, get_rows, matmul, mul, norm, rms_norm, rope, scale, silu, soft_max,
     soft_max_ext, sqr, sqrt, sub, RopeMode, RopeParams,

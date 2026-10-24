@@ -192,12 +192,14 @@ pub struct TensorDescriptor {
 impl TensorDescriptor {
     /// Checked exclusive end offset of this tensor's payload.
     pub fn end_offset(&self) -> Result<u64> {
-        self.file_offset.checked_add(self.byte_length).ok_or_else(|| {
-            Error::gguf(format!(
-                "tensor '{}' file range overflows: offset {} + length {}",
-                self.name, self.file_offset, self.byte_length
-            ))
-        })
+        self.file_offset
+            .checked_add(self.byte_length)
+            .ok_or_else(|| {
+                Error::gguf(format!(
+                    "tensor '{}' file range overflows: offset {} + length {}",
+                    self.name, self.file_offset, self.byte_length
+                ))
+            })
     }
 
     /// Return the checked quantization/storage format for this descriptor.
@@ -371,13 +373,11 @@ impl<R: Read + Seek> Reader<R> {
                 "{what} length {length} exceeds {MAX_STRING_LEN}"
             )));
         }
-        let len = usize::try_from(length).map_err(|_| {
-            Error::gguf(format!("{what} length {length} does not fit in usize"))
-        })?;
+        let len = usize::try_from(length)
+            .map_err(|_| Error::gguf(format!("{what} length {length} does not fit in usize")))?;
         self.charge(length, what)?;
         let bytes = self.read_bytes(len, what)?;
-        String::from_utf8(bytes)
-            .map_err(|_| Error::gguf(format!("{what} is not valid UTF-8")))
+        String::from_utf8(bytes).map_err(|_| Error::gguf(format!("{what} is not valid UTF-8")))
     }
 
     fn metadata_value(&mut self, value_type: GgufValueType) -> Result<MetadataValue> {
@@ -424,7 +424,9 @@ impl<R: Read + Seek> Reader<R> {
             )));
         }
         let count_usize = usize::try_from(count).map_err(|_| {
-            Error::gguf(format!("metadata array length {count} does not fit in usize"))
+            Error::gguf(format!(
+                "metadata array length {count} does not fit in usize"
+            ))
         })?;
         let vector_bytes = count
             .checked_mul(size_of::<MetadataValue>() as u64)
@@ -489,9 +491,8 @@ fn parse<R: Read + Seek>(reader: R, file_size: u64) -> Result<GgufInspection> {
             return Err(Error::gguf(format!("duplicate metadata key '{key}'")));
         }
         let raw_type = reader.u32("metadata value type")?;
-        let value_type = GgufValueType::from_raw(raw_type).ok_or_else(|| {
-            Error::gguf(format!("unsupported metadata value type id {raw_type}"))
-        })?;
+        let value_type = GgufValueType::from_raw(raw_type)
+            .ok_or_else(|| Error::gguf(format!("unsupported metadata value type id {raw_type}")))?;
         let value = reader.metadata_value(value_type)?;
         metadata.insert(key, value);
     }
@@ -499,9 +500,9 @@ fn parse<R: Read + Seek>(reader: R, file_size: u64) -> Result<GgufInspection> {
     let alignment = metadata
         .get("general.alignment")
         .map(|value| {
-            value.alignment_value().ok_or_else(|| {
-                Error::gguf("general.alignment must be encoded as uint32")
-            })
+            value
+                .alignment_value()
+                .ok_or_else(|| Error::gguf("general.alignment must be encoded as uint32"))
         })
         .transpose()?
         .unwrap_or(DEFAULT_ALIGNMENT);
@@ -566,9 +567,8 @@ fn parse<R: Read + Seek>(reader: R, file_size: u64) -> Result<GgufInspection> {
         }
 
         let raw_dtype = reader.u32("tensor dtype")?;
-        let dtype_id = i32::try_from(raw_dtype).map_err(|_| {
-            Error::gguf(format!("unsupported tensor dtype id {raw_dtype}"))
-        })?;
+        let dtype_id = i32::try_from(raw_dtype)
+            .map_err(|_| Error::gguf(format!("unsupported tensor dtype id {raw_dtype}")))?;
         let dtype = DType::from_ggml(dtype_id)
             .map_err(|_| Error::gguf(format!("unsupported tensor dtype id {raw_dtype}")))?;
         let offset = reader.u64("tensor data offset")?;
@@ -626,10 +626,7 @@ fn parse<R: Read + Seek>(reader: R, file_size: u64) -> Result<GgufInspection> {
         })?;
         let spec = block_spec(format);
         let values_per_block = u64::try_from(spec.values_per_block).map_err(|_| {
-            Error::gguf(format!(
-                "{} block width does not fit in u64",
-                format.name()
-            ))
+            Error::gguf(format!("{} block width does not fit in u64", format.name()))
         })?;
         if let Some(&first_dimension) = raw.dimensions.first() {
             if first_dimension % values_per_block != 0 {
@@ -648,9 +645,8 @@ fn parse<R: Read + Seek>(reader: R, file_size: u64) -> Result<GgufInspection> {
                 format.name()
             )));
         }
-        let byte_length = tensor_bytes(format, raw.element_count).map_err(|error| {
-            Error::gguf(format!("tensor '{}': {error}", raw.name))
-        })?;
+        let byte_length = tensor_bytes(format, raw.element_count)
+            .map_err(|error| Error::gguf(format!("tensor '{}': {error}", raw.name)))?;
         let file_offset = data_start.checked_add(raw.offset).ok_or_else(|| {
             Error::gguf(format!(
                 "tensor '{}' absolute offset overflows: data start {} + relative {}",
@@ -691,9 +687,9 @@ fn parse<R: Read + Seek>(reader: R, file_size: u64) -> Result<GgufInspection> {
         // The pinned reader accounts for the padded extent of every tensor,
         // including the final one, before it reads the data section.
         if index + 1 == tensor_count {
-            let data_end = data_start.checked_add(expected_offset).ok_or_else(|| {
-                Error::gguf("padded tensor-data file range overflows")
-            })?;
+            let data_end = data_start
+                .checked_add(expected_offset)
+                .ok_or_else(|| Error::gguf("padded tensor-data file range overflows"))?;
             if data_end > file_size {
                 return Err(Error::gguf(format!(
                     "padded tensor-data range [{data_start}, {data_end}) exceeds file size {file_size}"
@@ -731,6 +727,7 @@ mod tests {
     use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
     use super::*;
+    use crate::quant::row_bytes;
 
     fn push_u32(bytes: &mut Vec<u8>, value: u32) {
         bytes.extend_from_slice(&value.to_le_bytes());
@@ -815,7 +812,10 @@ mod tests {
         push_u32(&mut bytes, 3);
         push_u64(&mut bytes, 2);
         push_u64(&mut bytes, 0);
-        for (name, offset) in [(b"first".as_slice(), 0u64), (b"second".as_slice(), second_offset)] {
+        for (name, offset) in [
+            (b"first".as_slice(), 0u64),
+            (b"second".as_slice(), second_offset),
+        ] {
             push_string(&mut bytes, name);
             push_u32(&mut bytes, 1);
             push_u64(&mut bytes, 1);
@@ -861,7 +861,7 @@ mod tests {
             let start = self.inner.position();
             let end = start
                 .checked_add(buffer.len() as u64)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "read position overflow"))?;
+                .ok_or_else(|| io::Error::other("read position overflow"))?;
             if end > self.payload_start {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -887,7 +887,10 @@ mod tests {
         assert_eq!(inspection.version, 3);
         assert_eq!(inspection.file_size, bytes.len() as u64);
         assert_eq!(inspection.alignment, 32);
-        assert_eq!(inspection.metadata["general.architecture"].as_str(), Some("llama"));
+        assert_eq!(
+            inspection.metadata["general.architecture"].as_str(),
+            Some("llama")
+        );
         assert_eq!(inspection.tensors.len(), 1);
         let tensor = &inspection.tensors[0];
         assert_eq!(tensor.name, "test.weight");
@@ -922,7 +925,10 @@ mod tests {
                 values,
             } => {
                 assert_eq!(*element_type, GgufValueType::UInt16);
-                assert_eq!(values, &[MetadataValue::UInt16(7), MetadataValue::UInt16(9)]);
+                assert_eq!(
+                    values,
+                    &[MetadataValue::UInt16(7), MetadataValue::UInt16(9)]
+                );
             }
             other => panic!("unexpected metadata value: {other:?}"),
         }
@@ -987,7 +993,10 @@ mod tests {
                 inspect_bytes(&bytes[..length])
             }));
             assert!(result.is_ok(), "parser panicked at prefix length {length}");
-            assert!(result.unwrap().is_err(), "prefix {length} unexpectedly parsed");
+            assert!(
+                result.unwrap().is_err(),
+                "prefix {length} unexpectedly parsed"
+            );
         }
     }
 
@@ -1012,7 +1021,10 @@ mod tests {
 
     #[test]
     fn zero_sized_tensors_are_owned_and_checked() {
-        for dtype in [DType::F32.ggml_type() as u32, DType::Q4_0.ggml_type() as u32] {
+        for dtype in [
+            DType::F32.ggml_type() as u32,
+            DType::Q4_0.ggml_type() as u32,
+        ] {
             let inspection = inspect_bytes(&make_single_tensor(dtype, &[0], 0, 0)).unwrap();
             let tensor = &inspection.tensors[0];
             assert_eq!(tensor.element_count, 0);

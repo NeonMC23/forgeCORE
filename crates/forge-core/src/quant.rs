@@ -220,7 +220,7 @@ pub fn tensor_bytes(format: QuantFormat, element_count: u64) -> Result<u64> {
     let spec = block_spec(format);
     let values_per_block = u64::try_from(spec.values_per_block)
         .map_err(|_| Error(format!("{} block width does not fit in u64", format.name())))?;
-    if element_count % values_per_block != 0 {
+    if !element_count.is_multiple_of(values_per_block) {
         return Err(Error(format!(
             "{} element count {element_count} is not a multiple of block width {}",
             format.name(),
@@ -242,8 +242,12 @@ pub fn tensor_bytes(format: QuantFormat, element_count: u64) -> Result<u64> {
 ///
 /// `input_dim` must be an exact multiple of the format's block width.
 pub fn row_bytes(format: QuantFormat, input_dim: usize) -> Result<usize> {
-    let input = u64::try_from(input_dim)
-        .map_err(|_| Error(format!("{} input dimension does not fit in u64", format.name())))?;
+    let input = u64::try_from(input_dim).map_err(|_| {
+        Error(format!(
+            "{} input dimension does not fit in u64",
+            format.name()
+        ))
+    })?;
     let bytes = tensor_bytes(format, input)?;
     usize::try_from(bytes).map_err(|_| {
         Error(format!(
@@ -258,6 +262,7 @@ pub fn row_bytes(format: QuantFormat, input_dim: usize) -> Result<usize> {
 /// `bytes` must hold exactly [`row_bytes`] bytes and `out` exactly
 /// `input_dim` values. Formats without a reviewed decoder return an
 /// explicit unsupported error.
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 pub(crate) fn dequantize_row(
     format: QuantFormat,
     bytes: &[u8],
@@ -312,6 +317,7 @@ pub(crate) fn dequantize_row(
 /// Each output row is dequantized by [`dequantize_row`] and dotted with `x`
 /// in F32 in input order. `raw` must hold exactly
 /// `row_bytes * shape.output` bytes.
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 pub(crate) fn matvec_reference(
     format: QuantFormat,
     raw: &[u8],
@@ -372,6 +378,7 @@ const _: () = {
     assert!(block_spec(QuantFormat::Q6_K).values_per_block == Q6_K_BLOCK_VALUES);
 };
 
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 fn dequantize_row_q4_0(bytes: &[u8], out: &mut [f32]) {
     let (blocks, byte_rest) = bytes.as_chunks::<Q4_0_BLOCK_BYTES>();
     let (slots, slot_rest) = out.as_chunks_mut::<Q4_0_BLOCK_VALUES>();
@@ -386,6 +393,7 @@ fn dequantize_row_q4_0(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 fn dequantize_row_q8_0(bytes: &[u8], out: &mut [f32]) {
     let (blocks, byte_rest) = bytes.as_chunks::<Q8_0_BLOCK_BYTES>();
     let (slots, slot_rest) = out.as_chunks_mut::<Q8_0_BLOCK_VALUES>();
@@ -398,6 +406,7 @@ fn dequantize_row_q8_0(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 fn dequantize_row_f16(bytes: &[u8], out: &mut [f32]) {
     let (pairs, rest) = bytes.as_chunks::<2>();
     debug_assert!(rest.is_empty());
@@ -406,6 +415,7 @@ fn dequantize_row_f16(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 fn dequantize_row_bf16(bytes: &[u8], out: &mut [f32]) {
     let (pairs, rest) = bytes.as_chunks::<2>();
     debug_assert!(rest.is_empty());
@@ -447,6 +457,7 @@ fn dequantize_row_bf16(bytes: &[u8], out: &mut [f32]) {
 /// Each output is `d * scale * (six_bit_quant - 32)` in F32 with
 /// left-to-right multiplication, exactly as GGML computes it.
 /// Reconstructed quants span `[-32, 31]`.
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 pub(crate) fn dequantize_block_q6_k(block: &[u8], out: &mut [f32]) -> Result<()> {
     if block.len() != Q6_K_BLOCK_BYTES {
         return Err(Error(format!(
@@ -468,6 +479,7 @@ pub(crate) fn dequantize_block_q6_k(block: &[u8], out: &mut [f32]) -> Result<()>
 ///
 /// Decodes the block with [`dequantize_block_q6_k`], then accumulates
 /// `sum(decoded[i] * x[i])` in F32 in index order.
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 pub(crate) fn dot_block_q6_k(block: &[u8], x: &[f32]) -> Result<f32> {
     if x.len() != Q6_K_BLOCK_VALUES {
         return Err(Error(format!(
@@ -489,6 +501,7 @@ pub(crate) fn dot_block_q6_k(block: &[u8], x: &[f32]) -> Result<f32> {
 /// `row` must hold exactly `row_bytes(Q6_K, x.len())` bytes. Accumulation
 /// is one F32 running sum in global index order, identical to decoding
 /// the whole row and then dotting it.
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 pub(crate) fn dot_row_q6_k(row: &[u8], x: &[f32]) -> Result<f32> {
     let expected = row_bytes(QuantFormat::Q6_K, x.len())?;
     if row.len() != expected {
@@ -511,6 +524,7 @@ pub(crate) fn dot_row_q6_k(row: &[u8], x: &[f32]) -> Result<f32> {
     Ok(sum)
 }
 
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 fn dequantize_block_q6_k_inner(block: &[u8], out: &mut [f32]) {
     debug_assert_eq!(block.len(), Q6_K_BLOCK_BYTES);
     debug_assert_eq!(out.len(), Q6_K_BLOCK_VALUES);
@@ -539,6 +553,7 @@ fn dequantize_block_q6_k_inner(block: &[u8], out: &mut [f32]) {
     }
 }
 
+#[allow(dead_code)] // Scalar decoder is exercised by unit tests; no runtime consumer yet.
 fn dequantize_row_q6_k(bytes: &[u8], out: &mut [f32]) {
     let (blocks, byte_rest) = bytes.as_chunks::<Q6_K_BLOCK_BYTES>();
     let (slots, slot_rest) = out.as_chunks_mut::<Q6_K_BLOCK_VALUES>();
