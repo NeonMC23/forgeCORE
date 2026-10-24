@@ -1,7 +1,7 @@
 # forgeCORE project state
 
-**As of:** 2026-10-24  
-**Repository:** `forgeCORE` (`NeonMC23/forgeCORE`)  
+**As of:** 2026-10-25<br>
+**Repository:** `forgeCORE` (`NeonMC23/forgeCORE`)<br>
 **Role:** safe Rust abstraction and integration layer between RAMforge and the
 pinned llama.cpp/ggml native implementation.
 
@@ -50,7 +50,9 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
 - Model loading with explicit CPU/mmap/mlock modes, tensor checking, and
   static GPU-offload configuration (`GpuLayers`, split mode, device list).
   GPU execution is **not** validated on hardware in this environment.
-- `Model → Context → Batch → decode → Logits` CPU inference path.
+- `Model → Context → Batch → decode → Logits` CPU inference path, with
+  real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and
+  `gptneox` (Pythia-70M).
 - Context sizing/threading controls, multi-sequence and embedding batches,
   pooling/attention selection, embedding outputs.
 - Native KV/state primitives: sequence surgery, position shifts, byte-oriented
@@ -98,29 +100,85 @@ Results:
 - `cargo fmt --all -- --check`: passed.
 - `cargo check --workspace --locked`: passed.
 - `cargo test --workspace --locked` with all four fixtures: **370 passed, 0
-  failed, 0 ignored, and no `SKIP` lines**. Without any fixture environment,
-  113 `SKIP` lines are emitted; they must not be counted as executed coverage.
+  failed, 0 ignored, and no `SKIP` lines** (run before the GPT-NeoX test was
+  added). Without any fixture environment in the current tree, 370 tests still
+  pass, fixture-gated tests report `SKIP`, and the new GPT-NeoX test is the one
+  ignored test unless `FORGE_GPTNEOX_MODEL` is set. They must not be counted as
+  executed coverage when skipped.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 
-## Downstream real-model smoke evidence (2026-10-24)
+### GPT-NeoX/Pythia execution (2026-10-25)
+
+The pinned llama.cpp revision already implements `gptneox`
+(`native/src/src/models/gptneox.cpp`); no native upgrade or patch was needed.
+The missing piece was RAMforge's legacy architecture allowlist, not ForgeCore.
+RAMforge's explicit `--backend forgecore` path now exercises this architecture
+through the ordinary safe API (`Model → Context → Batch → decode → Logits`).
+
+New opt-in test:
+`crates/forge-core/tests/gptneox_execution.rs`, gated by
+`FORGE_GPTNEOX_MODEL`. It checks the model description contains `gptneox`,
+layer/embedding counts are non-zero, the native tokenizer encodes the prompt,
+logits are finite and non-constant, two independent greedy runs produce
+identical ids, and the generated ids decode to text.
+
+Fixture: `mradermacher/pythia-70m-deduped-GGUF`,
+`pythia-70m-deduped.Q8_0.gguf`, 76,722,400 B, SHA-256
+`94788a58bb81431b7058837ec2371c303edb20384b615f0afabfa81539294e0d`,
+GGUF v3, 6 layers, 512 embedding, 8 heads, 2048 FFN, 16 rotary dimensions,
+parallel residual enabled.
+
+```sh
+export FORGE_LLAMA_DIR="$PWD/../native"
+export LD_LIBRARY_PATH="$FORGE_LLAMA_DIR/build/bin"
+export FORGE_GPTNEOX_MODEL=/path/to/pythia-70m.Q8_0.gguf
+cargo test -p forge-core --test gptneox_execution --locked -- --ignored --nocapture
+```
+
+Observed: prompt `The capital of France is` encoded as five ids
+`[510, 5347, 273, 6181, 310]` (`adds_bos=false`), first four greedy ids
+`[253, 5347, 273, 253]`, decoding to ` the capital of`. A native llama.cpp probe
+with the same ids produces the same greedy prefix, and RAMforge
+`--backend forgecore` outputs ` the capital of the French Empire.` for 8
+tokens.
+
+Independent graph check: a NumPy GPT-NeoX forward pass over the same GGUF
+(dequantized Q8_0 weights, partial NeoX RoPE, parallel residual, GELU MLP)
+reproduces the native final-token logits with top-1 id 253, 9/10 top-10
+overlap, cosine similarity 1.000000046, and maximum absolute difference 0.929
+on logits of magnitude ~1,579. The residual difference is consistent with
+ggml's f16 GELU lookup and reduction order. This is not bit-exact parity.
+
+The 20B GPT-NeoX GGUF was not executed. At this pin, libllama loads model
+weights eagerly and ForgeCore has no out-of-core weight streaming; the host has
+15.39 GiB RAM and the model has 13,133,230,080 tensor bytes. ForgeCore also
+does not enforce RAM budgets. Treat 20B as inspect/plan-only until a streaming
+backend exists.
+
+## Downstream real-model smoke evidence (2026-10-25)
 
 RAMforge exercised this `forge-core` pin through its explicit
-`--backend forgecore` path on real GGUFs in the shared workspace. Each run was
-a separate CPU process; the large models were never loaded together. The
-sandboxed matrix used model directories and standard split-GGUF discovery in
-RAMforge's CLI before handing the primary shard to ForgeCore. Evidence:
-`/tmp/ramforge-real-model-smoke/20261024-193321`.
+`--backend forgecore` path on real GGUFs. Each run was a separate CPU process;
+the large models were never loaded together. Evidence:
+`/tmp/ramforge-real-model-smoke/20261025-002055`.
 
-| Model | Budget | Exit | Wall | Max RSS | Native compute buffer |
-|---|---:|---:|---:|---:|---:|
-| SmolLM2-135M Q4_K_M | 4G | 0 | 0.25 s | 374,700 KiB | 98.25 MiB |
-| Qwen2.5-1.5B Q4_0 | 4G | 0 | 1.23 s | 2,839,396 KiB | 302.75 MiB |
+| Model | Backend | Budget | Exit | Wall | Max RSS | Managed peak |
+|---|---|---:|---:|---:|---:|---:|
+| SmolLM2-135M Q4_K_M | forgecore | 4G | 0 | 0.20 s | 370,388 KiB | not exposed |
+| Qwen2.5-1.5B Q4_0 | forgecore | 4G | 0 | 1.31 s | 2,839,744 KiB | not exposed |
+| Pythia-70M-deduped Q8_0 | forgecore | 8G | 0 | 0.14 s | 167,616 KiB | not exposed |
+| Pythia-70M-deduped Q8_0 | forgecore | 4G | 0 | 0.13 s | 167,576 KiB | not exposed |
+| Pythia-70M-deduped Q8_0 | forgecore | 1G | 0 | 0.13 s | 167,584 KiB | not exposed |
+| Pythia-70M-deduped Q8_0 | forgecore | 100M | 0 | 0.13 s | 167,512 KiB | not exposed |
+| Pythia-70M-deduped Q8_0 | legacy | 1G | 1 | 0.01 s | 23,664 KiB | not exposed |
 
-Both runs generated 4 tokens with a fixed prompt and reported `Swaps: 0`.
-ForgeCore's requested 4 GiB budget is diagnostic only and is not enforced. RSS
-includes the loader, page-cache effects, Rust heap, and native allocations; it
-is not model residency. The GPU stayed at 40 MiB used / 3731 MiB free before
-and after every run, which confirms no GPU execution occurred; it is not GPU
+The GPT-NeoX runs generated byte-identical stdout at 8G, 4G, 1G, and 100M.
+That is expected because ForgeCore's requested budget is diagnostic only and
+is **not enforced**; it is budget-invariance, not out-of-core execution. The
+legacy row is RAMforge's intended architecture rejection before weight loading,
+not a ForgeCore failure. All cases reported `Swaps: 0`. RSS includes the
+loader, page-cache effects, Rust heap, and native allocations; it is not model
+residency. The native build is CPU-only, so none of these runs is GPU
 validation.
 
 RAMforge also validated Qwen2.5-7B Q4_K_M as a two-shard set at 4G through its
@@ -129,12 +187,13 @@ layers, 88 evictions). That evidence exercises RAMforge's split discovery and
 virtual cross-shard reads, not a new ForgeCore capability; ForgeCore still
 receives the primary shard path and the pinned native loader owns the rest.
 
-Qwen2.5 received a raw `Hello` prompt without a chat template, so its text is
-not quality evidence. RAMforge's legacy backend separately produced a correct
-chat-templated answer (`4`) for Qwen2.5-1.5B using the model's own
+Qwen2.5 and SmolLM2 above used a raw `Hello` prompt, so their text is not
+quality evidence. The GPT-NeoX prompt/continuation evidence is recorded in the
+dedicated section above. RAMforge's legacy backend separately produced a
+correct chat-templated answer (`4`) for Qwen2.5-1.5B using the model's own
 `tokenizer.chat_template`; that formatting and tokenizer work is RAMforge-side
-and was not exercised through the ForgeCore backend. SmolLM2 raw output was
-coherent. Model inputs were hashed read-only in the RAMforge run inventory.
+and was not exercised through the ForgeCore backend. Model inputs were hashed
+read-only in the RAMforge run inventory.
 
 ## Explicit limitations
 
@@ -146,7 +205,8 @@ coherent. Model inputs were hashed read-only in the RAMforge run inventory.
   the pinned native C API.
 - Model-path out-of-core weight streaming is not possible at the pin: libllama
   loads model weights eagerly. This is an architectural constraint, not a
-  forgeCORE wrapper gap.
+  forgeCORE wrapper gap. It is why the 13,135,032,320 B GPT-NeoX-20B fixture was
+  inspected/planned but never executed on the 15.39 GiB host.
 - The live BPE fixture covers a small ASCII vocabulary with the `default`
   GPT-2 pre-tokenizer. Byte-level BPE edge cases and other pre-tokenizer
   variants (for example llama3) remain unverified.
