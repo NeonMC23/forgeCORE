@@ -61,6 +61,7 @@ let host: Vec<f32> = sum.to_vec_f32()?;
 let model = Model::load("model.gguf".as_ref())?; // CPU unless offload is requested
 let mut opts = ModelOptions::default();
 opts.gpu_layers = GpuLayers::Count(20);     // explicit unsupported error without a GPU
+opts.use_extra_bufts = Some(false);         // disable CPU repack buffers; keep weights file-backed
 let gpu_model = Model::load_with_options("model.gguf".as_ref(), &opts)?;
 let mut ctx_opts = ContextOptions::default();
 ctx_opts.n_batch = 512;                     // + n_ubatch/n_seq_max/threads/embeddings/...
