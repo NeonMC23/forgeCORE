@@ -47,11 +47,15 @@ and neither silently delegates to the other.
 - If one reader becomes the sole source of truth, the other is removed or
   archived in the same reviewed change, with its tests preserved.
 
-## Follow-up (not started)
+## Follow-up
 
-1. Add a shared-fixture parity test that compares forgeCORE's inspector and
-   RAMforge's parser on the same bytes (metadata values, descriptor ranges,
-   tensor byte lengths, alignment).
+1. **Shared-fixture contract implemented.** Both repositories now have a
+   `tiny_fixture_matches_shared_structural_contract` test that loads the same
+   `FORGE_TEST_MODEL` file and asserts the same version, alignment,
+   architecture, tensor names, payload lengths, and total payload bytes. The
+   crates are not linked, so this is a contract test rather than an in-process
+   comparison; running both suites against one file catches descriptor
+   divergence.
 2. Decide whether RAMforge should adopt `forge_core::gguf` for descriptor
    validation while retaining its model-level metadata layer.
 3. Consolidate only after parity is demonstrated and the legacy execution path
