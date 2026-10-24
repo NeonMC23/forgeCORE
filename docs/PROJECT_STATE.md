@@ -105,26 +105,36 @@ Results:
 ## Downstream real-model smoke evidence (2026-10-24)
 
 RAMforge exercised this `forge-core` pin through its explicit
-`--backend forgecore` path on the two real GGUFs in the shared workspace. Each
-run was a separate CPU process; the two large models were never loaded
-together. Evidence:
-`/tmp/ramforge-real-model-smoke/20261024-184439`.
+`--backend forgecore` path on real GGUFs in the shared workspace. Each run was
+a separate CPU process; the large models were never loaded together. The
+sandboxed matrix used model directories and standard split-GGUF discovery in
+RAMforge's CLI before handing the primary shard to ForgeCore. Evidence:
+`/tmp/ramforge-real-model-smoke/20261024-193321`.
 
-| Model | Exit | Wall | Max RSS | Native compute buffer |
-|---|---:|---:|---:|---:|
-| SmolLM2-135M Q4_K_M | 0 | 0.30 s | 367,176 KiB | 98.25 MiB |
-| Qwen2.5-1.5B Q4_0 | 0 | 1.87 s | 2,815,624 KiB | 302.75 MiB |
+| Model | Budget | Exit | Wall | Max RSS | Native compute buffer |
+|---|---:|---:|---:|---:|---:|
+| SmolLM2-135M Q4_K_M | 4G | 0 | 0.25 s | 374,700 KiB | 98.25 MiB |
+| Qwen2.5-1.5B Q4_0 | 4G | 0 | 1.23 s | 2,839,396 KiB | 302.75 MiB |
 
-Both runs generated 8 tokens and reported `Swaps: 0`. ForgeCore's requested
-4 GiB budget is diagnostic only and is not enforced. RSS includes the loader,
-page-cache effects, Rust heap, and native allocations; it is not model
-residency. The GPU stayed at 40 MiB used / 3731 MiB free before and after every
-run, which confirms no GPU execution occurred; it is not GPU validation.
+Both runs generated 4 tokens with a fixed prompt and reported `Swaps: 0`.
+ForgeCore's requested 4 GiB budget is diagnostic only and is not enforced. RSS
+includes the loader, page-cache effects, Rust heap, and native allocations; it
+is not model residency. The GPU stayed at 40 MiB used / 3731 MiB free before
+and after every run, which confirms no GPU execution occurred; it is not GPU
+validation.
+
+RAMforge also validated Qwen2.5-7B Q4_K_M as a two-shard set at 4G through its
+legacy backend (4 tokens, peak managed 4,285,007,616 B under 4 GiB, 24 cached
+layers, 88 evictions). That evidence exercises RAMforge's split discovery and
+virtual cross-shard reads, not a new ForgeCore capability; ForgeCore still
+receives the primary shard path and the pinned native loader owns the rest.
 
 Qwen2.5 received a raw `Hello` prompt without a chat template, so its text is
-not quality evidence. SmolLM2 output was coherent. Model inputs were hashed
-read-only; the recorded SHA-256 values are in RAMforge's
-`scripts/smoke-real-models.sh` run directory.
+not quality evidence. RAMforge's legacy backend separately produced a correct
+chat-templated answer (`4`) for Qwen2.5-1.5B using the model's own
+`tokenizer.chat_template`; that formatting and tokenizer work is RAMforge-side
+and was not exercised through the ForgeCore backend. SmolLM2 raw output was
+coherent. Model inputs were hashed read-only in the RAMforge run inventory.
 
 ## Explicit limitations
 
