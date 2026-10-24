@@ -1,5 +1,15 @@
 # Post-P6 Low-Level Completeness Audit — forgeCORE
 
+> **Post-audit update (2026-10-24).** This audit is a historical snapshot of
+> the tree at v3.1.2. v3.1.3 subsequently added `forge_core::gguf`
+> (payload-lazy structural inspection) and `forge_core::quant` (checked
+> storage geometry). Rows that say forgeCORE performs zero GGUF parsing and
+> that GGUF parsing must never live in forgeCORE are therefore superseded.
+> The current ownership model is recorded in
+> [`GGUF_OWNERSHIP.md`](GGUF_OWNERSHIP.md); current capabilities are in
+> [`PROJECT_STATE.md`](PROJECT_STATE.md). The rest of this document remains
+> useful as the v3.1.2 evidence record.
+
 **Date:** 2026-10-06
 **Auditor:** agentic session (read-only on RAMforge and upstream)
 **Upstream pin (re-verified this session):** llama.cpp `v0.5.0` @

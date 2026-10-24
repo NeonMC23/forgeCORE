@@ -1,4 +1,13 @@
-# RAMforge engineering handoff
+# RAMforge engineering handoff (historical import)
+
+> **Historical notice (2026-10-24).** This directory was imported verbatim
+> from RAMforge V3.0.2 during forgeCORE repository initialization. It
+> describes the pre-ggml RAMforge handoff and the original ForgeCore proposal,
+> not the current forgeCORE tree. Statements here such as "there is no
+> ForgeCore implementation" are historical. For the current state, see
+> [`../PROJECT_STATE.md`](../PROJECT_STATE.md), [`../GGUF_OWNERSHIP.md`](../GGUF_OWNERSHIP.md),
+> and the forgeCORE crate documentation. See [`IMPORTED_FROM.md`](IMPORTED_FROM.md)
+> for provenance.
 
 This directory is the transfer package for a new developer or agent arriving without the prior conversation. It documents the repository as it exists, separates verified facts from investigation records and proposals, and identifies the planned replacement numerical core as **ForgeCore**.
 
