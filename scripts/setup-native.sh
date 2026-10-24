@@ -2,7 +2,7 @@
 # Set up the pinned upstream llama.cpp/ggml checkout and native build.
 #
 # Everything lives outside the workspace under $FORGE_LLAMA_DIR:
-#   $FORGE_LLAMA_DIR/src    pinned read-only-ish upstream checkout (never edited)
+#   $FORGE_LLAMA_DIR/src    pinned upstream checkout plus the documented patch
 #   $FORGE_LLAMA_DIR/build  CMake build tree with the shared libraries
 #
 # Usage:
@@ -21,8 +21,10 @@ LLAMA_TAG="${LLAMA_TAG:-v0.5.0}"
 LLAMA_SHA="${LLAMA_SHA:-7fe450e19305b828c199d602c23a8337aaa1f03b}"
 
 : "${FORGE_LLAMA_DIR:=/var/tmp/forge-native}"
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 SRC="$FORGE_LLAMA_DIR/src"
 BUILD="$FORGE_LLAMA_DIR/build"
+PATCH="$ROOT/patches/llama-mmap-no-prefetch.patch"
 
 if ! command -v git >/dev/null 2>&1; then
     echo "setup-native: git not found on PATH" >&2
@@ -47,6 +49,17 @@ if [ "$actual_sha" != "$LLAMA_SHA" ]; then
     exit 1
 fi
 echo "setup-native: upstream revision $actual_sha verified"
+
+if [ ! -f "$PATCH" ]; then
+    echo "setup-native: missing required patch: $PATCH" >&2
+    exit 1
+fi
+if git -C "$SRC" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
+    echo "setup-native: mmap-no-prefetch patch already applied"
+else
+    git -C "$SRC" apply "$PATCH"
+    echo "setup-native: applied mmap-no-prefetch patch"
+fi
 
 echo "setup-native: configuring CMake (CPU backends, shared libs) ..."
 cmake -S "$SRC" -B "$BUILD" \

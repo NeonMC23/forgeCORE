@@ -1,0 +1,62 @@
+diff --git a/include/llama.h b/include/llama.h
+index 31bbf8b..4430601 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -210,6 +210,7 @@ extern "C" {
+         LLAMA_LOAD_MODE_MLOCK      =  2, // force system to keep model in RAM rather than swapping or compressing
+         LLAMA_LOAD_MODE_MMAP_MLOCK =  3, // mmap + force system to keep model in RAM rather than swapping or compressing
+         LLAMA_LOAD_MODE_DIRECT_IO  =  4, // use direct I/O if available
++        LLAMA_LOAD_MODE_MMAP_NO_PREFETCH = 5, // mmap without prefaulting the whole file
+     };
+ 
+     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 43c396f..ddedb46 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -556,7 +556,8 @@ llama_model_loader::llama_model_loader(
+ 
+     tensor_buft_overrides = param_tensor_buft_overrides_p;
+ 
+-    this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
++    this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ||
++                          load_mode == LLAMA_LOAD_MODE_MMAP_NO_PREFETCH || load_mode == LLAMA_LOAD_MODE_AUTO;
+     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+ 
+     if (!fname.empty()) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e195f50..bd12d19 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1731,7 +1731,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    // mmap-no-prefetch keeps the mapping file-backed but skips MAP_POPULATE
++    const bool prefetch_mapping = params.load_mode != LLAMA_LOAD_MODE_MMAP_NO_PREFETCH;
++    ml.init_mappings(prefetch_mapping, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+diff --git a/src/llama.cpp b/src/llama.cpp
+index ad8e443..7165f3b 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -61,6 +61,8 @@ const char * llama_load_mode_name(enum llama_load_mode load_mode) {
+             return "mmap+mlock";
+         case LLAMA_LOAD_MODE_DIRECT_IO:
+             return "dio";
++        case LLAMA_LOAD_MODE_MMAP_NO_PREFETCH:
++            return "mmap-no-prefetch";
+     }
+     GGML_ABORT("fatal error");
+ }
+@@ -72,6 +74,7 @@ enum llama_load_mode llama_load_mode_from_str(const char * str) {
+     if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
+     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
+     if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
++    if (std::strcmp(str, "mmap-no-prefetch") == 0) { return LLAMA_LOAD_MODE_MMAP_NO_PREFETCH; }
+     throw std::invalid_argument(std::string("unknown load mode: ") + str);
+ }
+ 

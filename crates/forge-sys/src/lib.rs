@@ -140,13 +140,15 @@ pub mod split_mode {
 /// `enum llama_load_mode` values (`llama.h`).
 ///
 /// `LLAMA_LOAD_MODE_DIRECT_IO` (4) is deliberately unbound: no
-/// `forge-core` API selects it.
+/// `forge-core` API selects it. `MMAP_NO_PREFETCH` (5) is supplied by
+/// the documented native patch in `patches/llama-mmap-no-prefetch.patch`.
 pub mod load_mode {
     pub const AUTO: i32 = -1;
     pub const NONE: i32 = 0;
     pub const MMAP: i32 = 1;
     pub const MLOCK: i32 = 2;
     pub const MMAP_MLOCK: i32 = 3;
+    pub const MMAP_NO_PREFETCH: i32 = 5;
 }
 
 /// `enum llama_pooling_type` values (`llama.h`).
@@ -935,6 +937,7 @@ mod layout_tests {
         assert_eq!(offset_of!(llama_model_params, n_gpu_layers), 16);
         assert_eq!(offset_of!(llama_model_params, split_mode), 20);
         assert_eq!(offset_of!(llama_model_params, load_mode), 24);
+        assert_eq!(load_mode::MMAP_NO_PREFETCH, 5);
         assert_eq!(offset_of!(llama_model_params, lazy_mode), 28);
         assert_eq!(offset_of!(llama_model_params, main_gpu), 32);
         assert_eq!(offset_of!(llama_model_params, tensor_split), 40);

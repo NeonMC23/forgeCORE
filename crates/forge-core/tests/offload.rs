@@ -111,6 +111,7 @@ fn all_load_modes_load_cpu_fixture() {
         ModelLoadMode::Auto,
         ModelLoadMode::NoMmap,
         ModelLoadMode::Mmap,
+        ModelLoadMode::MmapNoPrefetch,
         ModelLoadMode::Mlock,
         ModelLoadMode::MmapMlock,
     ] {

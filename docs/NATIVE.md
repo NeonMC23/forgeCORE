@@ -6,7 +6,7 @@ native tree always lives **outside the workspace** under
 
 ```text
 $FORGE_LLAMA_DIR/
-  src/      pinned upstream checkout (tag v0.5.0, never edited)
+  src/      pinned upstream checkout (tag v0.5.0) + one documented patch
   build/    CMake tree; shared libs land in build/bin/
   tools/    ephemeral cmake binary (if the system has none)
   models/   optional local test fixtures (never in the repo)
@@ -43,9 +43,17 @@ cd /home/user/forgeCORE && cargo test --workspace
 
 `setup-native.sh` clones `--depth 1 --branch v0.5.0`, verifies the
 checkout resolves to commit `7fe450e19305b828c199d602c23a8337aaa1f03b`
-(aborting otherwise), configures with `BUILD_SHARED_LIBS=ON` and
-tests/examples/tools off, and builds with all cores. Re-running it
-reuses the checkout and rebuilds incrementally.
+(aborting otherwise), applies the documented patch under
+[`patches/llama-mmap-no-prefetch.patch`](../patches/llama-mmap-no-prefetch.patch),
+configures with `BUILD_SHARED_LIBS=ON` and tests/examples/tools off, and
+builds with all cores. Re-running it reuses the checkout, skips an
+already-applied patch, and rebuilds incrementally.
+
+The patch adds only `LLAMA_LOAD_MODE_MMAP_NO_PREFETCH = 5` and passes
+`prefetch=false` to the existing `init_mappings` path for that mode. It does
+not change `llama_model_params` layout or the default `AUTO`/`MMAP` behavior.
+The upstream checkout HEAD remains the pinned SHA; the patch is tracked in
+this repository so the native tree is reproducible.
 
 ## Pin management
 
@@ -53,9 +61,10 @@ The pin is `LLAMA_TAG`/`LLAMA_SHA` at the top of
 `scripts/setup-native.sh` — the single source of truth. To bump:
 
 1. Edit the tag and expected SHA in that script.
-2. `rm -rf "$FORGE_LLAMA_DIR/src" "$FORGE_LLAMA_DIR/build"` and re-run
+2. Refresh the patch against the new checkout and keep it minimal.
+3. `rm -rf "$FORGE_LLAMA_DIR/src" "$FORGE_LLAMA_DIR/build"` and re-run
    the script.
-3. Re-run the full validation suite; if the C API changed, update
+4. Re-run the full validation suite; if the C API changed, update
    `forge-sys` and the layout tests, then this doc and `docs/PIVOT.md`.
 
 ## Backend selection

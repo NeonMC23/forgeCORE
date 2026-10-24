@@ -7,6 +7,7 @@
 //! files at runtime. Nothing is compiled or downloaded here.
 
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 fn main() {
@@ -20,6 +21,22 @@ fn main() {
                 lib_dir.display()
             );
         }
+    }
+
+    let header = PathBuf::from(&root)
+        .join("src")
+        .join("include")
+        .join("llama.h");
+    if header.exists() {
+        let text = fs::read_to_string(&header)
+            .unwrap_or_else(|error| panic!("forge-sys: cannot read {}: {error}", header.display()));
+        if !text.contains("LLAMA_LOAD_MODE_MMAP_NO_PREFETCH") {
+            panic!(
+                "forge-sys: {} lacks LLAMA_LOAD_MODE_MMAP_NO_PREFETCH. Re-run `sh scripts/setup-native.sh` to apply patches/llama-mmap-no-prefetch.patch.",
+                header.display()
+            );
+        }
+        println!("cargo:rerun-if-changed={}", header.display());
     }
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());

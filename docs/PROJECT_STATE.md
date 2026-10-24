@@ -48,10 +48,14 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
 ## Implemented capabilities
 
 - Model loading with explicit CPU/mmap/mlock modes, tensor checking, static
-  GPU-offload configuration (`GpuLayers`, split mode, device list), and CPU
+  GPU-offload configuration (`GpuLayers`, split mode, device list), CPU
   weight-repacking control (`ModelOptions::use_extra_bufts`,
-  `without_cpu_weight_repacking()`). GPU execution is **not** validated on
-  hardware in this environment.
+  `without_cpu_weight_repacking()`), and an opt-in
+  `ModelLoadMode::MmapNoPrefetch` mode that skips whole-file `MAP_POPULATE`.
+  The no-prefetch mode is supplied by the documented
+  `patches/llama-mmap-no-prefetch.patch`; the default `Auto`/`Mmap` behavior is
+  unchanged. GPU execution is **not** validated on hardware in this
+  environment.
 - `Model → Context → Batch → decode → Logits` CPU inference path, with
   real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and
   `gptneox` (Pythia-70M).
@@ -108,6 +112,28 @@ Results:
   ignored test unless `FORGE_GPTNEOX_MODEL` is set. They must not be counted as
   executed coverage when skipped.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+
+### No-prefetch mapping evidence (2026-10-25)
+
+The native tree is the pinned v0.5.0 checkout plus the documented
+`patches/llama-mmap-no-prefetch.patch`; `setup-native.sh` applies it
+idempotently and verifies the upstream SHA first. The new mode adds only an
+enum value and a `prefetch=false` argument; `llama_model_params` layout and
+default `Auto`/`Mmap` behavior are unchanged.
+
+Current standard run: **372 passed, 0 failed, 2 ignored** (GPT-NeoX execution
+and the opt-in mapping test). With `FORGE_TEST_MODEL` pointing at the tiny
+fixture, `all_load_modes_load_cpu_fixture` also covers `MmapNoPrefetch` and
+passes. The opt-in disk-backed check:
+
+```sh
+FORGE_PREFETCH_MODEL=/home/neon/Documents/CODE LOCAL/forge/target/fixtures/pythia-70m.Q8_0.gguf \
+  cargo test -p forge-core --test mapping_prefetch --locked -- --ignored --nocapture
+```
+
+reported: file `76,722,400 B`; default `Mmap` mapping RSS `74,952,704 B`;
+`MmapNoPrefetch` mapping RSS `0 B`. This confirms the option skips
+whole-file prefaulting; it does not implement per-layer residency.
 
 ### GPT-NeoX/Pythia execution (2026-10-25)
 
@@ -220,11 +246,13 @@ read-only in the RAMforge run inventory.
 - KV allocated/resident bytes and per-layer K/V read-back are unavailable in
   the pinned native C API.
 - forgeCORE has no per-layer weight eviction or streaming API at the pin.
-  libllama maps the model and prefaults the mapping with `MAP_POPULATE`; the
-  pages are file-backed and reclaimable, but residency is controlled by the OS,
-  not forgeCORE. A bounded cgroup and `use_extra_bufts=false` can make a large
-  model fit under a hard cap (demonstrated downstream on GPT-NeoX-20B at 8 GiB),
-  but this is demand paging, not forgeCORE-managed out-of-core execution.
+  libllama maps the model and, in the default `Mmap` mode, prefaults the whole
+  mapping with `MAP_POPULATE`. The opt-in `MmapNoPrefetch` mode skips that
+  prefault (documented native patch); pages then fault on demand and remain
+  file-backed and reclaimable. A bounded cgroup and `use_extra_bufts=false` can
+  make a large model fit under a hard cap (demonstrated downstream on
+  GPT-NeoX-20B at 8 GiB), but residency is still controlled by the OS, not by
+  forgeCORE per-layer scheduling.
 - The live BPE fixture covers a small ASCII vocabulary with the `default`
   GPT-2 pre-tokenizer. Byte-level BPE edge cases and other pre-tokenizer
   variants (for example llama3) remain unverified.

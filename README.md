@@ -49,7 +49,7 @@ docs/                PIVOT.md, NATIVE.md, LICENSING.md, TOOLCHAIN.md, …
 Public API at a glance:
 
 ```rust
-use forge_core::{Backend, Context, ContextOptions, GpuLayers, Model, ModelOptions, SampleConfig, Tensor, TokenId, add, enumerate_devices, matmul, supports_gpu_offload};
+use forge_core::{Backend, Context, ContextOptions, GpuLayers, Model, ModelLoadMode, ModelOptions, SampleConfig, Tensor, TokenId, add, enumerate_devices, matmul, supports_gpu_offload};
 
 let devices = enumerate_devices();          // CPU, CUDA, … — whatever is registered
 let gpu_ok = supports_gpu_offload();        // capability fact; no placement policy here
@@ -62,6 +62,7 @@ let model = Model::load("model.gguf".as_ref())?; // CPU unless offload is reques
 let mut opts = ModelOptions::default();
 opts.gpu_layers = GpuLayers::Count(20);     // explicit unsupported error without a GPU
 opts.use_extra_bufts = Some(false);         // disable CPU repack buffers; keep weights file-backed
+opts.load_mode = ModelLoadMode::MmapNoPrefetch; // optional: skip whole-file MAP_POPULATE
 let gpu_model = Model::load_with_options("model.gguf".as_ref(), &opts)?;
 let mut ctx_opts = ContextOptions::default();
 ctx_opts.n_batch = 512;                     // + n_ubatch/n_seq_max/threads/embeddings/...
@@ -91,13 +92,13 @@ model loading with metadata, context/batch/decode/logits CPU
 inference path, native tokenizer (encode/decode/vocab), native
 sampler chains (greedy/dist/temp/top-k/top-p/min-p), model
 GPU-offload wiring (layer counts, split modes, device selection,
-tensor splits, mmap/mlock modes, capability facts), context/batch
+tensor splits, mmap/mlock and mmap-no-prefetch modes, capability facts), context/batch
 extension (effective sizing, multi-sequence and embedding batches,
 threading, pooling/attention/flash selection, embedding outputs,
 advisory KV/op offload flags), native KV sequence ops and
 byte-oriented state snapshots (clear/remove/copy/keep, position
 shifts, exact state sizes, KV cache dtypes), and explicit validation
-errors — 239 tests green with strict clippy. Out of scope here:
+errors — 372 tests green with strict clippy (2 opt-in tests ignored). Out of scope here:
 generation policy/loops, allocated/resident memory reporting
 (unavailable in the pinned C API), memory estimation, streaming,
 residency control, multi-GPU orchestration, and RAMforge integration

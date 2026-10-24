@@ -136,6 +136,12 @@ pub enum ModelLoadMode {
     NoMmap,
     /// Memory-map the model file.
     Mmap,
+    /// Memory-map the model file without whole-file prefaulting.
+    ///
+    /// This selects the documented `LLAMA_LOAD_MODE_MMAP_NO_PREFETCH`
+    /// native patch. Pages fault in on demand; the mapping and tensor
+    /// pointers remain valid exactly as for [`Self::Mmap`].
+    MmapNoPrefetch,
     /// Lock the model in RAM (without mmap).
     Mlock,
     /// Memory-map the model and lock the mapping in RAM.
@@ -148,6 +154,7 @@ impl ModelLoadMode {
             Self::Auto => forge_sys::load_mode::AUTO,
             Self::NoMmap => forge_sys::load_mode::NONE,
             Self::Mmap => forge_sys::load_mode::MMAP,
+            Self::MmapNoPrefetch => forge_sys::load_mode::MMAP_NO_PREFETCH,
             Self::Mlock => forge_sys::load_mode::MLOCK,
             Self::MmapMlock => forge_sys::load_mode::MMAP_MLOCK,
         }
@@ -590,6 +597,17 @@ mod tests {
         assert_eq!(ModelLoadMode::Mmap.as_native(), 1);
         assert_eq!(ModelLoadMode::Mlock.as_native(), 2);
         assert_eq!(ModelLoadMode::MmapMlock.as_native(), 3);
+        assert_eq!(ModelLoadMode::MmapNoPrefetch.as_native(), 5);
+    }
+
+    #[test]
+    fn no_prefetch_is_opt_in() {
+        assert_eq!(ModelOptions::default().load_mode, ModelLoadMode::Auto);
+        let options = ModelOptions {
+            load_mode: ModelLoadMode::MmapNoPrefetch,
+            ..ModelOptions::default()
+        };
+        assert_eq!(options.load_mode.as_native(), 5);
     }
 
     #[test]
