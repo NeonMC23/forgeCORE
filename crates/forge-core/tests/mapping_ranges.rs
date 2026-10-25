@@ -47,6 +47,14 @@ fn large_tensor_release_releases_pages_and_keeps_inference() {
         .max_by_key(|(_, mapping)| mapping.size)
         .map(|(index, _)| index as i32)
         .expect("file-backed tensor");
+    let prefetched = model
+        .prefetch_tensor_pages(&[selected])
+        .expect("large tensor prefetch");
+    eprintln!("prefetched={prefetched}");
+    assert!(prefetched > 0);
+    model
+        .prefetch_tensor_pages(&[selected])
+        .expect("repeated prefetch");
     let result = model
         .release_tensor_pages(&[selected])
         .expect("large tensor release");

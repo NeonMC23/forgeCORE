@@ -59,8 +59,11 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
   unchanged. Tensor metadata identifies only exact model-owned mapping
   fragments; range release skips pages shared with unselected file-backed
   tensors and never unmaps or invalidates pointers. Unsupported platforms
-  return `ENOTSUP`. GPU execution is **not** validated on hardware in this
-  environment.
+  return `ENOTSUP`. A bounded Linux `MADV_WILLNEED` prefetch hint and a
+  scheduler eval trace (node name/op/dependencies, explicit synchronized
+  completion) are exposed through the same patched native tree. The trace is
+  diagnostic and does not establish intra-decode eviction safety. GPU
+  execution is **not** validated on hardware in this environment.
 - `Model → Context → Batch → decode → Logits` CPU inference path, with
   real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and
   `gptneox` (Pythia-70M).
@@ -126,7 +129,7 @@ idempotently and verifies the upstream SHA first. The patch adds
 `MmapNoPrefetch` and `llama_model_release_pages`; `llama_model_params` layout
 and default `Auto`/`Mmap` behavior are unchanged.
 
-Current standard run: **376 passed, 0 failed, 3 ignored** (GPT-NeoX execution
+Current standard run: **378 passed, 0 failed, 3 ignored** (GPT-NeoX execution
 and the opt-in prefetch/anonymous mapping tests). With `FORGE_TEST_MODEL`
 pointing at the tiny fixture, `all_load_modes_load_cpu_fixture` covers
 `MmapNoPrefetch`, and `mapping_release` verifies two loaded models:
@@ -157,6 +160,20 @@ FORGE_PREFETCH_MODEL=/home/neon/Documents/CODE LOCAL/forge/target/fixtures/pythi
 reported: file `76,722,400 B`; default `Mmap` mapping RSS `74,952,704 B`;
 `MmapNoPrefetch` mapping RSS `0 B`. This confirms the option skips
 whole-file prefaulting; neither operation implements per-layer residency.
+
+Graph trace and prefetch evidence (2026-10-25):
+
+- Tiny fixture with `ContextTraceOptions { max_events: 4096 }`: 37 requested
+  and 37 synchronized-completion events retained; node/op/dependency names
+  populated; trace disabled returns no summary/events.
+- `max_events=2`: 37 requested/37 completed, 72 events dropped, 2 retained.
+- Real Pythia tensor prefetch: `27,369,472 B` requested; repeated prefetch
+  succeeded; subsequent tensor release reported `released_bytes=27,365,376`,
+  `skipped_shared_bytes=4,096`; decode succeeded.
+
+The eval callback runs synchronously after scheduler backend synchronization
+for observed node groups, but it is not proof that a weight can be released for
+the next graph/token. Intra-decode eviction remains unsupported.
 
 ### GPT-NeoX/Pythia execution (2026-10-25)
 

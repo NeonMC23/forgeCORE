@@ -728,6 +728,15 @@ unsafe extern "C" {
         n_indices: usize,
         out: *mut llama_model_page_release_result,
     ) -> c_int;
+    pub fn llama_model_prefetch_tensor_pages(
+        model: *mut llama_model,
+        indices: *const i32,
+        n_indices: usize,
+        out_requested_bytes: *mut u64,
+    ) -> c_int;
+    pub fn llama_tensor_op_name(tensor: *const ggml_tensor) -> *const c_char;
+    pub fn llama_tensor_src_count(tensor: *const ggml_tensor) -> c_int;
+    pub fn llama_tensor_src_name(tensor: *const ggml_tensor, index: i32) -> *const c_char;
     pub fn llama_model_n_params(model: *const llama_model) -> u64;
     // Device/offload capability facts (`llama.h`). All four take no
     // arguments and cannot fail: `max_devices` returns a constant

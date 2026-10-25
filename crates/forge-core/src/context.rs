@@ -35,7 +35,10 @@ use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::memory::{Memory, SeqState, State};
 use crate::model::{Model, ModelInner};
-use std::os::raw::{c_char, c_int};
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int, c_void};
 use std::rc::Rc;
 
 /// Pooled-embedding mode (upstream `llama_pooling_type`).
@@ -155,6 +158,193 @@ impl FlashAttnType {
 /// full-cache selection, performance counters (P7), callbacks, and
 /// backend sampler chains. See the P4/P5 engineering reports for the
 /// per-field rationale.
+/// Opt-in scheduler eval tracing. Enabling this makes the pinned scheduler
+/// compute observed nodes in groups and synchronize after each group; it is
+/// diagnostic instrumentation, not a residency hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextTraceOptions {
+    pub max_events: usize,
+}
+
+impl Default for ContextTraceOptions {
+    fn default() -> Self {
+        Self { max_events: 4096 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TracePhase {
+    /// Scheduler asks whether this node should be observed.
+    Requested,
+    /// The observed node group has been computed and the backend synchronized.
+    CompletedSynchronized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceCompletion {
+    NotCompleted,
+    BackendSynchronized,
+}
+
+/// One bounded graph-trace event. Names/op/dependencies are copied; no native
+/// pointers are retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceEvent {
+    pub execution_id: u64,
+    pub sequence: u64,
+    pub node_name: Option<String>,
+    pub op_name: Option<String>,
+    pub bytes: u64,
+    pub dependencies: Vec<String>,
+    pub phase: TracePhase,
+    pub completion: TraceCompletion,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TraceSummary {
+    pub executions: u64,
+    pub requested_events: u64,
+    pub completed_events: u64,
+    pub dropped_events: u64,
+    pub max_events: usize,
+    pub retained_events: usize,
+}
+
+struct TraceBuffer {
+    max_events: usize,
+    execution_id: u64,
+    sequence: u64,
+    requested_events: u64,
+    completed_events: u64,
+    dropped_events: u64,
+    events: VecDeque<TraceEvent>,
+}
+
+struct TraceState {
+    buffer: RefCell<TraceBuffer>,
+}
+
+impl TraceState {
+    fn new(max_events: usize) -> Self {
+        Self {
+            buffer: RefCell::new(TraceBuffer {
+                max_events: max_events.max(1),
+                execution_id: 0,
+                sequence: 0,
+                requested_events: 0,
+                completed_events: 0,
+                dropped_events: 0,
+                events: VecDeque::new(),
+            }),
+        }
+    }
+
+    fn begin_execution(&self) {
+        self.buffer.borrow_mut().execution_id += 1;
+    }
+
+    fn record(&self, tensor: *mut forge_sys::ggml_tensor, ask: bool) {
+        if tensor.is_null() {
+            return;
+        }
+        // SAFETY: the scheduler owns the tensor for the duration of the
+        // callback; names and sizes are copied immediately.
+        let node_name = unsafe { name_of(forge_sys::ggml_get_name(tensor)) };
+        let op_name = unsafe { name_of(forge_sys::llama_tensor_op_name(tensor)) };
+        let bytes = unsafe { forge_sys::ggml_nbytes(tensor) as u64 };
+        let mut dependencies = Vec::new();
+        // SAFETY: read-only node metadata during the scheduler callback.
+        let source_count = unsafe { forge_sys::llama_tensor_src_count(tensor) };
+        for index in 0..source_count {
+            if let Some(name) = unsafe { name_of(forge_sys::llama_tensor_src_name(tensor, index)) }
+            {
+                dependencies.push(name);
+            }
+        }
+        let mut buffer = self.buffer.borrow_mut();
+        let phase = if ask {
+            buffer.requested_events += 1;
+            TracePhase::Requested
+        } else {
+            buffer.completed_events += 1;
+            TracePhase::CompletedSynchronized
+        };
+        let event = TraceEvent {
+            execution_id: buffer.execution_id,
+            sequence: buffer.sequence,
+            node_name,
+            op_name,
+            bytes,
+            dependencies,
+            phase,
+            completion: if ask {
+                TraceCompletion::NotCompleted
+            } else {
+                TraceCompletion::BackendSynchronized
+            },
+        };
+        buffer.sequence += 1;
+        if buffer.events.len() >= buffer.max_events {
+            buffer.events.pop_front();
+            buffer.dropped_events += 1;
+        }
+        buffer.events.push_back(event);
+    }
+
+    fn events(&self) -> Vec<TraceEvent> {
+        self.buffer.borrow().events.iter().cloned().collect()
+    }
+
+    fn take_events(&self) -> Vec<TraceEvent> {
+        let mut buffer = self.buffer.borrow_mut();
+        buffer.events.drain(..).collect()
+    }
+
+    fn clear(&self) {
+        let mut buffer = self.buffer.borrow_mut();
+        buffer.events.clear();
+        buffer.dropped_events = 0;
+    }
+
+    fn summary(&self) -> TraceSummary {
+        let buffer = self.buffer.borrow();
+        TraceSummary {
+            executions: buffer.execution_id,
+            requested_events: buffer.requested_events,
+            completed_events: buffer.completed_events,
+            dropped_events: buffer.dropped_events,
+            max_events: buffer.max_events,
+            retained_events: buffer.events.len(),
+        }
+    }
+}
+
+unsafe extern "C" fn trace_callback(
+    tensor: *mut forge_sys::ggml_tensor,
+    ask: bool,
+    user_data: *mut c_void,
+) -> bool {
+    if !user_data.is_null() {
+        // SAFETY: user_data points at the Box<TraceState> owned by the
+        // context for the duration of the callback. No unwind crosses FFI.
+        let state = unsafe { &*(user_data as *const TraceState) };
+        state.record(tensor, ask);
+    }
+    // Returning true at both phases keeps execution going and asks the
+    // scheduler to observe every node.
+    true
+}
+
+unsafe fn name_of(pointer: *const c_char) -> Option<String> {
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: native name pointers are NUL-terminated and valid during the
+    // callback; copy immediately.
+    let value = unsafe { CStr::from_ptr(pointer) }.to_str().ok()?;
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ContextOptions {
@@ -229,6 +419,9 @@ pub struct ContextOptions {
     pub type_k: DType,
     /// Data type for the V cache. See [`ContextOptions::type_k`].
     pub type_v: DType,
+    /// Opt-in bounded graph eval tracing. `None` preserves the original
+    /// execution path with no callback installed.
+    pub trace: Option<ContextTraceOptions>,
 }
 
 impl Default for ContextOptions {
@@ -253,6 +446,7 @@ impl Default for ContextOptions {
             flash_attn: FlashAttnType::Auto,
             type_k: DType::F16,
             type_v: DType::F16,
+            trace: None,
         }
     }
 }
@@ -336,6 +530,7 @@ pub struct Context {
     // multi-position MROPE/IMROPE models, where upstream aborts).
     max_parallel_seqs: u32,
     shift_allowed: bool,
+    trace: Option<Box<TraceState>>,
 }
 
 impl Drop for Context {
@@ -373,6 +568,14 @@ impl Context {
         };
         let n_threads_batch = c_int::try_from(threads_batch)
             .map_err(|_| Error::invalid("context n_threads_batch too large"))?;
+        let trace_state = options
+            .trace
+            .map(|trace| Box::new(TraceState::new(trace.max_events)));
+        let trace_ptr = trace_state
+            .as_deref()
+            .map_or(std::ptr::null_mut(), |state| {
+                (state as *const TraceState).cast_mut().cast::<c_void>()
+            });
         // SAFETY: default params are valid by construction; the model is
         // live; NULL return (init failure) is checked. The context keeps
         // a share of the model so it cannot outlive it.
@@ -395,6 +598,11 @@ impl Context {
             params.kv_unified = options.kv_unified;
             params.type_k = options.type_k.ggml_type();
             params.type_v = options.type_v.ggml_type();
+            params.cb_eval = trace_state.as_ref().map(|_| {
+                trace_callback
+                    as unsafe extern "C" fn(*mut forge_sys::ggml_tensor, bool, *mut c_void) -> bool
+            });
+            params.cb_eval_user_data = trace_ptr;
             let raw = forge_sys::llama_init_from_model(model.raw(), params);
             if raw.is_null() {
                 return Err(Error::context("context creation failed"));
@@ -472,6 +680,7 @@ impl Context {
                 n_cls_out,
                 max_parallel_seqs,
                 shift_allowed,
+                trace: trace_state,
             })
         }
     }
@@ -568,6 +777,34 @@ impl Context {
         unsafe { forge_sys::llama_synchronize(self.raw) };
     }
 
+    /// Bounded graph trace summary, or `None` when tracing was not enabled.
+    pub fn trace_summary(&self) -> Option<TraceSummary> {
+        self.trace.as_ref().map(|trace| trace.summary())
+    }
+
+    /// Copy retained trace events. Empty when tracing was not enabled.
+    pub fn trace_events(&self) -> Vec<TraceEvent> {
+        self.trace
+            .as_ref()
+            .map(|trace| trace.events())
+            .unwrap_or_default()
+    }
+
+    /// Drain retained trace events.
+    pub fn take_trace_events(&self) -> Vec<TraceEvent> {
+        self.trace
+            .as_ref()
+            .map(|trace| trace.take_events())
+            .unwrap_or_default()
+    }
+
+    /// Clear retained events and reset the dropped-event counter.
+    pub fn clear_trace(&self) {
+        if let Some(trace) = &self.trace {
+            trace.clear();
+        }
+    }
+
     /// Decode one [`Batch`], advancing this context's KV state.
     ///
     /// ForgeCore refuses up front what upstream cannot take safely: an
@@ -615,6 +852,9 @@ impl Context {
                     self.n_seq_max
                 )));
             }
+        }
+        if let Some(trace) = &self.trace {
+            trace.begin_execution();
         }
         // SAFETY: raw is a live context; the batch view borrows only
         // arrays the `&Batch` owns, which outlive this call; the model

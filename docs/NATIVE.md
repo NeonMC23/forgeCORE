@@ -63,6 +63,14 @@ The patch adds two narrow capabilities:
   which validates tensor indices against exact model-owned mapping fragments.
   Pages shared with unselected file-backed tensors are skipped conservatively.
   Names are borrowed from the model; forgeCORE copies them immediately.
+- `llama_model_prefetch_tensor_pages()` as a bounded Linux
+  `MADV_WILLNEED` hint over validated tensor pages. It is not a synchronous
+  read or a residency guarantee.
+- Read-only tensor graph helpers (`llama_tensor_op_name`,
+  `llama_tensor_src_count`, `llama_tensor_src_name`) used by forgeCORE's
+  bounded scheduler eval trace. The trace callback itself uses the pinned
+  public `llama_context_params.cb_eval`; no native execution behavior changes
+  when tracing is disabled.
 
 It does not change `llama_model_params` layout or the default `AUTO`/`MMAP`
 behavior. The upstream checkout HEAD remains the pinned SHA; the patch is

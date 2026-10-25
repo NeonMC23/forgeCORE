@@ -604,6 +604,36 @@ impl Model {
         })
     }
 
+    /// Best-effort `MADV_WILLNEED` for selected tensor pages.
+    ///
+    /// Returns page bytes submitted to the native advice call. This is a hint,
+    /// not a synchronous read or a residency guarantee; unsupported platforms
+    /// return an explicit error.
+    pub fn prefetch_tensor_pages(&mut self, indices: &[i32]) -> Result<u64> {
+        if indices.is_empty() {
+            return Err(Error::invalid(
+                "prefetch_tensor_pages requires at least one tensor index",
+            ));
+        }
+        let mut requested = 0u64;
+        // SAFETY: raw is a live model; indices is a live slice; requested is
+        // writable. The native side only advises validated model mappings.
+        let rc = unsafe {
+            forge_sys::llama_model_prefetch_tensor_pages(
+                self.inner.raw,
+                indices.as_ptr(),
+                indices.len(),
+                &mut requested,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::model(format!(
+                "native tensor page prefetch failed with errno {rc}; ENOTSUP (95) indicates an unsupported platform"
+            )));
+        }
+        Ok(requested)
+    }
+
     /// Training context length the model was built with.
     pub fn n_ctx_train(&self) -> Result<u32> {
         // SAFETY: raw is a live model; pure getter.

@@ -84,8 +84,17 @@ platforms return an explicit `ENOTSUP` error. Do not call it during a decode.
 `Model::tensor_mappings()` returns owned tensor metadata (name, file-backed
 flag, mapping index, offset, size, page bounds). `Model::release_tensor_pages()`
 releases only selected tensor ranges, conservatively skipping pages shared with
-unselected file-backed tensors. These are tensor-level primitives; layer
-grouping remains caller policy.
+unselected file-backed tensors. `Model::prefetch_tensor_pages()` is a bounded
+Linux `MADV_WILLNEED` hint, not a synchronous read. These are tensor-level
+primitives; layer grouping remains caller policy.
+
+`ContextOptions::trace` enables a bounded scheduler eval trace using the
+pinned public `llama_context_params.cb_eval`. With tracing enabled, the
+scheduler computes observed nodes in groups and synchronizes before the
+`ask == false` callback. The trace reports node names, op names, dependencies,
+and an explicit `BackendSynchronized` completion phase. It is diagnostic only:
+it does not prove that a weight is safe to release for the next graph. Tracing
+disabled preserves the original execution path.
 
 ## Docs
 
@@ -109,7 +118,7 @@ threading, pooling/attention/flash selection, embedding outputs,
 advisory KV/op offload flags), native KV sequence ops and
 byte-oriented state snapshots (clear/remove/copy/keep, position
 shifts, exact state sizes, KV cache dtypes), and explicit validation
-errors — 376 tests green with strict clippy (3 opt-in tests ignored). Out of scope here:
+errors — 378 tests green with strict clippy (3 opt-in tests ignored). Out of scope here:
 generation policy/loops, allocated/resident memory reporting
 (unavailable in the pinned C API), memory estimation, streaming,
 residency control, multi-GPU orchestration, and RAMforge integration
