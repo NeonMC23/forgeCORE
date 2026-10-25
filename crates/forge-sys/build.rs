@@ -32,6 +32,8 @@ fn main() {
             .unwrap_or_else(|error| panic!("forge-sys: cannot read {}: {error}", header.display()));
         if !text.contains("LLAMA_LOAD_MODE_MMAP_NO_PREFETCH")
             || !text.contains("llama_model_release_pages")
+            || !text.contains("llama_model_tensor_mapping_count")
+            || !text.contains("llama_model_release_tensor_pages")
         {
             panic!(
                 "forge-sys: {} lacks the required native residency patch. Re-run `sh scripts/setup-native.sh` to apply patches/llama-model-residency.patch.",

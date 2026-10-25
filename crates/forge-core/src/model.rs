@@ -11,7 +11,7 @@
 
 use crate::device::{self, DeviceInfo};
 use crate::error::{Error, Result};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::path::Path;
 use std::ptr;
@@ -159,6 +159,41 @@ impl ModelLoadMode {
             Self::MmapMlock => forge_sys::load_mode::MMAP_MLOCK,
         }
     }
+}
+
+/// Exact file-backed mapping metadata for one model tensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorMappingInfo {
+    pub name: String,
+    pub file_backed: bool,
+    /// Mapping index among the model's own file mappings.
+    pub mapping_index: Option<u32>,
+    /// Total mapping size in bytes.
+    pub mapping_size: u64,
+    /// Tensor data offset within the mapping.
+    pub offset: u64,
+    /// Tensor data size in bytes.
+    pub size: u64,
+    /// OS page size used for page bounds.
+    pub page_size: u64,
+    /// Page-aligned start offset within the mapping.
+    pub page_start: u64,
+    /// Page-aligned end offset within the mapping (may round past the
+    /// mapping file size; release clamps it).
+    pub page_end: u64,
+}
+
+/// Outcome of a tensor-scoped page release request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageReleaseResult {
+    /// Page bytes submitted to `madvise`; not proof that RSS dropped.
+    pub released_bytes: u64,
+    /// Page bytes skipped because an unselected tensor shares them.
+    pub skipped_shared_bytes: u64,
+    /// Selected tensors that are not file-backed.
+    pub non_file_backed_tensors: u64,
+    /// Unique selected tensors that are file-backed.
+    pub selected_tensors: u64,
 }
 
 /// Validate a caller-supplied `tensor_split` array's shape and values.
@@ -471,6 +506,102 @@ impl Model {
             )));
         }
         Ok(())
+    }
+
+    /// Exact file-backed mapping metadata for every model tensor.
+    ///
+    /// Names and offsets come from the live native model. Anonymous tensors
+    /// (for example repacked buffers) are reported with `file_backed == false`.
+    /// The returned descriptors are owned values; no native pointer escapes.
+    pub fn tensor_mappings(&self) -> Result<Vec<TensorMappingInfo>> {
+        // SAFETY: raw is a live model; count is a pure getter.
+        let count = unsafe { forge_sys::llama_model_tensor_mapping_count(self.inner.raw) };
+        if count < 0 {
+            return Err(Error::model("native tensor mapping count failed"));
+        }
+        let mut mappings = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut raw = forge_sys::llama_tensor_mapping {
+                name: ptr::null(),
+                file_backed: 0,
+                mapping_index: -1,
+                mapping_size: 0,
+                offset: 0,
+                size: 0,
+                page_size: 0,
+                page_start: 0,
+                page_end: 0,
+            };
+            // SAFETY: raw is a live model and out points to writable storage.
+            let rc =
+                unsafe { forge_sys::llama_model_tensor_mapping(self.inner.raw, index, &mut raw) };
+            if rc != 0 {
+                return Err(Error::model(format!(
+                    "native tensor mapping lookup failed at index {index}"
+                )));
+            }
+            if raw.name.is_null() {
+                return Err(Error::model("native tensor mapping returned no name"));
+            }
+            // SAFETY: the name pointer is owned by the live model and valid
+            // for the duration of this call; copy it immediately.
+            let name = unsafe { CStr::from_ptr(raw.name) }
+                .to_str()
+                .map_err(|_| Error::model("tensor name is not UTF-8"))?
+                .to_owned();
+            let file_backed = raw.file_backed != 0;
+            if file_backed && raw.mapping_index < 0 {
+                return Err(Error::model("file-backed tensor has invalid mapping index"));
+            }
+            mappings.push(TensorMappingInfo {
+                name,
+                file_backed,
+                mapping_index: file_backed.then_some(raw.mapping_index as u32),
+                mapping_size: raw.mapping_size,
+                offset: raw.offset,
+                size: raw.size,
+                page_size: raw.page_size,
+                page_start: raw.page_start,
+                page_end: raw.page_end,
+            });
+        }
+        Ok(mappings)
+    }
+
+    /// Release pages for selected model tensor indices.
+    ///
+    /// The native side validates indices, maps them to exact model-owned
+    /// mapping ranges, and conservatively skips pages shared with unselected
+    /// file-backed tensors. It never unmaps or invalidates pointers. Callers
+    /// must not call this during decode; `Model`/`Context` are
+    /// `!Send + !Sync`, and this takes `&mut self`.
+    pub fn release_tensor_pages(&mut self, indices: &[i32]) -> Result<PageReleaseResult> {
+        if indices.is_empty() {
+            return Err(Error::invalid(
+                "release_tensor_pages requires at least one tensor index",
+            ));
+        }
+        let mut out = forge_sys::llama_model_page_release_result::default();
+        // SAFETY: raw is a live model; indices is a live slice; out is writable.
+        let rc = unsafe {
+            forge_sys::llama_model_release_tensor_pages(
+                self.inner.raw,
+                indices.as_ptr(),
+                indices.len(),
+                &mut out,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::model(format!(
+                "native tensor page release failed with errno {rc}; ENOTSUP (95) indicates an unsupported platform"
+            )));
+        }
+        Ok(PageReleaseResult {
+            released_bytes: out.released_bytes,
+            skipped_shared_bytes: out.skipped_shared_bytes,
+            non_file_backed_tensors: out.non_file_backed_tensors,
+            selected_tensors: out.selected_tensors,
+        })
     }
 
     /// Training context length the model was built with.

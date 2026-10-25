@@ -58,6 +58,11 @@ The patch adds two narrow capabilities:
   mapped fragments. It does not unmap memory or invalidate tensor pointers.
   Other platforms return `ENOTSUP`; the caller must not release pages during a
   decode.
+- Tensor-to-mapping metadata (`llama_model_tensor_mapping_count` /
+  `llama_model_tensor_mapping`) and `llama_model_release_tensor_pages()`,
+  which validates tensor indices against exact model-owned mapping fragments.
+  Pages shared with unselected file-backed tensors are skipped conservatively.
+  Names are borrowed from the model; forgeCORE copies them immediately.
 
 It does not change `llama_model_params` layout or the default `AUTO`/`MMAP`
 behavior. The upstream checkout HEAD remains the pinned SHA; the patch is

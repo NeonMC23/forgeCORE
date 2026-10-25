@@ -264,6 +264,31 @@ pub struct llama_model_params {
     pub load_mtp: bool,
 }
 
+/// `struct llama_tensor_mapping` (`llama.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct llama_tensor_mapping {
+    pub name: *const c_char,
+    pub file_backed: i32,
+    pub mapping_index: i32,
+    pub mapping_size: u64,
+    pub offset: u64,
+    pub size: u64,
+    pub page_size: u64,
+    pub page_start: u64,
+    pub page_end: u64,
+}
+
+/// `struct llama_model_page_release_result` (`llama.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct llama_model_page_release_result {
+    pub released_bytes: u64,
+    pub skipped_shared_bytes: u64,
+    pub non_file_backed_tensors: u64,
+    pub selected_tensors: u64,
+}
+
 /// `ggml_log_callback` (`ggml.h`); also used by `llama_log_set`.
 pub type ggml_log_callback =
     Option<unsafe extern "C" fn(level: c_int, text: *const c_char, user_data: *mut c_void)>;
@@ -691,6 +716,18 @@ unsafe extern "C" {
     ) -> *mut llama_model;
     pub fn llama_model_free(model: *mut llama_model);
     pub fn llama_model_release_pages(model: *mut llama_model) -> c_int;
+    pub fn llama_model_tensor_mapping_count(model: *const llama_model) -> c_int;
+    pub fn llama_model_tensor_mapping(
+        model: *const llama_model,
+        index: i32,
+        out: *mut llama_tensor_mapping,
+    ) -> c_int;
+    pub fn llama_model_release_tensor_pages(
+        model: *mut llama_model,
+        indices: *const i32,
+        n_indices: usize,
+        out: *mut llama_model_page_release_result,
+    ) -> c_int;
     pub fn llama_model_n_params(model: *const llama_model) -> u64;
     // Device/offload capability facts (`llama.h`). All four take no
     // arguments and cannot fail: `max_devices` returns a constant
@@ -928,6 +965,21 @@ mod layout_tests {
         assert_eq!(offset_of!(ggml_init_params, mem_size), 0);
         assert_eq!(offset_of!(ggml_init_params, mem_buffer), 8);
         assert_eq!(offset_of!(ggml_init_params, no_alloc), 16);
+    }
+
+    #[test]
+    fn llama_tensor_mapping_layout() {
+        assert_eq!(size_of::<llama_tensor_mapping>(), 64);
+        assert_eq!(offset_of!(llama_tensor_mapping, name), 0);
+        assert_eq!(offset_of!(llama_tensor_mapping, file_backed), 8);
+        assert_eq!(offset_of!(llama_tensor_mapping, mapping_index), 12);
+        assert_eq!(offset_of!(llama_tensor_mapping, mapping_size), 16);
+        assert_eq!(offset_of!(llama_tensor_mapping, offset), 24);
+        assert_eq!(offset_of!(llama_tensor_mapping, size), 32);
+        assert_eq!(offset_of!(llama_tensor_mapping, page_size), 40);
+        assert_eq!(offset_of!(llama_tensor_mapping, page_start), 48);
+        assert_eq!(offset_of!(llama_tensor_mapping, page_end), 56);
+        assert_eq!(size_of::<llama_model_page_release_result>(), 32);
     }
 
     #[test]

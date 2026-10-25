@@ -52,7 +52,9 @@ pub use gguf::{
 };
 pub use graph::{Graph, NodeInfo, Plan, DEFAULT_GRAPH_CAPACITY};
 pub use memory::{Memory, SeqState, State};
-pub use model::{GpuLayers, Model, ModelLoadMode, ModelOptions, SplitMode};
+pub use model::{
+    GpuLayers, Model, ModelLoadMode, ModelOptions, PageReleaseResult, SplitMode, TensorMappingInfo,
+};
 pub use quant::{block_spec, row_bytes, tensor_bytes, BlockSpec, QuantFormat};
 pub use runtime::{
     add, concat, div, get_rows, matmul, mul, norm, rms_norm, rope, scale, silu, soft_max,

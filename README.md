@@ -81,6 +81,12 @@ from exactly that model's file-backed mappings. On Linux it uses
 `madvise(MADV_DONTNEED)`; it never unmaps or invalidates tensor pointers. Other
 platforms return an explicit `ENOTSUP` error. Do not call it during a decode.
 
+`Model::tensor_mappings()` returns owned tensor metadata (name, file-backed
+flag, mapping index, offset, size, page bounds). `Model::release_tensor_pages()`
+releases only selected tensor ranges, conservatively skipping pages shared with
+unselected file-backed tensors. These are tensor-level primitives; layer
+grouping remains caller policy.
+
 ## Docs
 
 - `docs/PIVOT.md` — why the pivot, what was kept/removed, API and FFI
@@ -103,7 +109,7 @@ threading, pooling/attention/flash selection, embedding outputs,
 advisory KV/op offload flags), native KV sequence ops and
 byte-oriented state snapshots (clear/remove/copy/keep, position
 shifts, exact state sizes, KV cache dtypes), and explicit validation
-errors — 373 tests green with strict clippy (2 opt-in tests ignored). Out of scope here:
+errors — 376 tests green with strict clippy (2 opt-in tests ignored). Out of scope here:
 generation policy/loops, allocated/resident memory reporting
 (unavailable in the pinned C API), memory estimation, streaming,
 residency control, multi-GPU orchestration, and RAMforge integration

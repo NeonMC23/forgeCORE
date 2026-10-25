@@ -52,12 +52,15 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
   weight-repacking control (`ModelOptions::use_extra_bufts`,
   `without_cpu_weight_repacking()`), and an opt-in
   `ModelLoadMode::MmapNoPrefetch` mode that skips whole-file `MAP_POPULATE`,
-  plus `Model::release_mapping_pages()` for model-scoped Linux page release.
-  Both are supplied by the documented `patches/llama-model-residency.patch`;
-  the default `Auto`/`Mmap` behavior is unchanged. Page release walks only the
-  native model's own mappings, never unmaps them, and returns `ENOTSUP` on
-  unsupported platforms. GPU execution is **not** validated on hardware in
-  this environment.
+  plus model-scoped and tensor-scoped Linux page release:
+  `Model::release_mapping_pages()`, `Model::tensor_mappings()`, and
+  `Model::release_tensor_pages()`. These are supplied by the documented
+  `patches/llama-model-residency.patch`; the default `Auto`/`Mmap` behavior is
+  unchanged. Tensor metadata identifies only exact model-owned mapping
+  fragments; range release skips pages shared with unselected file-backed
+  tensors and never unmaps or invalidates pointers. Unsupported platforms
+  return `ENOTSUP`. GPU execution is **not** validated on hardware in this
+  environment.
 - `Model → Context → Batch → decode → Logits` CPU inference path, with
   real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and
   `gptneox` (Pythia-70M).
@@ -123,7 +126,7 @@ idempotently and verifies the upstream SHA first. The patch adds
 `MmapNoPrefetch` and `llama_model_release_pages`; `llama_model_params` layout
 and default `Auto`/`Mmap` behavior are unchanged.
 
-Current standard run: **373 passed, 0 failed, 2 ignored** (GPT-NeoX execution
+Current standard run: **376 passed, 0 failed, 2 ignored** (GPT-NeoX execution
 and the opt-in prefetch mapping test). With `FORGE_TEST_MODEL` pointing at the
 tiny fixture, `all_load_modes_load_cpu_fixture` covers `MmapNoPrefetch`, and
 `mapping_release` verifies two loaded models:
@@ -133,8 +136,16 @@ A 8192->0, B 8192->8192
 ```
 
 Model A's mapping pages were released; model B's remained resident; a decode
-against A after release succeeded. This confirms model scoping and pointer
-validity. The opt-in disk-backed prefetch check:
+against A after release succeeded. `mapping_ranges` verifies exact tensor
+metadata and conservative shared-page handling. With the real Pythia fixture,
+the largest file-backed tensor reported:
+
+```text
+released_bytes=27,365,376 skipped_shared_bytes=4,096 selected_tensors=1
+```
+
+A decode after repeated tensor release succeeded. The opt-in disk-backed
+prefetch check:
 
 ```sh
 FORGE_PREFETCH_MODEL=/home/neon/Documents/CODE LOCAL/forge/target/fixtures/pythia-70m.Q8_0.gguf \
@@ -256,13 +267,14 @@ read-only in the RAMforge run inventory.
   and `tensor_buft_overrides` are not implemented.
 - KV allocated/resident bytes and per-layer K/V read-back are unavailable in
   the pinned native C API.
-- forgeCORE has no per-layer weight eviction or streaming API at the pin.
+- forgeCORE has no per-layer execution scheduler or automatic eviction.
   libllama maps the model and, in the default `Mmap` mode, prefaults the whole
   mapping with `MAP_POPULATE`. The opt-in `MmapNoPrefetch` mode skips that
-  prefault, and `Model::release_mapping_pages()` releases pages from the whole
-  model mapping on Linux (documented native patch). Neither operation is
-  per-layer. A bounded cgroup and `use_extra_bufts=false` can make a large
-  model fit under a hard cap (demonstrated downstream on GPT-NeoX-20B at
+  prefault; model-scoped and tensor-scoped release exist on Linux, and tensor
+  ranges are exact, but layer grouping and release timing are caller policy.
+  Release skips pages shared with unselected tensors and cannot guarantee a
+  lower load-time peak. A bounded cgroup and `use_extra_bufts=false` can make a
+  large model fit under a hard cap (demonstrated downstream on GPT-NeoX-20B at
   8 GiB), but residency is still controlled by the OS, not by forgeCORE
   per-layer scheduling.
 - The live BPE fixture covers a small ASCII vocabulary with the `default`
