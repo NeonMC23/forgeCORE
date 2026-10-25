@@ -44,16 +44,24 @@ cd /home/user/forgeCORE && cargo test --workspace
 `setup-native.sh` clones `--depth 1 --branch v0.5.0`, verifies the
 checkout resolves to commit `7fe450e19305b828c199d602c23a8337aaa1f03b`
 (aborting otherwise), applies the documented patch under
-[`patches/llama-mmap-no-prefetch.patch`](../patches/llama-mmap-no-prefetch.patch),
+[`patches/llama-model-residency.patch`](../patches/llama-model-residency.patch),
 configures with `BUILD_SHARED_LIBS=ON` and tests/examples/tools off, and
 builds with all cores. Re-running it reuses the checkout, skips an
 already-applied patch, and rebuilds incrementally.
 
-The patch adds only `LLAMA_LOAD_MODE_MMAP_NO_PREFETCH = 5` and passes
-`prefetch=false` to the existing `init_mappings` path for that mode. It does
-not change `llama_model_params` layout or the default `AUTO`/`MMAP` behavior.
-The upstream checkout HEAD remains the pinned SHA; the patch is tracked in
-this repository so the native tree is reproducible.
+The patch adds two narrow capabilities:
+
+- `LLAMA_LOAD_MODE_MMAP_NO_PREFETCH = 5`, which passes `prefetch=false` to the
+  existing `init_mappings` path.
+- `llama_model_release_pages()`, which walks only that model's own
+  file-backed mappings and calls Linux `madvise(MADV_DONTNEED)` on their
+  mapped fragments. It does not unmap memory or invalidate tensor pointers.
+  Other platforms return `ENOTSUP`; the caller must not release pages during a
+  decode.
+
+It does not change `llama_model_params` layout or the default `AUTO`/`MMAP`
+behavior. The upstream checkout HEAD remains the pinned SHA; the patch is
+tracked in this repository so the native tree is reproducible.
 
 ## Pin management
 

@@ -51,11 +51,13 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
   GPU-offload configuration (`GpuLayers`, split mode, device list), CPU
   weight-repacking control (`ModelOptions::use_extra_bufts`,
   `without_cpu_weight_repacking()`), and an opt-in
-  `ModelLoadMode::MmapNoPrefetch` mode that skips whole-file `MAP_POPULATE`.
-  The no-prefetch mode is supplied by the documented
-  `patches/llama-mmap-no-prefetch.patch`; the default `Auto`/`Mmap` behavior is
-  unchanged. GPU execution is **not** validated on hardware in this
-  environment.
+  `ModelLoadMode::MmapNoPrefetch` mode that skips whole-file `MAP_POPULATE`,
+  plus `Model::release_mapping_pages()` for model-scoped Linux page release.
+  Both are supplied by the documented `patches/llama-model-residency.patch`;
+  the default `Auto`/`Mmap` behavior is unchanged. Page release walks only the
+  native model's own mappings, never unmaps them, and returns `ENOTSUP` on
+  unsupported platforms. GPU execution is **not** validated on hardware in
+  this environment.
 - `Model → Context → Batch → decode → Logits` CPU inference path, with
   real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and
   `gptneox` (Pythia-70M).
@@ -113,18 +115,26 @@ Results:
   executed coverage when skipped.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 
-### No-prefetch mapping evidence (2026-10-25)
+### Mapping residency evidence (2026-10-25)
 
 The native tree is the pinned v0.5.0 checkout plus the documented
-`patches/llama-mmap-no-prefetch.patch`; `setup-native.sh` applies it
-idempotently and verifies the upstream SHA first. The new mode adds only an
-enum value and a `prefetch=false` argument; `llama_model_params` layout and
-default `Auto`/`Mmap` behavior are unchanged.
+`patches/llama-model-residency.patch`; `setup-native.sh` applies it
+idempotently and verifies the upstream SHA first. The patch adds
+`MmapNoPrefetch` and `llama_model_release_pages`; `llama_model_params` layout
+and default `Auto`/`Mmap` behavior are unchanged.
 
-Current standard run: **372 passed, 0 failed, 2 ignored** (GPT-NeoX execution
-and the opt-in mapping test). With `FORGE_TEST_MODEL` pointing at the tiny
-fixture, `all_load_modes_load_cpu_fixture` also covers `MmapNoPrefetch` and
-passes. The opt-in disk-backed check:
+Current standard run: **373 passed, 0 failed, 2 ignored** (GPT-NeoX execution
+and the opt-in prefetch mapping test). With `FORGE_TEST_MODEL` pointing at the
+tiny fixture, `all_load_modes_load_cpu_fixture` covers `MmapNoPrefetch`, and
+`mapping_release` verifies two loaded models:
+
+```text
+A 8192->0, B 8192->8192
+```
+
+Model A's mapping pages were released; model B's remained resident; a decode
+against A after release succeeded. This confirms model scoping and pointer
+validity. The opt-in disk-backed prefetch check:
 
 ```sh
 FORGE_PREFETCH_MODEL=/home/neon/Documents/CODE LOCAL/forge/target/fixtures/pythia-70m.Q8_0.gguf \
@@ -133,7 +143,7 @@ FORGE_PREFETCH_MODEL=/home/neon/Documents/CODE LOCAL/forge/target/fixtures/pythi
 
 reported: file `76,722,400 B`; default `Mmap` mapping RSS `74,952,704 B`;
 `MmapNoPrefetch` mapping RSS `0 B`. This confirms the option skips
-whole-file prefaulting; it does not implement per-layer residency.
+whole-file prefaulting; neither operation implements per-layer residency.
 
 ### GPT-NeoX/Pythia execution (2026-10-25)
 

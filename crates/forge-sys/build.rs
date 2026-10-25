@@ -30,9 +30,11 @@ fn main() {
     if header.exists() {
         let text = fs::read_to_string(&header)
             .unwrap_or_else(|error| panic!("forge-sys: cannot read {}: {error}", header.display()));
-        if !text.contains("LLAMA_LOAD_MODE_MMAP_NO_PREFETCH") {
+        if !text.contains("LLAMA_LOAD_MODE_MMAP_NO_PREFETCH")
+            || !text.contains("llama_model_release_pages")
+        {
             panic!(
-                "forge-sys: {} lacks LLAMA_LOAD_MODE_MMAP_NO_PREFETCH. Re-run `sh scripts/setup-native.sh` to apply patches/llama-mmap-no-prefetch.patch.",
+                "forge-sys: {} lacks the required native residency patch. Re-run `sh scripts/setup-native.sh` to apply patches/llama-model-residency.patch.",
                 header.display()
             );
         }

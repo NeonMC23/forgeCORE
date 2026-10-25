@@ -24,7 +24,7 @@ LLAMA_SHA="${LLAMA_SHA:-7fe450e19305b828c199d602c23a8337aaa1f03b}"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 SRC="$FORGE_LLAMA_DIR/src"
 BUILD="$FORGE_LLAMA_DIR/build"
-PATCH="$ROOT/patches/llama-mmap-no-prefetch.patch"
+PATCH="$ROOT/patches/llama-model-residency.patch"
 
 if ! command -v git >/dev/null 2>&1; then
     echo "setup-native: git not found on PATH" >&2
@@ -55,10 +55,10 @@ if [ ! -f "$PATCH" ]; then
     exit 1
 fi
 if git -C "$SRC" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
-    echo "setup-native: mmap-no-prefetch patch already applied"
+    echo "setup-native: model-residency patch already applied"
 else
     git -C "$SRC" apply "$PATCH"
-    echo "setup-native: applied mmap-no-prefetch patch"
+    echo "setup-native: applied model-residency patch"
 fi
 
 echo "setup-native: configuring CMake (CPU backends, shared libs) ..."

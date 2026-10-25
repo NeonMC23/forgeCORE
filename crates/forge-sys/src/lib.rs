@@ -141,7 +141,7 @@ pub mod split_mode {
 ///
 /// `LLAMA_LOAD_MODE_DIRECT_IO` (4) is deliberately unbound: no
 /// `forge-core` API selects it. `MMAP_NO_PREFETCH` (5) is supplied by
-/// the documented native patch in `patches/llama-mmap-no-prefetch.patch`.
+/// the documented native patch in `patches/llama-model-residency.patch`.
 pub mod load_mode {
     pub const AUTO: i32 = -1;
     pub const NONE: i32 = 0;
@@ -690,6 +690,7 @@ unsafe extern "C" {
         params: llama_model_params,
     ) -> *mut llama_model;
     pub fn llama_model_free(model: *mut llama_model);
+    pub fn llama_model_release_pages(model: *mut llama_model) -> c_int;
     pub fn llama_model_n_params(model: *const llama_model) -> u64;
     // Device/offload capability facts (`llama.h`). All four take no
     // arguments and cannot fail: `max_devices` returns a constant

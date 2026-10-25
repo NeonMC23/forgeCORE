@@ -451,6 +451,28 @@ impl Model {
         unsafe { forge_sys::llama_model_size(self.inner.raw) }
     }
 
+    /// Advise the OS to reclaim resident pages from this model's file-backed
+    /// mappings.
+    ///
+    /// Linux uses `madvise(MADV_DONTNEED)` on exactly the mappings owned by
+    /// this native model. Memory is not unmapped, tensor pointers remain
+    /// valid, and later access refaults pages on demand. Other platforms
+    /// return an explicit error (`ENOTSUP` from the native layer). The model
+    /// must not be decoding while this is called; `Model`/`Context` are
+    /// `!Send + !Sync`, so synchronous callers satisfy this by construction.
+    pub fn release_mapping_pages(&mut self) -> Result<()> {
+        // SAFETY: raw is a live model; &mut self states exclusive use. The
+        // native side iterates only this model's mappings and never unmaps
+        // or frees them, so tensor pointers remain valid.
+        let rc = unsafe { forge_sys::llama_model_release_pages(self.inner.raw) };
+        if rc != 0 {
+            return Err(Error::model(format!(
+                "native page release failed with errno {rc}; ENOTSUP (95) indicates an unsupported platform"
+            )));
+        }
+        Ok(())
+    }
+
     /// Training context length the model was built with.
     pub fn n_ctx_train(&self) -> Result<u32> {
         // SAFETY: raw is a live model; pure getter.
