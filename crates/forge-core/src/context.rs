@@ -192,10 +192,15 @@ pub enum TraceCompletion {
 pub struct TraceEvent {
     pub execution_id: u64,
     pub sequence: u64,
+    /// Transient native tensor identity for this graph; not durable beyond the
+    /// trace.
+    pub node_id: u64,
     pub node_name: Option<String>,
     pub op_name: Option<String>,
     pub bytes: u64,
     pub dependencies: Vec<String>,
+    /// Transient native identities of source tensors.
+    pub dependency_ids: Vec<u64>,
     pub phase: TracePhase,
     pub completion: TraceCompletion,
 }
@@ -252,13 +257,19 @@ impl TraceState {
         let node_name = unsafe { name_of(forge_sys::ggml_get_name(tensor)) };
         let op_name = unsafe { name_of(forge_sys::llama_tensor_op_name(tensor)) };
         let bytes = unsafe { forge_sys::ggml_nbytes(tensor) as u64 };
+        let node_id = tensor as usize as u64;
         let mut dependencies = Vec::new();
+        let mut dependency_ids = Vec::new();
         // SAFETY: read-only node metadata during the scheduler callback.
         let source_count = unsafe { forge_sys::llama_tensor_src_count(tensor) };
         for index in 0..source_count {
             if let Some(name) = unsafe { name_of(forge_sys::llama_tensor_src_name(tensor, index)) }
             {
                 dependencies.push(name);
+            }
+            let id = unsafe { forge_sys::llama_tensor_src_id(tensor, index) };
+            if id != 0 {
+                dependency_ids.push(id);
             }
         }
         let mut buffer = self.buffer.borrow_mut();
@@ -272,10 +283,12 @@ impl TraceState {
         let event = TraceEvent {
             execution_id: buffer.execution_id,
             sequence: buffer.sequence,
+            node_id,
             node_name,
             op_name,
             bytes,
             dependencies,
+            dependency_ids,
             phase,
             completion: if ask {
                 TraceCompletion::NotCompleted

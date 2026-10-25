@@ -737,6 +737,7 @@ unsafe extern "C" {
     pub fn llama_tensor_op_name(tensor: *const ggml_tensor) -> *const c_char;
     pub fn llama_tensor_src_count(tensor: *const ggml_tensor) -> c_int;
     pub fn llama_tensor_src_name(tensor: *const ggml_tensor, index: i32) -> *const c_char;
+    pub fn llama_tensor_src_id(tensor: *const ggml_tensor, index: i32) -> u64;
     pub fn llama_model_n_params(model: *const llama_model) -> u64;
     // Device/offload capability facts (`llama.h`). All four take no
     // arguments and cannot fail: `max_devices` returns a constant
