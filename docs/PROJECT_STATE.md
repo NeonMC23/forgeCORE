@@ -259,11 +259,12 @@ read-only in the RAMforge run inventory.
 - forgeCORE has no per-layer weight eviction or streaming API at the pin.
   libllama maps the model and, in the default `Mmap` mode, prefaults the whole
   mapping with `MAP_POPULATE`. The opt-in `MmapNoPrefetch` mode skips that
-  prefault (documented native patch); pages then fault on demand and remain
-  file-backed and reclaimable. A bounded cgroup and `use_extra_bufts=false` can
-  make a large model fit under a hard cap (demonstrated downstream on
-  GPT-NeoX-20B at 8 GiB), but residency is still controlled by the OS, not by
-  forgeCORE per-layer scheduling.
+  prefault, and `Model::release_mapping_pages()` releases pages from the whole
+  model mapping on Linux (documented native patch). Neither operation is
+  per-layer. A bounded cgroup and `use_extra_bufts=false` can make a large
+  model fit under a hard cap (demonstrated downstream on GPT-NeoX-20B at
+  8 GiB), but residency is still controlled by the OS, not by forgeCORE
+  per-layer scheduling.
 - The live BPE fixture covers a small ASCII vocabulary with the `default`
   GPT-2 pre-tokenizer. Byte-level BPE edge cases and other pre-tokenizer
   variants (for example llama3) remain unverified.
