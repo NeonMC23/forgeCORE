@@ -178,15 +178,16 @@ on logits of magnitude ~1,579. The residual difference is consistent with
 ggml's f16 GELU lookup and reduction order. This is not bit-exact parity.
 
 ForgeCore itself does not enforce RAM budgets, and it exposes no per-layer
-weight streaming. At this pin libllama maps the model and prefaults the whole
-mapping with `MAP_POPULATE`; the pages are file-backed and reclaimable but not
-controlled by forgeCORE. RAMforge's separate `--enforce-ram` cgroup v2
-supervisor executed the 13,133,230,080 B GPT-NeoX-20B fixture under an 8 GiB
-hard cap: 7.65 GiB of the 12.23 GiB mapping resident, 54,721 limit events, no
-OOM kill, one greedy token ` Paris` in 16.94 s. That is OS demand paging under
-a kernel cap, not forgeCORE-managed out-of-core streaming. The model remains
-impractical as a throughput target; see the RAMforge README for the enforced
-matrix and caveats.
+weight streaming. At this pin the default `Mmap` mode maps the model and
+prefaults the whole mapping with `MAP_POPULATE`; the opt-in
+`ModelLoadMode::MmapNoPrefetch` skips that prefault. RAMforge's separate
+`--enforce-ram` cgroup v2 supervisor executed the 13,133,230,080 B
+GPT-NeoX-20B fixture under an 8 GiB hard cap with `--no-prefetch`: 7.64 GiB of
+the 12.23 GiB mapping resident, 7,979 limit events, no OOM kill, one greedy
+token ` Paris` in 7.72 s (16.94 s with prefetch). That is OS demand paging
+under a kernel cap, not forgeCORE-managed out-of-core streaming. The model
+remains impractical as a throughput target; see the RAMforge README for the
+enforced matrix and caveats.
 
 ## Downstream real-model smoke evidence (2026-10-25)
 
