@@ -67,6 +67,38 @@ fn large_tensor_release_releases_pages_and_keeps_inference() {
 }
 
 #[test]
+#[ignore = "requires a Q4_0 real model with FORGE_ANON_MODEL set"]
+fn repacked_tensors_are_reported_anonymous() {
+    let Some(path) = std::env::var_os("FORGE_ANON_MODEL").map(PathBuf::from) else {
+        eprintln!("SKIP: FORGE_ANON_MODEL not set");
+        return;
+    };
+    if !path.is_file() {
+        eprintln!("SKIP: FORGE_ANON_MODEL is not a file");
+        return;
+    }
+    let mut options = ModelOptions::default();
+    options.load_mode = ModelLoadMode::Mmap;
+    options.use_extra_bufts = Some(true);
+    let model = Model::load_with_options(&path, &options).expect("repacked model");
+    let mappings = model.tensor_mappings().expect("tensor mappings");
+    let file_backed = mappings
+        .iter()
+        .filter(|mapping| mapping.file_backed)
+        .count();
+    let anonymous = mappings
+        .iter()
+        .filter(|mapping| !mapping.file_backed)
+        .count();
+    eprintln!("file_backed={file_backed} anonymous={anonymous}");
+    assert!(file_backed > 0);
+    assert!(
+        anonymous > 0,
+        "repacked Q4_0 should expose anonymous tensors"
+    );
+}
+
+#[test]
 fn tensor_mapping_metadata_is_exact_and_release_preserves_inference() {
     let Some(path) = fixture() else {
         eprintln!("SKIP: FORGE_TEST_MODEL not set");

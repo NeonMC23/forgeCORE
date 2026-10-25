@@ -126,10 +126,10 @@ idempotently and verifies the upstream SHA first. The patch adds
 `MmapNoPrefetch` and `llama_model_release_pages`; `llama_model_params` layout
 and default `Auto`/`Mmap` behavior are unchanged.
 
-Current standard run: **376 passed, 0 failed, 2 ignored** (GPT-NeoX execution
-and the opt-in prefetch mapping test). With `FORGE_TEST_MODEL` pointing at the
-tiny fixture, `all_load_modes_load_cpu_fixture` covers `MmapNoPrefetch`, and
-`mapping_release` verifies two loaded models:
+Current standard run: **376 passed, 0 failed, 3 ignored** (GPT-NeoX execution
+and the opt-in prefetch/anonymous mapping tests). With `FORGE_TEST_MODEL`
+pointing at the tiny fixture, `all_load_modes_load_cpu_fixture` covers
+`MmapNoPrefetch`, and `mapping_release` verifies two loaded models:
 
 ```text
 A 8192->0, B 8192->8192
@@ -144,7 +144,9 @@ the largest file-backed tensor reported:
 released_bytes=27,365,376 skipped_shared_bytes=4,096 selected_tensors=1
 ```
 
-A decode after repeated tensor release succeeded. The opt-in disk-backed
+A decode after repeated tensor release succeeded. The opt-in Qwen2.5-1.5B
+Q4_0 repack check reported `file_backed=143 anonymous=196`, confirming that
+repacked tensors are not misclassified as file-backed. The opt-in disk-backed
 prefetch check:
 
 ```sh
