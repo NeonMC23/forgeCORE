@@ -279,6 +279,27 @@ pub struct llama_tensor_mapping {
     pub page_end: u64,
 }
 
+/// `struct llama_model_lifetime_state` (`llama.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct llama_model_lifetime_state {
+    pub instance_id: u64,
+    pub active_contexts: u64,
+    pub inflight_contexts: u64,
+    pub quiescent: u32,
+    pub reserved: u32,
+}
+
+/// `struct llama_context_lifetime_state` (`llama.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct llama_context_lifetime_state {
+    pub context_id: u64,
+    pub execution_generation: u64,
+    pub inflight: u32,
+    pub synchronized: u32,
+}
+
 /// `struct llama_model_page_release_result` (`llama.h`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -715,6 +736,12 @@ unsafe extern "C" {
         params: llama_model_params,
     ) -> *mut llama_model;
     pub fn llama_model_free(model: *mut llama_model);
+    pub fn llama_model_residency_contract_version() -> u32;
+    pub fn llama_model_instance_id(model: *const llama_model) -> u64;
+    pub fn llama_model_lifetime_state(
+        model: *const llama_model,
+        out: *mut llama_model_lifetime_state,
+    ) -> c_int;
     pub fn llama_model_release_pages(model: *mut llama_model) -> c_int;
     pub fn llama_model_tensor_mapping_count(model: *const llama_model) -> c_int;
     pub fn llama_model_tensor_mapping(
@@ -759,6 +786,10 @@ unsafe extern "C" {
         params: llama_context_params,
     ) -> *mut llama_context;
     pub fn llama_free(ctx: *mut llama_context);
+    pub fn llama_context_lifetime_state(
+        ctx: *const llama_context,
+        out: *mut llama_context_lifetime_state,
+    ) -> c_int;
     pub fn llama_decode(ctx: *mut llama_context, batch: llama_batch) -> c_int;
     pub fn llama_get_logits_ith(ctx: *mut llama_context, i: c_int) -> *mut f32;
     // Actual context sizing (`llama.h`): upstream resolves/pads the
@@ -990,6 +1021,23 @@ mod layout_tests {
         assert_eq!(offset_of!(llama_tensor_mapping, page_start), 48);
         assert_eq!(offset_of!(llama_tensor_mapping, page_end), 56);
         assert_eq!(size_of::<llama_model_page_release_result>(), 32);
+        assert_eq!(size_of::<llama_model_lifetime_state>(), 32);
+        assert_eq!(offset_of!(llama_model_lifetime_state, instance_id), 0);
+        assert_eq!(offset_of!(llama_model_lifetime_state, active_contexts), 8);
+        assert_eq!(
+            offset_of!(llama_model_lifetime_state, inflight_contexts),
+            16
+        );
+        assert_eq!(offset_of!(llama_model_lifetime_state, quiescent), 24);
+        assert_eq!(offset_of!(llama_model_lifetime_state, reserved), 28);
+        assert_eq!(size_of::<llama_context_lifetime_state>(), 24);
+        assert_eq!(offset_of!(llama_context_lifetime_state, context_id), 0);
+        assert_eq!(
+            offset_of!(llama_context_lifetime_state, execution_generation),
+            8
+        );
+        assert_eq!(offset_of!(llama_context_lifetime_state, inflight), 16);
+        assert_eq!(offset_of!(llama_context_lifetime_state, synchronized), 20);
     }
 
     #[test]

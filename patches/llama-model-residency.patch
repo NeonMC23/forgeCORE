@@ -1,5 +1,5 @@
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b..424abd5 100644
+index 31bbf8b..c295146 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -210,6 +210,7 @@ extern "C" {
@@ -10,16 +10,53 @@ index 31bbf8b..424abd5 100644
      };
  
      LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
-@@ -541,6 +542,63 @@ extern "C" {
+@@ -541,6 +542,103 @@ extern "C" {
  
      LLAMA_API void llama_model_free(struct llama_model * model);
  
 +    // Advise the OS to reclaim resident pages from the model's file-backed mappings.
 +    // Linux uses madvise(MADV_DONTNEED); other platforms return ENOTSUP.
 +    // Returns 0 on success, a positive errno on failure, or -1 for a NULL model.
-+    // Does not unmap memory or invalidate tensor pointers. The caller must not
-+    // call this while a decode is in progress.
++    // EBUSY means a context still has asynchronous compute in flight. The
++    // call does not block waiting for inference. Does not unmap memory or
++    // invalidate tensor pointers; logical model ownership continues until
++    // llama_model_free.
 +    LLAMA_API int32_t llama_model_release_pages(struct llama_model * model);
++
++    // Process-local model identity. Stable only for this loaded model
++    // instance; never a pointer and never reused after model destruction.
++    struct llama_model_lifetime_state {
++        uint64_t instance_id;
++        uint64_t active_contexts;
++        uint64_t inflight_contexts;
++        // Non-zero only if a non-blocking exclusive quiescence check
++        // succeeded at the instant of the call.
++        uint32_t quiescent;
++        uint32_t reserved;
++    };
++
++    // Version of the residency/ownership contract implemented by this native
++    // build. Increment only for incompatible semantic changes.
++    LLAMA_API uint32_t llama_model_residency_contract_version(void);
++    LLAMA_API uint64_t llama_model_instance_id(const struct llama_model * model);
++    LLAMA_API int32_t llama_model_lifetime_state(
++            const struct llama_model * model,
++            struct llama_model_lifetime_state * out);
++
++    // Per-context lifetime state. execution_generation increments when a
++    // graph is submitted; the context is synchronized only when no async
++    // graph work remains. These are diagnostic facts, not a promise that a
++    // model weight will never be used by a future token.
++    struct llama_context_lifetime_state {
++        uint64_t context_id;
++        uint64_t execution_generation;
++        uint32_t inflight;
++        uint32_t synchronized;
++    };
++
++    LLAMA_API int32_t llama_context_lifetime_state(
++            const struct llama_context * ctx,
++            struct llama_context_lifetime_state * out);
 +
 +    // Tensor-to-mapping metadata for one model. `name` is owned by the model
 +    // and remains valid until llama_model_free. `file_backed` means the tensor
@@ -51,8 +88,9 @@ index 31bbf8b..424abd5 100644
 +
 +    // Release pages for selected tensor indices. Pages shared with unselected
 +    // file-backed tensors are skipped conservatively. Returns 0, a positive
-+    // errno, or -1 for invalid input. On non-Linux platforms this returns
-+    // ENOTSUP. Do not call during decode.
++    // errno, or -1 for invalid input. EBUSY means asynchronous context work
++    // is still in flight; the call does not block. On non-Linux platforms this
++    // returns ENOTSUP. Does not unmap or invalidate tensor pointers.
 +    LLAMA_API int32_t llama_model_release_tensor_pages(
 +            struct llama_model * model, const int32_t * indices, size_t n_indices,
 +            struct llama_model_page_release_result * out);
@@ -60,6 +98,8 @@ index 31bbf8b..424abd5 100644
 +    // Best-effort Linux MADV_WILLNEED for selected tensor pages. Returns 0,
 +    // a positive errno, or -1 for invalid input. Other platforms return
 +    // ENOTSUP. This is a hint, not a synchronous read or residency guarantee.
++    // It may run concurrently with active inference because it never removes
++    // pages, but it serializes against a page-release gate.
 +    LLAMA_API int32_t llama_model_prefetch_tensor_pages(
 +            struct llama_model * model, const int32_t * indices, size_t n_indices,
 +            uint64_t * out_requested_bytes);
@@ -74,6 +114,141 @@ index 31bbf8b..424abd5 100644
      LLAMA_API struct llama_context * llama_init_from_model(
                       struct llama_model * model,
              struct llama_context_params   params);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index fcd4dfb..a9a20d4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -477,11 +477,17 @@ llama_context::llama_context(
+             sampling.token_ids_full_vocab[i] = i;
+         }
+     }
++
++    // Register only after construction succeeded, so a throwing constructor
++    // cannot leave an unmatched context count.
++    context_id = model.next_context_id();
++    model.context_opened();
+ }
+ 
+ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
++    model.context_closed();
+ 
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.hparams.no_alloc && !opt_ctx) {
+@@ -796,6 +802,13 @@ void llama_context::synchronize() {
+ 
+     n_queued_tokens = 0;
+     t_compute_start_us = 0;
++
++    // The scheduler is now quiescent. Keep this after backend synchronization:
++    // an exclusive page release must not observe the gate free earlier.
++    if (execution_lock.owns_lock()) {
++        model.execution_finished();
++        execution_lock.unlock();
++    }
+ }
+ 
+ const llama_model & llama_context::get_model() const {
+@@ -810,6 +823,18 @@ ggml_backend_sched_t llama_context::get_sched() const {
+     return sched.get();
+ }
+ 
++uint64_t llama_context::get_context_id() const {
++    return context_id;
++}
++
++uint64_t llama_context::get_execution_generation() const {
++    return execution_generation;
++}
++
++bool llama_context::has_inflight_execution() const {
++    return execution_lock.owns_lock();
++}
++
+ uint32_t llama_context::n_ctx() const {
+     return cparams.n_ctx;
+ }
+@@ -2585,9 +2610,22 @@ ggml_status llama_context::graph_compute(
+         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+     }
+ 
++    if (!execution_lock.owns_lock()) {
++        // Blocking here is intentional: a page release holds the exclusive
++        // side only for the duration of madvise, while inference keeps the
++        // shared side from submission until synchronize().
++        execution_lock = std::shared_lock<std::shared_mutex>(model.execution_gate());
++        ++execution_generation;
++        model.execution_started();
++    }
++
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
++        if (execution_lock.owns_lock()) {
++            model.execution_finished();
++            execution_lock.unlock();
++        }
+     }
+ 
+     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+@@ -4407,6 +4445,18 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+     return ctx->memory_breakdown();
+ }
+ 
++int32_t llama_context_lifetime_state(const llama_context * ctx, struct llama_context_lifetime_state * out) {
++    if (ctx == nullptr || out == nullptr) {
++        return -1;
++    }
++    *out = {};
++    out->context_id = ctx->get_context_id();
++    out->execution_generation = ctx->get_execution_generation();
++    out->inflight = ctx->has_inflight_execution() ? 1 : 0;
++    out->synchronized = out->inflight ? 0 : 1;
++    return 0;
++}
++
+ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
+     return ctx->get_cparams().ctx_other;
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 77ef92f..3339f31 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -13,6 +13,7 @@
+ 
+ #include <array>
+ #include <map>
++#include <shared_mutex>
+ #include <vector>
+ 
+ struct llama_model;
+@@ -69,6 +70,11 @@ struct llama_context {
+     uint32_t n_ubatch()  const;
+     uint32_t n_seq_max() const;
+ 
++    // Native lifetime facts. These do not imply future-reuse safety.
++    uint64_t get_context_id() const;
++    uint64_t get_execution_generation() const;
++    bool has_inflight_execution() const;
++
+     uint32_t n_threads()       const;
+     uint32_t n_threads_batch() const;
+ 
+@@ -385,6 +391,13 @@ private:
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+ 
++    // Model-scoped lifetime identity and execution gate. The shared lock is
++    // held from asynchronous graph submission until synchronize() observes
++    // completion; page release takes the exclusive side with try_to_lock.
++    uint64_t context_id = 0;
++    uint64_t execution_generation = 0;
++    std::shared_lock<std::shared_mutex> execution_lock;
++
+     // perf
+     mutable int64_t t_start_us  = 0;
+     mutable int64_t t_load_us   = 0;
 diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
 index 715a6e3..0844ad4 100644
 --- a/src/llama-mmap.cpp
@@ -274,18 +449,27 @@ index 43c396f..ddedb46 100644
  
      if (!fname.empty()) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index e195f50..d1c0bf9 100644
+index e195f50..4054786 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -27,6 +27,7 @@
+@@ -26,13 +26,16 @@
+ #include "ggml-cpp.h"
  
  #include <algorithm>
++#include <atomic>
  #include <cassert>
 +#include <cerrno>
  #include <cfloat>
  #include <cstdint>
  #include <cstring>
-@@ -40,6 +41,82 @@
+ #include <cmath>
+ #include <functional>
+ #include <map>
++#include <mutex>
+ #include <numeric>
+ #include <regex>
+ #include <sstream>
+@@ -40,6 +43,88 @@
  #include <string>
  #include <vector>
  
@@ -297,6 +481,12 @@ index e195f50..d1c0bf9 100644
 +    uint64_t first;
 +    uint64_t last;
 +};
++
++static std::atomic<uint64_t> llama_next_model_instance{1};
++
++static uint64_t llama_next_model_instance_id() {
++    return llama_next_model_instance.fetch_add(1, std::memory_order_relaxed);
++}
 +
 +static uint64_t llama_page_size_for_model() {
 +#ifndef _WIN32
@@ -368,11 +558,64 @@ index e195f50..d1c0bf9 100644
  static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
      switch (arch) {
          case LLM_ARCH_CLIP:
-@@ -1223,6 +1300,190 @@ llama_model::~llama_model() {
+@@ -1172,6 +1257,12 @@ struct llama_model::impl {
+     impl() = default;
+     ~impl() = default;
+ 
++    const uint64_t instance_id = llama_next_model_instance_id();
++    mutable std::atomic<uint64_t> next_context_id{1};
++    mutable std::atomic<uint64_t> active_contexts{0};
++    mutable std::atomic<uint64_t> inflight_contexts{0};
++    mutable std::shared_mutex execution_gate;
++
+     uint64_t n_elements = 0;
+ 
+     size_t n_bytes = 0;
+@@ -1223,6 +1314,237 @@ llama_model::~llama_model() {
      }
  }
  
++uint64_t llama_model::instance_id() const {
++    return pimpl->instance_id;
++}
++
++uint64_t llama_model::next_context_id() const {
++    return pimpl->next_context_id.fetch_add(1, std::memory_order_relaxed);
++}
++
++void llama_model::context_opened() const {
++    pimpl->active_contexts.fetch_add(1, std::memory_order_relaxed);
++}
++
++void llama_model::context_closed() const {
++    pimpl->active_contexts.fetch_sub(1, std::memory_order_relaxed);
++}
++
++void llama_model::execution_started() const {
++    pimpl->inflight_contexts.fetch_add(1, std::memory_order_relaxed);
++}
++
++void llama_model::execution_finished() const {
++    pimpl->inflight_contexts.fetch_sub(1, std::memory_order_relaxed);
++}
++
++uint64_t llama_model::active_contexts() const {
++    return pimpl->active_contexts.load(std::memory_order_relaxed);
++}
++
++uint64_t llama_model::inflight_contexts() const {
++    return pimpl->inflight_contexts.load(std::memory_order_relaxed);
++}
++
++std::shared_mutex & llama_model::execution_gate() const {
++    return pimpl->execution_gate;
++}
++
 +int32_t llama_model::release_pages() {
++    std::unique_lock<std::shared_mutex> lock(pimpl->execution_gate, std::try_to_lock);
++    if (!lock.owns_lock()) {
++        return EBUSY;
++    }
 +    for (auto & mapping : pimpl->mappings) {
 +        const int rc = mapping->advise_pages();
 +        if (rc != 0) {
@@ -387,6 +630,9 @@ index e195f50..d1c0bf9 100644
 +    if (indices == nullptr || n_indices == 0 || out_requested_bytes == nullptr) {
 +        return -1;
 +    }
++    // MADV_WILLNEED never removes pages, so it may share the gate with active
++    // inference. It still serializes against an exclusive release.
++    std::shared_lock<std::shared_mutex> lock(pimpl->execution_gate);
 +    *out_requested_bytes = 0;
 +    const int32_t count = tensor_mapping_count();
 +    if (count < 0) {
@@ -492,6 +738,10 @@ index e195f50..d1c0bf9 100644
 +    if (out == nullptr || indices == nullptr || n_indices == 0) {
 +        return -1;
 +    }
++    std::unique_lock<std::shared_mutex> lock(pimpl->execution_gate, std::try_to_lock);
++    if (!lock.owns_lock()) {
++        return EBUSY;
++    }
 +    *out = {};
 +    const int32_t count = tensor_mapping_count();
 +    if (count < 0) {
@@ -559,7 +809,7 @@ index e195f50..d1c0bf9 100644
  void llama_model_base::load_stats(llama_model_loader & ml) {
      pimpl->n_elements = ml.n_elements;
      pimpl->n_bytes = ml.n_bytes;
-@@ -1731,7 +1992,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1731,7 +2053,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -570,10 +820,31 @@ index e195f50..d1c0bf9 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
-@@ -2820,6 +3083,78 @@ void llama_model_free(llama_model * model) {
+@@ -2820,6 +3144,99 @@ void llama_model_free(llama_model * model) {
      delete model;
  }
  
++uint32_t llama_model_residency_contract_version(void) {
++    return 1;
++}
++
++uint64_t llama_model_instance_id(const llama_model * model) {
++    return model == nullptr ? 0 : model->instance_id();
++}
++
++int32_t llama_model_lifetime_state(const llama_model * model, struct llama_model_lifetime_state * out) {
++    if (model == nullptr || out == nullptr) {
++        return -1;
++    }
++    *out = {};
++    out->instance_id = model->instance_id();
++    out->active_contexts = model->active_contexts();
++    out->inflight_contexts = model->inflight_contexts();
++    std::unique_lock<std::shared_mutex> lock(model->execution_gate(), std::try_to_lock);
++    out->quiescent = lock.owns_lock() ? 1 : 0;
++    return 0;
++}
++
 +int32_t llama_model_release_pages(llama_model * model) {
 +    if (model == nullptr) {
 +        return -1;
@@ -650,15 +921,34 @@ index e195f50..d1c0bf9 100644
      return model->hparams.n_ctx_train;
  }
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 984b2cf..61718a7 100644
+index 984b2cf..2e1c6fc 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -738,6 +738,16 @@ struct llama_model {
+@@ -9,6 +9,7 @@
+ 
+ #include <map>
+ #include <memory>
++#include <shared_mutex>
+ #include <string>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -738,6 +739,27 @@ struct llama_model {
  
      std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
  
 +    // release resident pages from this model's file-backed mappings
 +    int32_t release_pages();
++
++    // process-local identity and execution-quiescence gate
++    uint64_t instance_id() const;
++    uint64_t next_context_id() const;
++    void context_opened() const;
++    void context_closed() const;
++    void execution_started() const;
++    void execution_finished() const;
++    uint64_t active_contexts() const;
++    uint64_t inflight_contexts() const;
++    std::shared_mutex & execution_gate() const;
 +
 +    int32_t tensor_mapping_count() const;
 +    int32_t tensor_mapping_info(int32_t index, llama_tensor_mapping * out) const;

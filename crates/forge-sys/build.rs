@@ -31,6 +31,9 @@ fn main() {
         let text = fs::read_to_string(&header)
             .unwrap_or_else(|error| panic!("forge-sys: cannot read {}: {error}", header.display()));
         if !text.contains("LLAMA_LOAD_MODE_MMAP_NO_PREFETCH")
+            || !text.contains("llama_model_residency_contract_version")
+            || !text.contains("llama_model_lifetime_state")
+            || !text.contains("llama_context_lifetime_state")
             || !text.contains("llama_model_release_pages")
             || !text.contains("llama_model_tensor_mapping_count")
             || !text.contains("llama_model_release_tensor_pages")

@@ -35,6 +35,7 @@ use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::memory::{Memory, SeqState, State};
 use crate::model::{Model, ModelInner};
+use crate::residency::ContextLifetimeState;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::CStr;
@@ -788,6 +789,29 @@ impl Context {
     pub fn synchronize(&mut self) {
         // SAFETY: raw is a live context; safe on an idle context.
         unsafe { forge_sys::llama_synchronize(self.raw) };
+    }
+
+    /// Native context identity and execution state.
+    ///
+    /// `synchronized` means no asynchronous graph work remains at this
+    /// instant. It does not mean a model weight will not be reused by a
+    /// later token or graph.
+    pub fn lifetime_state(&self) -> Result<ContextLifetimeState> {
+        let mut raw = forge_sys::llama_context_lifetime_state::default();
+        // SAFETY: raw is a live context; out points to writable storage.
+        let rc = unsafe { forge_sys::llama_context_lifetime_state(self.raw, &mut raw) };
+        if rc != 0 {
+            return Err(Error::context("native context lifetime query failed"));
+        }
+        if raw.context_id == 0 {
+            return Err(Error::context("native context returned a zero id"));
+        }
+        Ok(ContextLifetimeState {
+            context_id: raw.context_id,
+            execution_generation: raw.execution_generation,
+            inflight: raw.inflight != 0,
+            synchronized: raw.synchronized != 0,
+        })
     }
 
     /// Bounded graph trace summary, or `None` when tracing was not enabled.

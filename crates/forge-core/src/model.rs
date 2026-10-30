@@ -11,6 +11,7 @@
 
 use crate::device::{self, DeviceInfo};
 use crate::error::{Error, Result};
+use crate::residency::{ModelLifetimeState, ResidencyError, RESIDENCY_CONTRACT_VERSION};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::path::Path;
@@ -486,6 +487,40 @@ impl Model {
         unsafe { forge_sys::llama_model_size(self.inner.raw) }
     }
 
+    /// Native residency contract version. Must match the forge-sys build.
+    pub fn residency_contract_version() -> u32 {
+        // SAFETY: no arguments; pure ABI capability getter.
+        let version = unsafe { forge_sys::llama_model_residency_contract_version() };
+        debug_assert_eq!(version, RESIDENCY_CONTRACT_VERSION);
+        version
+    }
+
+    /// Process-local identity for this loaded model instance.
+    pub fn instance_id(&self) -> u64 {
+        // SAFETY: raw is a live model; pure getter.
+        unsafe { forge_sys::llama_model_instance_id(self.inner.raw) }
+    }
+
+    /// Native context/execution facts. `quiescent` is a point-in-time
+    /// non-blocking observation, not future-reuse proof.
+    pub fn lifetime_state(&self) -> Result<ModelLifetimeState> {
+        let mut raw = forge_sys::llama_model_lifetime_state::default();
+        // SAFETY: raw is a live model; out points to writable storage.
+        let rc = unsafe { forge_sys::llama_model_lifetime_state(self.inner.raw, &mut raw) };
+        if rc != 0 {
+            return Err(Error::model("native model lifetime query failed"));
+        }
+        if raw.instance_id == 0 {
+            return Err(Error::model("native model returned a zero instance id"));
+        }
+        Ok(ModelLifetimeState {
+            instance_id: raw.instance_id,
+            active_contexts: raw.active_contexts,
+            inflight_contexts: raw.inflight_contexts,
+            quiescent: raw.quiescent != 0,
+        })
+    }
+
     /// Advise the OS to reclaim resident pages from this model's file-backed
     /// mappings.
     ///
@@ -495,15 +530,15 @@ impl Model {
     /// return an explicit error (`ENOTSUP` from the native layer). The model
     /// must not be decoding while this is called; `Model`/`Context` are
     /// `!Send + !Sync`, so synchronous callers satisfy this by construction.
-    pub fn release_mapping_pages(&mut self) -> Result<()> {
+    pub fn release_mapping_pages(&mut self) -> std::result::Result<(), ResidencyError> {
         // SAFETY: raw is a live model; &mut self states exclusive use. The
-        // native side iterates only this model's mappings and never unmaps
-        // or frees them, so tensor pointers remain valid.
+        // native side takes its execution gate with try_to_lock and refuses
+        // with EBUSY if any context has asynchronous compute in flight. It
+        // iterates only this model's mappings and never unmaps or frees them,
+        // so tensor pointers remain valid and later access refaults pages.
         let rc = unsafe { forge_sys::llama_model_release_pages(self.inner.raw) };
         if rc != 0 {
-            return Err(Error::model(format!(
-                "native page release failed with errno {rc}; ENOTSUP (95) indicates an unsupported platform"
-            )));
+            return Err(ResidencyError::from_native_errno(rc));
         }
         Ok(())
     }
@@ -575,10 +610,13 @@ impl Model {
     /// file-backed tensors. It never unmaps or invalidates pointers. Callers
     /// must not call this during decode; `Model`/`Context` are
     /// `!Send + !Sync`, and this takes `&mut self`.
-    pub fn release_tensor_pages(&mut self, indices: &[i32]) -> Result<PageReleaseResult> {
+    pub fn release_tensor_pages(
+        &mut self,
+        indices: &[i32],
+    ) -> std::result::Result<PageReleaseResult, ResidencyError> {
         if indices.is_empty() {
-            return Err(Error::invalid(
-                "release_tensor_pages requires at least one tensor index",
+            return Err(ResidencyError::Invalid(
+                "release_tensor_pages requires at least one tensor index".to_string(),
             ));
         }
         let mut out = forge_sys::llama_model_page_release_result::default();
@@ -592,9 +630,7 @@ impl Model {
             )
         };
         if rc != 0 {
-            return Err(Error::model(format!(
-                "native tensor page release failed with errno {rc}; ENOTSUP (95) indicates an unsupported platform"
-            )));
+            return Err(ResidencyError::from_native_errno(rc));
         }
         Ok(PageReleaseResult {
             released_bytes: out.released_bytes,

@@ -1,6 +1,6 @@
 # forgeCORE project state
 
-**As of:** 2026-10-25<br>
+**As of:** 2026-10-30<br>
 **Repository:** `forgeCORE` (`NeonMC23/forgeCORE`)<br>
 **Role:** safe Rust abstraction and integration layer between RAMforge and the
 pinned llama.cpp/ggml native implementation.
@@ -19,6 +19,24 @@ model/context/batch/graph/backend/device/buffer primitives, and low-level
 inspection facts. It does **not** own RAMforge's memory budget, residency,
 eviction, cache, placement, scheduling, or prefetch policy. GGUF ownership is
 recorded in [`GGUF_OWNERSHIP.md`](GGUF_OWNERSHIP.md).
+
+## Native resource-lifetime contract (2026-10-30)
+
+The native pin is unchanged. The tracked residency patch now adds:
+
+- a model-scoped shared/exclusive execution gate: contexts hold a shared lease
+  from asynchronous graph submission through `llama_synchronize`/destruction;
+- non-blocking page release (`EBUSY` while any context is in flight);
+- model instance ids, active/in-flight context counts, point-in-time
+  quiescence, context ids, execution generations, and contract version 1.
+
+This establishes a safe **between-operation physical page reclamation**
+boundary. It does not prove that a model weight will not be reused by the next
+token/graph and therefore does not authorize intra-decode eviction. KV cache,
+graph scratch, backend buffers, and other context-owned allocations have no
+independent native page-release API. `ResidencyError::{Busy, Unsupported,
+Invalid, Native}` is exposed by forge-core. See `docs/NATIVE.md` and
+`README.md`.
 
 ## Crates
 

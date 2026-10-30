@@ -79,7 +79,21 @@ let token: TokenId = sampler.sample(logits)?;              // back into Batch/To
 `Model::release_mapping_pages(&mut self)` asks the OS to reclaim resident pages
 from exactly that model's file-backed mappings. On Linux it uses
 `madvise(MADV_DONTNEED)`; it never unmaps or invalidates tensor pointers. Other
-platforms return an explicit `ENOTSUP` error. Do not call it during a decode.
+platforms return `ResidencyError::Unsupported`.
+
+The native layer now has an execution gate. A context holds a shared lease from
+asynchronous graph submission until `Context::synchronize()` (or context drop)
+observes completion. Page release takes the exclusive side with a non-blocking
+attempt and returns `ResidencyError::Busy` while any context still has
+asynchronous work in flight. A synchronized context still logically owns model
+weights for future tokens, so this is a safe **between-operation physical page**
+boundary, not permission for intra-decode eviction.
+
+`Model::lifetime_state()` exposes a process-local instance id, active/in-flight
+context counts, and a point-in-time quiescence observation.
+`Context::lifetime_state()` exposes context id, execution generation, and
+synchronization state. `Model::residency_contract_version()` reports the native
+contract version (currently 1).
 
 `Model::tensor_mappings()` returns owned tensor metadata (name, file-backed
 flag, mapping index, offset, size, page bounds). `Model::release_tensor_pages()`

@@ -56,8 +56,17 @@ The patch adds two narrow capabilities:
 - `llama_model_release_pages()`, which walks only that model's own
   file-backed mappings and calls Linux `madvise(MADV_DONTNEED)` on their
   mapped fragments. It does not unmap memory or invalidate tensor pointers.
-  Other platforms return `ENOTSUP`; the caller must not release pages during a
-  decode.
+  Other platforms return `ENOTSUP`.
+- An execution-quiescence gate. A context acquires a shared lock before
+  asynchronous graph submission and releases it only after
+  `llama_synchronize` (or context destruction) observes completion. Page
+  release takes the exclusive side with `try_to_lock` and returns `EBUSY`
+  instead of blocking while any context has work in flight. This protects the
+  physical page-release boundary; it is not an intra-decode lifetime proof.
+- Model/context lifetime diagnostics: a process-local model instance id,
+  active/in-flight context counts, a point-in-time quiescent flag, per-context
+  id and execution generation, and residency contract version 1. No native
+  pointer is exposed.
 - Tensor-to-mapping metadata (`llama_model_tensor_mapping_count` /
   `llama_model_tensor_mapping`) and `llama_model_release_tensor_pages()`,
   which validates tensor indices against exact model-owned mapping fragments.
@@ -65,7 +74,8 @@ The patch adds two narrow capabilities:
   Names are borrowed from the model; forgeCORE copies them immediately.
 - `llama_model_prefetch_tensor_pages()` as a bounded Linux
   `MADV_WILLNEED` hint over validated tensor pages. It is not a synchronous
-  read or a residency guarantee.
+  read or a residency guarantee. It may share the execution gate because it
+  never removes pages, but it serializes against an exclusive release.
 - Read-only tensor graph helpers (`llama_tensor_op_name`,
   `llama_tensor_src_count`, `llama_tensor_src_name`) used by forgeCORE's
   bounded scheduler eval trace. The trace callback itself uses the pinned
