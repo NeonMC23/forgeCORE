@@ -147,7 +147,7 @@ idempotently and verifies the upstream SHA first. The patch adds
 `MmapNoPrefetch` and `llama_model_release_pages`; `llama_model_params` layout
 and default `Auto`/`Mmap` behavior are unchanged.
 
-Current standard run: **382 passed, 0 failed, 3 ignored** (GPT-NeoX execution
+Current standard run: **383 passed, 0 failed, 3 ignored** (GPT-NeoX execution
 and the opt-in prefetch/anonymous mapping tests). With `FORGE_TEST_MODEL`
 pointing at the tiny fixture, `all_load_modes_load_cpu_fixture` covers
 `MmapNoPrefetch`, and `mapping_release` verifies two loaded models:
