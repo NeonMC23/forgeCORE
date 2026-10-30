@@ -319,6 +319,18 @@ pub type ggml_log_callback =
 pub type ggml_sched_eval_callback =
     Option<unsafe extern "C" fn(t: *mut ggml_tensor, ask: bool, user_data: *mut c_void) -> bool>;
 
+/// CPU node-dispatch callback (`llama.h`). Called once per dispatched CPU
+/// graph node before workers enter the kernel.
+pub type llama_node_dispatch_callback = Option<
+    unsafe extern "C" fn(
+        node: *mut ggml_tensor,
+        node_index: c_int,
+        node_count: c_int,
+        n_threads: c_int,
+        user_data: *mut c_void,
+    ),
+>;
+
 /// `ggml_abort_callback` (`ggml.h`). Only carried inside
 /// [`llama_context_params`], never installed from Rust.
 pub type ggml_abort_callback = Option<unsafe extern "C" fn(data: *mut c_void) -> bool>;
@@ -789,6 +801,11 @@ unsafe extern "C" {
     pub fn llama_context_lifetime_state(
         ctx: *const llama_context,
         out: *mut llama_context_lifetime_state,
+    ) -> c_int;
+    pub fn llama_context_set_node_dispatch_observer(
+        ctx: *mut llama_context,
+        callback: llama_node_dispatch_callback,
+        user_data: *mut c_void,
     ) -> c_int;
     pub fn llama_decode(ctx: *mut llama_context, batch: llama_batch) -> c_int;
     pub fn llama_get_logits_ith(ctx: *mut llama_context, i: c_int) -> *mut f32;

@@ -110,6 +110,17 @@ and an explicit `BackendSynchronized` completion phase. It is diagnostic only:
 it does not prove that a weight is safe to release for the next graph. Tracing
 disabled preserves the original execution path.
 
+`Context::set_dispatch_observer(Some(NodeDispatchOptions { ... }))` installs an
+opt-in CPU-only node-dispatch observer in the patched ggml CPU execution loop.
+It emits exactly one `NodeDispatchStarted`-semantics event per non-empty,
+compute-enabled graph node, from worker 0 and before workers enter the node
+kernel. The event carries model/context IDs, execution and event sequences,
+node index/count, thread count, op name, node name, and declared source names.
+It is diagnostic only: it does not prove a source read, page fault, I/O,
+kernel completion, final use, or release safety. The observer is disabled by
+default; `set_dispatch_observer(None)` synchronizes before removal. Event storage
+is bounded, drops the oldest events, and reports `dropped_events`.
+
 ## Docs
 
 - `docs/PIVOT.md` — why the pivot, what was kept/removed, API and FFI

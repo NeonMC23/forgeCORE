@@ -80,8 +80,12 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
   return `ENOTSUP`. A bounded Linux `MADV_WILLNEED` prefetch hint and a
   scheduler eval trace (node name/op/dependencies, explicit synchronized
   completion) are exposed through the same patched native tree. The trace is
-  diagnostic and does not establish intra-decode eviction safety. GPU
-  execution is **not** validated on hardware in this environment.
+  diagnostic and does not establish intra-decode eviction safety. A separate
+  opt-in CPU node-dispatch observer (`Context::set_dispatch_observer`) emits
+  one event from worker 0 before each non-empty compute-enabled node; it is
+  dispatch-start evidence only, not a tensor read, page-fault, I/O, completion,
+  or release proof. GPU execution is **not** validated on hardware in this
+  environment.
 - `Model → Context → Batch → decode → Logits` CPU inference path, with
   real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and
   `gptneox` (Pythia-70M).

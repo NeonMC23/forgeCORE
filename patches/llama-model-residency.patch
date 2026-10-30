@@ -1,5 +1,140 @@
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index dc6453c..77c0069 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -7,6 +7,16 @@
+ extern "C" {
+ #endif
+ 
++    // CPU-only node-dispatch observer. Invoked once before the CPU workers
++    // begin a non-empty graph node. It is not a memory-access or residency
++    // callback.
++    typedef void (*ggml_backend_cpu_node_dispatch_callback)(
++            struct ggml_tensor * node,
++            int32_t node_index,
++            int32_t node_count,
++            int32_t n_threads,
++            void * user_data);
++
+     // the compute plan that needs to be prepared for ggml_graph_compute()
+     // since https://github.com/ggml-org/ggml/issues/287
+     struct ggml_cplan {
+@@ -22,6 +32,10 @@ extern "C" {
+ 
+         // use only reference implementations
+         bool use_ref;
++
++        // Optional CPU node-dispatch observer. Both are NULL/zero by default.
++        ggml_backend_cpu_node_dispatch_callback node_dispatch_callback;
++        void * node_dispatch_user_data;
+     };
+ 
+     // numa strategies
+@@ -134,6 +148,10 @@ extern "C" {
+     GGML_BACKEND_API bool ggml_backend_is_cpu                (ggml_backend_t backend);
+     GGML_BACKEND_API void ggml_backend_cpu_set_n_threads     (ggml_backend_t backend_cpu, int n_threads);
+     GGML_BACKEND_API void ggml_backend_cpu_set_threadpool    (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
++    GGML_BACKEND_API void ggml_backend_cpu_set_node_dispatch_observer(
++            ggml_backend_t backend_cpu,
++            ggml_backend_cpu_node_dispatch_callback callback,
++            void * user_data);
+     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
+ 
+     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 8bb0ff7..502eb7f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3146,6 +3146,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++        if (cplan->node_dispatch_callback) {
++            // Exactly one producer (worker 0) publishes the event. The
++            // barrier makes the publication visible before any worker enters
++            // the kernel. This path is only entered when the opt-in observer
++            // is installed; disabled execution has no extra barrier.
++            if (state->ith == 0) {
++                cplan->node_dispatch_callback(
++                    node, node_n, cgraph->n_nodes, params.nth,
++                    cplan->node_dispatch_user_data);
++            }
++            ggml_barrier(tp);
++        }
++
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 1df0f2b..0ed23e1 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -107,6 +107,9 @@ struct ggml_backend_cpu_context {
+     void *              abort_callback_data;
+ 
+     bool                use_ref;  // use reference implementation
++
++    ggml_backend_cpu_node_dispatch_callback node_dispatch_callback;
++    void *              node_dispatch_user_data;
+ };
+ 
+ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
+@@ -146,6 +149,8 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
+     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
+     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
+     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
++    cpu_plan->cplan.node_dispatch_callback = cpu_ctx->node_dispatch_callback;
++    cpu_plan->cplan.node_dispatch_user_data = cpu_ctx->node_dispatch_user_data;
+ 
+     return cpu_plan;
+ }
+@@ -186,6 +191,8 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
+     cplan.abort_callback      = cpu_ctx->abort_callback;
+     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
+     cplan.use_ref             = cpu_ctx->use_ref;
++    cplan.node_dispatch_callback = cpu_ctx->node_dispatch_callback;
++    cplan.node_dispatch_user_data = cpu_ctx->node_dispatch_user_data;
+ 
+     return ggml_graph_compute(cgraph, &cplan);
+ }
+@@ -230,6 +237,8 @@ ggml_backend_t ggml_backend_cpu_init(void) {
+     ctx->abort_callback      = NULL;
+     ctx->abort_callback_data = NULL;
+     ctx->use_ref             = false;
++    ctx->node_dispatch_callback = NULL;
++    ctx->node_dispatch_user_data = NULL;
+ 
+     ggml_backend_t cpu_backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_cpu_guid(),
+@@ -269,6 +278,16 @@ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool
+     ctx->threadpool = threadpool;
+ }
+ 
++void ggml_backend_cpu_set_node_dispatch_observer(
++        ggml_backend_t backend_cpu,
++        ggml_backend_cpu_node_dispatch_callback callback,
++        void * user_data) {
++    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
++    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
++    ctx->node_dispatch_callback = callback;
++    ctx->node_dispatch_user_data = user_data;
++}
++
+ void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
+     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+ 
+@@ -667,6 +686,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
+         return (void *)ggml_backend_cpu_set_abort_callback;
+     }
++    if (strcmp(name, "ggml_backend_cpu_set_node_dispatch_observer") == 0) {
++        return (void *)ggml_backend_cpu_set_node_dispatch_observer;
++    }
+     if (strcmp(name, "ggml_backend_cpu_numa_init") == 0) {
+         return (void *)ggml_numa_init;
+     }
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b..c295146 100644
+index 31bbf8b..3a3ad42 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -210,6 +210,7 @@ extern "C" {
@@ -10,7 +145,7 @@ index 31bbf8b..c295146 100644
      };
  
      LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
-@@ -541,6 +542,103 @@ extern "C" {
+@@ -541,6 +542,119 @@ extern "C" {
  
      LLAMA_API void llama_model_free(struct llama_model * model);
  
@@ -57,6 +192,22 @@ index 31bbf8b..c295146 100644
 +    LLAMA_API int32_t llama_context_lifetime_state(
 +            const struct llama_context * ctx,
 +            struct llama_context_lifetime_state * out);
++
++    // Optional CPU-only node-dispatch observation. The callback is invoked
++    // once per dispatched CPU graph node, before workers enter the kernel.
++    // It is diagnostic: it is not proof of a tensor read, page fault, I/O,
++    // completion, or release safety. Passing a NULL callback removes it.
++    typedef void (*llama_node_dispatch_callback)(
++            struct ggml_tensor * node,
++            int32_t node_index,
++            int32_t node_count,
++            int32_t n_threads,
++            void * user_data);
++
++    LLAMA_API int32_t llama_context_set_node_dispatch_observer(
++            struct llama_context * ctx,
++            llama_node_dispatch_callback callback,
++            void * user_data);
 +
 +    // Tensor-to-mapping metadata for one model. `name` is owned by the model
 +    // and remains valid until llama_model_free. `file_backed` means the tensor
@@ -115,10 +266,26 @@ index 31bbf8b..c295146 100644
                       struct llama_model * model,
              struct llama_context_params   params);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fcd4dfb..a9a20d4 100644
+index fcd4dfb..78a1d76 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -477,11 +477,17 @@ llama_context::llama_context(
+@@ -1,6 +1,7 @@
+ #include "llama-context.h"
+ 
+ #include "ggml.h"
++#include "ggml-cpu.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+ #include "llama-impl.h"
+@@ -14,6 +15,7 @@
+ #include "llama.h"
+ 
+ #include <cinttypes>
++#include <cerrno>
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
+@@ -477,11 +479,17 @@ llama_context::llama_context(
              sampling.token_ids_full_vocab[i] = i;
          }
      }
@@ -136,7 +303,7 @@ index fcd4dfb..a9a20d4 100644
  
      // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
      if (!model.hparams.no_alloc && !opt_ctx) {
-@@ -796,6 +802,13 @@ void llama_context::synchronize() {
+@@ -796,6 +804,13 @@ void llama_context::synchronize() {
  
      n_queued_tokens = 0;
      t_compute_start_us = 0;
@@ -150,10 +317,26 @@ index fcd4dfb..a9a20d4 100644
  }
  
  const llama_model & llama_context::get_model() const {
-@@ -810,6 +823,18 @@ ggml_backend_sched_t llama_context::get_sched() const {
+@@ -810,6 +825,34 @@ ggml_backend_sched_t llama_context::get_sched() const {
      return sched.get();
  }
  
++int32_t llama_context::set_node_dispatch_observer(
++        llama_node_dispatch_callback callback,
++        void * user_data) {
++    if (backend_cpu == nullptr) {
++        return ENOTSUP;
++    }
++    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
++    auto * set_observer_fn = (decltype(ggml_backend_cpu_set_node_dispatch_observer) *)
++        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_node_dispatch_observer");
++    if (set_observer_fn == nullptr) {
++        return ENOTSUP;
++    }
++    set_observer_fn(backend_cpu, callback, user_data);
++    return 0;
++}
++
 +uint64_t llama_context::get_context_id() const {
 +    return context_id;
 +}
@@ -169,7 +352,7 @@ index fcd4dfb..a9a20d4 100644
  uint32_t llama_context::n_ctx() const {
      return cparams.n_ctx;
  }
-@@ -2585,9 +2610,22 @@ ggml_status llama_context::graph_compute(
+@@ -2585,9 +2628,22 @@ ggml_status llama_context::graph_compute(
          set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
      }
  
@@ -192,10 +375,20 @@ index fcd4dfb..a9a20d4 100644
      }
  
      // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
-@@ -4407,6 +4445,18 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -4407,6 +4463,28 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
  
++int32_t llama_context_set_node_dispatch_observer(
++        llama_context * ctx,
++        llama_node_dispatch_callback callback,
++        void * user_data) {
++    if (ctx == nullptr) {
++        return -1;
++    }
++    return ctx->set_node_dispatch_observer(callback, user_data);
++}
++
 +int32_t llama_context_lifetime_state(const llama_context * ctx, struct llama_context_lifetime_state * out) {
 +    if (ctx == nullptr || out == nullptr) {
 +        return -1;
@@ -212,7 +405,7 @@ index fcd4dfb..a9a20d4 100644
      return ctx->get_cparams().ctx_other;
  }
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 77ef92f..3339f31 100644
+index 77ef92f..822a4ad 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -13,6 +13,7 @@
@@ -223,11 +416,12 @@ index 77ef92f..3339f31 100644
  #include <vector>
  
  struct llama_model;
-@@ -69,6 +70,11 @@ struct llama_context {
+@@ -69,6 +70,12 @@ struct llama_context {
      uint32_t n_ubatch()  const;
      uint32_t n_seq_max() const;
  
 +    // Native lifetime facts. These do not imply future-reuse safety.
++    int32_t set_node_dispatch_observer(llama_node_dispatch_callback callback, void * user_data);
 +    uint64_t get_context_id() const;
 +    uint64_t get_execution_generation() const;
 +    bool has_inflight_execution() const;
@@ -235,7 +429,7 @@ index 77ef92f..3339f31 100644
      uint32_t n_threads()       const;
      uint32_t n_threads_batch() const;
  
-@@ -385,6 +391,13 @@ private:
+@@ -385,6 +392,13 @@ private:
      // env: LLAMA_GRAPH_REUSE_DISABLE
      bool graph_reuse_disable = false;
  

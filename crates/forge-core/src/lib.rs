@@ -39,7 +39,8 @@ pub use batch::{Batch, BatchBuilder, SeqId, TokenId};
 pub use buffer::{Buffer, BufferType};
 pub use context::{
     AttentionType, Context, ContextOptions, ContextTraceOptions, Embeddings, FlashAttnType, Logits,
-    PoolingType, TraceCompletion, TraceEvent, TracePhase, TraceSummary,
+    NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSummary, PoolingType,
+    TraceCompletion, TraceEvent, TracePhase, TraceSummary, MAX_NODE_DISPATCH_EVENTS,
 };
 pub use device::{
     enumerate_devices, max_devices, supports_gpu_offload, supports_mlock, supports_mmap,

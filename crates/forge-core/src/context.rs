@@ -216,6 +216,309 @@ pub struct TraceSummary {
     pub retained_events: usize,
 }
 
+/// Maximum number of CPU node-dispatch events retained in one context.
+pub const MAX_NODE_DISPATCH_EVENTS: usize = 65_536;
+const NODE_NAME_CAPACITY: usize = 128;
+const OP_NAME_CAPACITY: usize = 64;
+const SOURCE_NAME_CAPACITY: usize = 128;
+const MAX_DISPATCH_SOURCES: usize = 8;
+
+/// Opt-in CPU node-dispatch observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeDispatchOptions {
+    /// Maximum retained events. Must be in `1..=MAX_NODE_DISPATCH_EVENTS`.
+    pub max_events: usize,
+}
+
+impl Default for NodeDispatchOptions {
+    fn default() -> Self {
+        Self { max_events: 4096 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeDispatchBackend {
+    Cpu,
+}
+
+/// One CPU graph-node dispatch-start observation.
+///
+/// This is emitted before workers enter the node kernel. It does not prove
+/// that every declared source was read, that a page fault occurred, that I/O
+/// happened, or that the node completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeDispatchEvent {
+    pub model_instance_id: u64,
+    pub context_id: u64,
+    pub execution_sequence: u64,
+    pub event_sequence: u64,
+    pub node_index: u32,
+    pub node_count: u32,
+    pub n_threads: u32,
+    pub backend: NodeDispatchBackend,
+    pub node_name: Option<String>,
+    pub node_name_truncated: bool,
+    pub op_name: Option<String>,
+    pub op_name_truncated: bool,
+    /// Declared source tensor names, in native source order, truncated to
+    /// [`MAX_DISPATCH_SOURCES`] entries.
+    pub source_names: Vec<String>,
+    pub sources_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeDispatchSummary {
+    pub executions: u64,
+    pub events: u64,
+    pub dropped_events: u64,
+    pub retained_events: usize,
+    pub max_events: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RawDispatchSource {
+    name: [u8; SOURCE_NAME_CAPACITY],
+    len: u16,
+    truncated: bool,
+}
+
+impl Default for RawDispatchSource {
+    fn default() -> Self {
+        Self {
+            name: [0; SOURCE_NAME_CAPACITY],
+            len: 0,
+            truncated: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawDispatchEvent {
+    model_instance_id: u64,
+    context_id: u64,
+    execution_sequence: u64,
+    event_sequence: u64,
+    node_index: u32,
+    node_count: u32,
+    n_threads: u32,
+    node_name: [u8; NODE_NAME_CAPACITY],
+    node_name_len: u16,
+    node_name_truncated: bool,
+    op_name: [u8; OP_NAME_CAPACITY],
+    op_name_len: u16,
+    op_name_truncated: bool,
+    sources: [RawDispatchSource; MAX_DISPATCH_SOURCES],
+    source_count: u8,
+    sources_truncated: bool,
+}
+
+impl Default for RawDispatchEvent {
+    fn default() -> Self {
+        Self {
+            model_instance_id: 0,
+            context_id: 0,
+            execution_sequence: 0,
+            event_sequence: 0,
+            node_index: 0,
+            node_count: 0,
+            n_threads: 0,
+            node_name: [0; NODE_NAME_CAPACITY],
+            node_name_len: 0,
+            node_name_truncated: false,
+            op_name: [0; OP_NAME_CAPACITY],
+            op_name_len: 0,
+            op_name_truncated: false,
+            sources: [RawDispatchSource::default(); MAX_DISPATCH_SOURCES],
+            source_count: 0,
+            sources_truncated: false,
+        }
+    }
+}
+
+struct DispatchBuffer {
+    max_events: usize,
+    next_event_sequence: u64,
+    execution_sequence: u64,
+    total_events: u64,
+    dropped_events: u64,
+    events: VecDeque<RawDispatchEvent>,
+}
+
+struct DispatchState {
+    buffer: RefCell<DispatchBuffer>,
+    model_instance_id: u64,
+    context_id: u64,
+}
+
+impl DispatchState {
+    fn new(model_instance_id: u64, context_id: u64, max_events: usize) -> Self {
+        Self {
+            buffer: RefCell::new(DispatchBuffer {
+                max_events,
+                next_event_sequence: 0,
+                execution_sequence: 0,
+                total_events: 0,
+                dropped_events: 0,
+                events: VecDeque::with_capacity(max_events),
+            }),
+            model_instance_id,
+            context_id,
+        }
+    }
+
+    fn begin_execution(&self) {
+        if let Ok(mut buffer) = self.buffer.try_borrow_mut() {
+            buffer.execution_sequence = buffer.execution_sequence.saturating_add(1);
+        }
+    }
+
+    fn record(&self, node: *mut forge_sys::ggml_tensor, index: i32, count: i32, threads: i32) {
+        let Ok(mut buffer) = self.buffer.try_borrow_mut() else {
+            return;
+        };
+        let mut event = RawDispatchEvent {
+            model_instance_id: self.model_instance_id,
+            context_id: self.context_id,
+            execution_sequence: buffer.execution_sequence,
+            event_sequence: buffer.next_event_sequence,
+            node_index: u32::try_from(index).unwrap_or(0),
+            node_count: u32::try_from(count).unwrap_or(0),
+            n_threads: u32::try_from(threads).unwrap_or(0),
+            ..RawDispatchEvent::default()
+        };
+        if !node.is_null() {
+            // SAFETY: the scheduler owns the node for this callback. All
+            // pointers are copied immediately; no native pointer is retained.
+            let (len, truncated) =
+                unsafe { copy_c_name(forge_sys::ggml_get_name(node), &mut event.node_name) };
+            event.node_name_len = len;
+            event.node_name_truncated = truncated;
+            let (len, truncated) =
+                unsafe { copy_c_name(forge_sys::llama_tensor_op_name(node), &mut event.op_name) };
+            event.op_name_len = len;
+            event.op_name_truncated = truncated;
+            let source_count = unsafe { forge_sys::llama_tensor_src_count(node) };
+            let source_total = usize::try_from(source_count).unwrap_or(0);
+            let stored = source_total.min(MAX_DISPATCH_SOURCES);
+            event.source_count = stored as u8;
+            event.sources_truncated = source_total > stored;
+            for source_index in 0..stored {
+                let index = i32::try_from(source_index).unwrap_or(0);
+                let (len, truncated) = unsafe {
+                    copy_c_name(
+                        forge_sys::llama_tensor_src_name(node, index),
+                        &mut event.sources[source_index].name,
+                    )
+                };
+                event.sources[source_index].len = len;
+                event.sources[source_index].truncated = truncated;
+            }
+        }
+        buffer.next_event_sequence = buffer.next_event_sequence.saturating_add(1);
+        buffer.total_events = buffer.total_events.saturating_add(1);
+        if buffer.events.len() >= buffer.max_events {
+            buffer.events.pop_front();
+            buffer.dropped_events = buffer.dropped_events.saturating_add(1);
+        }
+        buffer.events.push_back(event);
+    }
+
+    fn events(&self) -> Vec<NodeDispatchEvent> {
+        let Ok(buffer) = self.buffer.try_borrow() else {
+            return Vec::new();
+        };
+        buffer.events.iter().map(raw_to_event).collect()
+    }
+
+    fn take_events(&self) -> Vec<NodeDispatchEvent> {
+        let Ok(mut buffer) = self.buffer.try_borrow_mut() else {
+            return Vec::new();
+        };
+        buffer
+            .events
+            .drain(..)
+            .map(|raw| raw_to_event(&raw))
+            .collect()
+    }
+
+    fn clear(&self) {
+        if let Ok(mut buffer) = self.buffer.try_borrow_mut() {
+            buffer.events.clear();
+            buffer.dropped_events = 0;
+        }
+    }
+
+    fn summary(&self) -> NodeDispatchSummary {
+        let Ok(buffer) = self.buffer.try_borrow() else {
+            return NodeDispatchSummary::default();
+        };
+        NodeDispatchSummary {
+            executions: buffer.execution_sequence,
+            events: buffer.total_events,
+            dropped_events: buffer.dropped_events,
+            retained_events: buffer.events.len(),
+            max_events: buffer.max_events,
+        }
+    }
+}
+
+unsafe fn copy_c_name(pointer: *const c_char, destination: &mut [u8]) -> (u16, bool) {
+    if pointer.is_null() {
+        return (0, false);
+    }
+    // SAFETY: native names are NUL-terminated for the callback duration.
+    let bytes = unsafe { CStr::from_ptr(pointer) }.to_bytes();
+    let copied = bytes.len().min(destination.len());
+    destination[..copied].copy_from_slice(&bytes[..copied]);
+    (copied as u16, bytes.len() > copied)
+}
+
+fn text_from_raw(bytes: &[u8], len: u16) -> Option<String> {
+    let len = (len as usize).min(bytes.len());
+    (len > 0).then(|| String::from_utf8_lossy(&bytes[..len]).into_owned())
+}
+
+fn raw_to_event(raw: &RawDispatchEvent) -> NodeDispatchEvent {
+    let mut source_names = Vec::with_capacity(raw.source_count as usize);
+    for source in raw.sources.iter().take(raw.source_count as usize) {
+        if let Some(name) = text_from_raw(&source.name, source.len) {
+            source_names.push(name);
+        }
+    }
+    NodeDispatchEvent {
+        model_instance_id: raw.model_instance_id,
+        context_id: raw.context_id,
+        execution_sequence: raw.execution_sequence,
+        event_sequence: raw.event_sequence,
+        node_index: raw.node_index,
+        node_count: raw.node_count,
+        n_threads: raw.n_threads,
+        backend: NodeDispatchBackend::Cpu,
+        node_name: text_from_raw(&raw.node_name, raw.node_name_len),
+        node_name_truncated: raw.node_name_truncated,
+        op_name: text_from_raw(&raw.op_name, raw.op_name_len),
+        op_name_truncated: raw.op_name_truncated,
+        source_names,
+        sources_truncated: raw.sources_truncated,
+    }
+}
+
+unsafe extern "C" fn dispatch_callback(
+    node: *mut forge_sys::ggml_tensor,
+    node_index: c_int,
+    node_count: c_int,
+    n_threads: c_int,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: user_data is the Box<DispatchState> owned by the live Context.
+    // The callback performs only bounded copies and a bounded push.
+    let state = unsafe { &*(user_data as *const DispatchState) };
+    state.record(node, node_index, node_count, n_threads);
+}
+
 struct TraceBuffer {
     max_events: usize,
     execution_id: u64,
@@ -545,10 +848,23 @@ pub struct Context {
     max_parallel_seqs: u32,
     shift_allowed: bool,
     trace: Option<Box<TraceState>>,
+    model_instance_id: u64,
+    dispatch: Option<Box<DispatchState>>,
 }
 
 impl Drop for Context {
     fn drop(&mut self) {
+        if self.dispatch.is_some() {
+            // The context is exclusively borrowed and no decode is running.
+            // Disable the native pointer before freeing the native context.
+            unsafe {
+                let _ = forge_sys::llama_context_set_node_dispatch_observer(
+                    self.raw,
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
         // SAFETY: raw came from a successful init, is freed exactly once;
         // the shared model outlives us via the Rc below (Drop runs before
         // fields are released).
@@ -573,6 +889,7 @@ impl Context {
             // never reach the native call.
             return Err(Error::invalid("context n_batch must be at least 1"));
         }
+        let model_instance_id = model.lifetime_state()?.instance_id;
         let n_threads = c_int::try_from(options.n_threads)
             .map_err(|_| Error::invalid("context n_threads too large"))?;
         let threads_batch = if options.n_threads_batch == 0 {
@@ -695,6 +1012,8 @@ impl Context {
                 max_parallel_seqs,
                 shift_allowed,
                 trace: trace_state,
+                model_instance_id,
+                dispatch: None,
             })
         }
     }
@@ -814,6 +1133,91 @@ impl Context {
         })
     }
 
+    /// Install or remove the opt-in CPU node-dispatch observer.
+    ///
+    /// Removal first synchronizes the context, so no callback can be in
+    /// flight when the observation buffer is dropped. Returns an error when
+    /// the backend does not expose the CPU observer.
+    pub fn set_dispatch_observer(&mut self, options: Option<NodeDispatchOptions>) -> Result<()> {
+        self.synchronize();
+        // SAFETY: raw is live; the setter only changes the CPU backend field.
+        unsafe {
+            let _ = forge_sys::llama_context_set_node_dispatch_observer(
+                self.raw,
+                None,
+                std::ptr::null_mut(),
+            );
+        }
+        self.dispatch = None;
+        let Some(options) = options else {
+            return Ok(());
+        };
+        if options.max_events == 0 || options.max_events > MAX_NODE_DISPATCH_EVENTS {
+            return Err(Error::invalid(format!(
+                "node dispatch max_events must be in 1..={MAX_NODE_DISPATCH_EVENTS}"
+            )));
+        }
+        let context_id = self.lifetime_state()?.context_id;
+        let state = Box::new(DispatchState::new(
+            self.model_instance_id,
+            context_id,
+            options.max_events,
+        ));
+        let pointer = (&*state as *const DispatchState)
+            .cast_mut()
+            .cast::<c_void>();
+        // SAFETY: raw is live; state is boxed and retained in self.dispatch.
+        let rc = unsafe {
+            forge_sys::llama_context_set_node_dispatch_observer(
+                self.raw,
+                Some(dispatch_callback),
+                pointer,
+            )
+        };
+        if rc != 0 {
+            // The observer was not installed; drop the state while no native
+            // callback can reference it.
+            return Err(Error::context(format!(
+                "CPU node-dispatch observer unavailable (code {rc})"
+            )));
+        }
+        self.dispatch = Some(state);
+        Ok(())
+    }
+
+    /// Whether the CPU node-dispatch observer is currently installed.
+    pub fn dispatch_observer_active(&self) -> bool {
+        self.dispatch.is_some()
+    }
+
+    /// Bounded CPU node-dispatch event summary.
+    pub fn dispatch_summary(&self) -> Option<NodeDispatchSummary> {
+        self.dispatch.as_ref().map(|state| state.summary())
+    }
+
+    /// Copy retained CPU node-dispatch events.
+    pub fn dispatch_events(&self) -> Vec<NodeDispatchEvent> {
+        self.dispatch
+            .as_ref()
+            .map(|state| state.events())
+            .unwrap_or_default()
+    }
+
+    /// Drain retained CPU node-dispatch events.
+    pub fn take_dispatch_events(&self) -> Vec<NodeDispatchEvent> {
+        self.dispatch
+            .as_ref()
+            .map(|state| state.take_events())
+            .unwrap_or_default()
+    }
+
+    /// Clear retained CPU node-dispatch events.
+    pub fn clear_dispatch_events(&self) {
+        if let Some(state) = &self.dispatch {
+            state.clear();
+        }
+    }
+
     /// Bounded graph trace summary, or `None` when tracing was not enabled.
     pub fn trace_summary(&self) -> Option<TraceSummary> {
         self.trace.as_ref().map(|trace| trace.summary())
@@ -892,6 +1296,9 @@ impl Context {
         }
         if let Some(trace) = &self.trace {
             trace.begin_execution();
+        }
+        if let Some(dispatch) = &self.dispatch {
+            dispatch.begin_execution();
         }
         // SAFETY: raw is a live context; the batch view borrows only
         // arrays the `&Batch` owns, which outlive this call; the model

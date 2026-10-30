@@ -81,6 +81,11 @@ The patch adds two narrow capabilities:
   bounded scheduler eval trace. The trace callback itself uses the pinned
   public `llama_context_params.cb_eval`; no native execution behavior changes
   when tracing is disabled.
+- CPU node-dispatch observer support in `ggml/src/ggml-cpu` and
+  `llama_context_set_node_dispatch_observer()`. It is opt-in, emits once per
+  non-empty compute-enabled node from worker 0, and adds a barrier after event
+  publication only while installed. It is a dispatch-start observation, not a
+  tensor read or residency proof.
 
 It does not change `llama_model_params` layout or the default `AUTO`/`MMAP`
 behavior. The upstream checkout HEAD remains the pinned SHA; the patch is
