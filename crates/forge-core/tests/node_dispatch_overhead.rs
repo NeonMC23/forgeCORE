@@ -37,14 +37,16 @@ fn node_dispatch_observer_overhead_smoke() {
     };
     let model = Model::load(&path).expect("model");
     for threads in [1usize, 4] {
-        for enabled in [false, true] {
+        for (enabled, drain) in [(false, false), (true, true), (true, false)] {
             let mut options = ContextOptions::default();
             options.n_threads = threads as u32;
             options.n_threads_batch = threads as u32;
             let mut context = Context::open(&model, &options).expect("context");
             if enabled {
                 context
-                    .set_dispatch_observer(Some(NodeDispatchOptions { max_events: 4096 }))
+                    .set_dispatch_observer(Some(NodeDispatchOptions {
+                        max_events: if drain { 4096 } else { 65_536 },
+                    }))
                     .expect("observer");
             }
             context.decode(&batch_at(0)).expect("warmup");
@@ -61,16 +63,20 @@ fn node_dispatch_observer_overhead_smoke() {
                     .decode(&batch_at(position))
                     .expect("measured decode");
                 samples.push(started.elapsed().as_nanos());
-                if enabled {
+                if enabled && drain {
                     let summary = context.dispatch_summary().expect("summary");
-                    events += summary.events as usize;
-                    dropped += summary.dropped_events;
-                    let _ = context.take_dispatch_events();
+                    dropped = summary.dropped_events;
+                    events += context.take_dispatch_events().len();
                 }
+            }
+            if enabled && !drain {
+                let summary = context.dispatch_summary().expect("summary");
+                events = summary.events as usize;
+                dropped = summary.dropped_events;
             }
             let median = median(&mut samples);
             eprintln!(
-                "threads={threads} observer={} median_ns={median} events={events} dropped={dropped}",
+                "threads={threads} observer={} drain={drain} median_ns={median} events={events} dropped={dropped}",
                 if enabled { "on" } else { "off" }
             );
             if enabled {
