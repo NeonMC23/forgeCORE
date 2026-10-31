@@ -296,6 +296,11 @@ pub struct llama_page_sample_result {
     pub max_pages: u64,
     pub mapping_id: u64,
     pub mapping_generation: u64,
+    pub mapping_size: u64,
+    pub tensor_offset: u64,
+    pub tensor_size: u64,
+    pub page_start: u64,
+    pub page_end: u64,
     pub truncated: u32,
     pub error: u32,
 }
@@ -1069,7 +1074,7 @@ mod layout_tests {
         assert_eq!(offset_of!(llama_tensor_mapping, mapping_generation), 72);
         assert_eq!(offset_of!(llama_tensor_mapping, file_path), 80);
         assert_eq!(offset_of!(llama_tensor_mapping, file_size), 88);
-        assert_eq!(size_of::<llama_page_sample_result>(), 80);
+        assert_eq!(size_of::<llama_page_sample_result>(), 120);
         assert_eq!(size_of::<llama_model_page_release_result>(), 32);
         assert_eq!(size_of::<llama_model_lifetime_state>(), 32);
         assert_eq!(offset_of!(llama_model_lifetime_state, instance_id), 0);

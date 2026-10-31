@@ -134,7 +134,7 @@ index 1df0f2b..0ed23e1 100644
          return (void *)ggml_numa_init;
      }
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b..616bf5b 100644
+index 31bbf8b..c29e417 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -210,6 +210,7 @@ extern "C" {
@@ -145,7 +145,7 @@ index 31bbf8b..616bf5b 100644
      };
  
      LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
-@@ -541,6 +542,150 @@ extern "C" {
+@@ -541,6 +542,155 @@ extern "C" {
  
      LLAMA_API void llama_model_free(struct llama_model * model);
  
@@ -242,6 +242,11 @@ index 31bbf8b..616bf5b 100644
 +        uint64_t max_pages;
 +        uint64_t mapping_id;
 +        uint64_t mapping_generation;
++        uint64_t mapping_size;
++        uint64_t tensor_offset;
++        uint64_t tensor_size;
++        uint64_t page_start;
++        uint64_t page_end;
 +        uint32_t truncated;
 +        uint32_t error;
 +    };
@@ -820,7 +825,7 @@ index 43c396f..ddedb46 100644
  
      if (!fname.empty()) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index e195f50..20d5f87 100644
+index e195f50..777b9af 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -26,13 +26,16 @@
@@ -942,7 +947,7 @@ index e195f50..20d5f87 100644
      uint64_t n_elements = 0;
  
      size_t n_bytes = 0;
-@@ -1223,6 +1314,281 @@ llama_model::~llama_model() {
+@@ -1223,6 +1314,286 @@ llama_model::~llama_model() {
      }
  }
  
@@ -1141,6 +1146,11 @@ index e195f50..20d5f87 100644
 +            &out->truncated);
 +        out->mapping_id = info.mapping_id;
 +        out->mapping_generation = info.mapping_generation;
++        out->mapping_size = info.mapping_size;
++        out->tensor_offset = info.offset;
++        out->tensor_size = info.size;
++        out->page_start = info.page_start;
++        out->page_end = info.page_end;
 +        out->error = rc == 0 ? 0 : (uint32_t) rc;
 +        return 0;
 +    }
@@ -1224,7 +1234,7 @@ index e195f50..20d5f87 100644
  void llama_model_base::load_stats(llama_model_loader & ml) {
      pimpl->n_elements = ml.n_elements;
      pimpl->n_bytes = ml.n_bytes;
-@@ -1731,7 +2097,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1731,7 +2102,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -1235,7 +1245,7 @@ index e195f50..20d5f87 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
-@@ -2820,6 +3188,108 @@ void llama_model_free(llama_model * model) {
+@@ -2820,6 +3193,108 @@ void llama_model_free(llama_model * model) {
      delete model;
  }
  
