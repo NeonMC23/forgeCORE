@@ -34,7 +34,7 @@ use crate::batch::{Batch, SeqId};
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::memory::{Memory, SeqState, State};
-use crate::model::{Model, ModelInner};
+use crate::model::{Model, ModelInner, PageSample, PageSampleStatus};
 use crate::residency::ContextLifetimeState;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -218,6 +218,7 @@ pub struct TraceSummary {
 
 /// Maximum number of CPU node-dispatch events retained in one context.
 pub const MAX_NODE_DISPATCH_EVENTS: usize = 65_536;
+pub const MAX_NODE_DISPATCH_SAMPLE_PAGES: u64 = 4096;
 const NODE_NAME_CAPACITY: usize = 128;
 const OP_NAME_CAPACITY: usize = 64;
 const SOURCE_NAME_CAPACITY: usize = 128;
@@ -228,11 +229,17 @@ const MAX_DISPATCH_SOURCES: usize = 8;
 pub struct NodeDispatchOptions {
     /// Maximum retained events. Must be in `1..=MAX_NODE_DISPATCH_EVENTS`.
     pub max_events: usize,
+    /// Maximum pages sampled per declared source tensor. Zero disables
+    /// pre-dispatch residency sampling.
+    pub sample_pages: u64,
 }
 
 impl Default for NodeDispatchOptions {
     fn default() -> Self {
-        Self { max_events: 4096 }
+        Self {
+            max_events: 4096,
+            sample_pages: 0,
+        }
     }
 }
 
@@ -263,7 +270,15 @@ pub struct NodeDispatchEvent {
     /// Declared source tensor names, in native source order, truncated to
     /// [`MAX_DISPATCH_SOURCES`] entries.
     pub source_names: Vec<String>,
+    /// Bounded per-source residency observations made before dispatch.
+    pub source_samples: Vec<NodeDispatchSource>,
     pub sources_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeDispatchSource {
+    pub name: String,
+    pub sample: Option<PageSample>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -280,6 +295,7 @@ struct RawDispatchSource {
     name: [u8; SOURCE_NAME_CAPACITY],
     len: u16,
     truncated: bool,
+    sample: PageSample,
 }
 
 impl Default for RawDispatchSource {
@@ -288,6 +304,7 @@ impl Default for RawDispatchSource {
             name: [0; SOURCE_NAME_CAPACITY],
             len: 0,
             truncated: false,
+            sample: PageSample::default(),
         }
     }
 }
@@ -348,10 +365,18 @@ struct DispatchState {
     buffer: RefCell<DispatchBuffer>,
     model_instance_id: u64,
     context_id: u64,
+    model: *const forge_sys::llama_model,
+    sample_pages: u64,
 }
 
 impl DispatchState {
-    fn new(model_instance_id: u64, context_id: u64, max_events: usize) -> Self {
+    fn new(
+        model_instance_id: u64,
+        context_id: u64,
+        model: *const forge_sys::llama_model,
+        sample_pages: u64,
+        max_events: usize,
+    ) -> Self {
         Self {
             buffer: RefCell::new(DispatchBuffer {
                 max_events,
@@ -363,6 +388,8 @@ impl DispatchState {
             }),
             model_instance_id,
             context_id,
+            model,
+            sample_pages,
         }
     }
 
@@ -412,6 +439,22 @@ impl DispatchState {
                 };
                 event.sources[source_index].len = len;
                 event.sources[source_index].truncated = truncated;
+                if self.sample_pages > 0 && !self.model.is_null() {
+                    let mut sample = forge_sys::llama_page_sample_result::default();
+                    let name_ptr = unsafe { forge_sys::llama_tensor_src_name(node, index) };
+                    if !name_ptr.is_null() {
+                        let rc = unsafe {
+                            forge_sys::llama_model_sample_tensor_pages(
+                                self.model,
+                                name_ptr,
+                                self.model_instance_id,
+                                self.sample_pages,
+                                &mut sample,
+                            )
+                        };
+                        event.sources[source_index].sample = page_sample_from_raw(rc, sample);
+                    }
+                }
             }
         }
         buffer.next_event_sequence = buffer.next_event_sequence.saturating_add(1);
@@ -478,11 +521,49 @@ fn text_from_raw(bytes: &[u8], len: u16) -> Option<String> {
     (len > 0).then(|| String::from_utf8_lossy(&bytes[..len]).into_owned())
 }
 
+fn page_sample_from_raw(rc: i32, raw: forge_sys::llama_page_sample_result) -> PageSample {
+    let status = if rc != 0 {
+        PageSampleStatus::Error
+    } else {
+        match raw.error {
+            0 if raw.truncated != 0 || raw.unknown_pages > 0 => PageSampleStatus::Partial,
+            0 => PageSampleStatus::Complete,
+            95 => PageSampleStatus::Unsupported,
+            116 => PageSampleStatus::Stale,
+            2 => PageSampleStatus::Missing,
+            22 => PageSampleStatus::Error,
+            _ => PageSampleStatus::Unknown,
+        }
+    };
+    PageSample {
+        requested_pages: raw.requested_pages,
+        sampled_pages: raw.sampled_pages,
+        resident_pages: raw.resident_pages,
+        nonresident_pages: raw.nonresident_pages,
+        unknown_pages: raw.unknown_pages,
+        page_size: raw.page_size,
+        max_pages: raw.max_pages,
+        mapping_id: raw.mapping_id,
+        mapping_generation: raw.mapping_generation,
+        truncated: raw.truncated != 0,
+        error: raw.error,
+        status,
+    }
+}
+
 fn raw_to_event(raw: &RawDispatchEvent) -> NodeDispatchEvent {
     let mut source_names = Vec::with_capacity(raw.source_count as usize);
+    let mut source_samples = Vec::with_capacity(raw.source_count as usize);
     for source in raw.sources.iter().take(raw.source_count as usize) {
         if let Some(name) = text_from_raw(&source.name, source.len) {
-            source_names.push(name);
+            source_names.push(name.clone());
+            source_samples.push(NodeDispatchSource {
+                name,
+                sample: (source.sample.status != PageSampleStatus::Unknown
+                    || source.sample.requested_pages > 0
+                    || source.sample.error != 0)
+                    .then_some(source.sample),
+            });
         }
     }
     NodeDispatchEvent {
@@ -499,6 +580,7 @@ fn raw_to_event(raw: &RawDispatchEvent) -> NodeDispatchEvent {
         op_name: text_from_raw(&raw.op_name, raw.op_name_len),
         op_name_truncated: raw.op_name_truncated,
         source_names,
+        source_samples,
         sources_truncated: raw.sources_truncated,
     }
 }
@@ -849,6 +931,7 @@ pub struct Context {
     shift_allowed: bool,
     trace: Option<Box<TraceState>>,
     model_instance_id: u64,
+    model_raw: *const forge_sys::llama_model,
     dispatch: Option<Box<DispatchState>>,
 }
 
@@ -1013,6 +1096,7 @@ impl Context {
                 shift_allowed,
                 trace: trace_state,
                 model_instance_id,
+                model_raw: model.raw(),
                 dispatch: None,
             })
         }
@@ -1157,10 +1241,17 @@ impl Context {
                 "node dispatch max_events must be in 1..={MAX_NODE_DISPATCH_EVENTS}"
             )));
         }
+        if options.sample_pages > MAX_NODE_DISPATCH_SAMPLE_PAGES {
+            return Err(Error::invalid(format!(
+                "node dispatch sample_pages must be in 0..={MAX_NODE_DISPATCH_SAMPLE_PAGES}"
+            )));
+        }
         let context_id = self.lifetime_state()?.context_id;
         let state = Box::new(DispatchState::new(
             self.model_instance_id,
             context_id,
+            self.model_raw,
+            options.sample_pages,
             options.max_events,
         ));
         let pointer = (&*state as *const DispatchState)

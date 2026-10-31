@@ -134,7 +134,7 @@ index 1df0f2b..0ed23e1 100644
          return (void *)ggml_numa_init;
      }
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b..3a3ad42 100644
+index 31bbf8b..616bf5b 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -210,6 +210,7 @@ extern "C" {
@@ -145,7 +145,7 @@ index 31bbf8b..3a3ad42 100644
      };
  
      LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
-@@ -541,6 +542,119 @@ extern "C" {
+@@ -541,6 +542,150 @@ extern "C" {
  
      LLAMA_API void llama_model_free(struct llama_model * model);
  
@@ -223,6 +223,27 @@ index 31bbf8b..3a3ad42 100644
 +        uint64_t     page_size;
 +        uint64_t     page_start;
 +        uint64_t     page_end;
++        // Stable within this loaded model. The generation changes when a new
++        // model instance/mapping set is created.
++        uint64_t     mapping_id;
++        uint64_t     mapping_generation;
++        // Borrowed for the model lifetime; never a pointer to loader state.
++        const char * file_path;
++        uint64_t     file_size;
++    };
++
++    struct llama_page_sample_result {
++        uint64_t requested_pages;
++        uint64_t sampled_pages;
++        uint64_t resident_pages;
++        uint64_t nonresident_pages;
++        uint64_t unknown_pages;
++        uint64_t page_size;
++        uint64_t max_pages;
++        uint64_t mapping_id;
++        uint64_t mapping_generation;
++        uint32_t truncated;
++        uint32_t error;
 +    };
 +
 +    struct llama_model_page_release_result {
@@ -254,6 +275,16 @@ index 31bbf8b..3a3ad42 100644
 +    LLAMA_API int32_t llama_model_prefetch_tensor_pages(
 +            struct llama_model * model, const int32_t * indices, size_t n_indices,
 +            uint64_t * out_requested_bytes);
++
++    // Sample residency for one named, file-backed tensor. Linux uses mincore;
++    // other platforms return ENOTSUP. The generation must match the live model
++    // instance or the result is rejected. max_pages is clamped to 4096.
++    LLAMA_API int32_t llama_model_sample_tensor_pages(
++            const struct llama_model * model,
++            const char * name,
++            uint64_t expected_generation,
++            uint64_t max_pages,
++            struct llama_page_sample_result * out);
 +
 +    // Read-only graph-node helpers for diagnostics/tracing.
 +    LLAMA_API const char * llama_tensor_op_name(const struct ggml_tensor * tensor);
@@ -444,10 +475,38 @@ index 77ef92f..822a4ad 100644
      mutable int64_t t_start_us  = 0;
      mutable int64_t t_load_us   = 0;
 diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
-index 715a6e3..0844ad4 100644
+index 715a6e3..536ae6a 100644
 --- a/src/llama-mmap.cpp
 +++ b/src/llama-mmap.cpp
-@@ -563,6 +563,84 @@ struct llama_mmap::impl {
+@@ -405,6 +405,13 @@ llama_file::~llama_file() = default;
+ 
+ size_t llama_file::tell() const { return pimpl->tell(); }
+ size_t llama_file::size() const { return pimpl->size; }
++const char * llama_file::path() const {
++#ifdef _WIN32
++    return "";
++#else
++    return pimpl->fname.c_str();
++#endif
++}
+ 
+ size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
+ bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+@@ -465,9 +472,13 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
+ struct llama_mmap::impl {
+ #ifdef _POSIX_MAPPED_FILES
+     std::vector<std::pair<size_t, size_t>> mapped_fragments;
++    std::string file_path;
++    size_t file_size = 0;
+ 
+     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+         size = file->size();
++        file_path = file->path();
++        file_size = size;
+         int fd = file->file_id();
+         int flags = MAP_SHARED;
+         if (numa) { prefetch = 0; }
+@@ -563,6 +574,141 @@ struct llama_mmap::impl {
          mapped_fragments = std::move(new_mapped_fragments);
      }
  
@@ -507,6 +566,63 @@ index 715a6e3..0844ad4 100644
 +#endif
 +    }
 +
++    int sample_pages_range(size_t first, size_t last, size_t max_pages,
++                           uint64_t * requested, uint64_t * sampled,
++                           uint64_t * resident, uint64_t * nonresident,
++                           uint64_t * unknown, uint64_t * page_size_out,
++                           uint32_t * truncated) const {
++#if defined(__linux__)
++        if (first >= last || last > size || max_pages == 0) {
++            return EINVAL;
++        }
++        const size_t page_size = sysconf(_SC_PAGESIZE);
++        if (page_size == 0) {
++            return EINVAL;
++        }
++        first = first & ~(page_size - 1);
++        last  = std::min((last + page_size - 1) & ~(page_size - 1), size);
++        const size_t total_pages = (last - first) / page_size;
++        *requested = total_pages;
++        *sampled = 0;
++        *resident = 0;
++        *nonresident = 0;
++        *unknown = 0;
++        *page_size_out = page_size;
++        *truncated = total_pages > max_pages;
++        size_t budget = max_pages;
++        uint8_t status[4096];
++        for (const auto & frag : mapped_fragments) {
++            if (budget == 0) break;
++            const size_t beg = std::max(first, frag.first);
++            const size_t end = std::min(last, frag.second);
++            if (beg >= end) continue;
++            size_t range_first = beg & ~(page_size - 1);
++            size_t range_last = std::min((end + page_size - 1) & ~(page_size - 1), size);
++            while (range_first < range_last && budget > 0) {
++                const size_t chunk_pages = std::min<size_t>(budget, (range_last - range_first) / page_size);
++                if (chunk_pages == 0) break;
++                const size_t chunk_bytes = chunk_pages * page_size;
++                if (mincore((char *) addr + range_first, chunk_bytes, status) != 0) {
++                    *unknown += chunk_pages;
++                } else {
++                    for (size_t i = 0; i < chunk_pages; ++i) {
++                        if (status[i] & 1) ++*resident; else ++*nonresident;
++                    }
++                }
++                *sampled += chunk_pages;
++                budget -= chunk_pages;
++                range_first += chunk_bytes;
++            }
++        }
++        return 0;
++#else
++        (void) first; (void) last; (void) max_pages;
++        (void) requested; (void) sampled; (void) resident; (void) nonresident;
++        (void) unknown; (void) page_size_out; (void) truncated;
++        return ENOTSUP;
++#endif
++    }
++
 +    bool contains_range(const void * ptr, size_t len, size_t * offset) const {
 +        if (ptr == nullptr || len == 0 || offset == nullptr) {
 +            return false;
@@ -532,7 +648,23 @@ index 715a6e3..0844ad4 100644
      ~impl() {
          for (const auto & frag : mapped_fragments) {
              if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
-@@ -627,6 +705,23 @@ struct llama_mmap::impl {
+@@ -572,11 +718,15 @@ struct llama_mmap::impl {
+     }
+ #elif defined(_WIN32)
+     HANDLE hMapping = nullptr;
++    std::string file_path;
++    size_t file_size = 0;
+ 
+     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+         GGML_UNUSED(numa);
+ 
+         size = file->size();
++        file_path = file->path();
++        file_size = size;
+ 
+         HANDLE hFile = (HANDLE) _get_osfhandle(file->file_id());
+ 
+@@ -627,6 +777,23 @@ struct llama_mmap::impl {
          GGML_UNUSED(last);
      }
  
@@ -556,7 +688,7 @@ index 715a6e3..0844ad4 100644
      ~impl() {
          if (hMapping) {
              if (addr) {
-@@ -657,6 +752,13 @@ struct llama_mmap::impl {
+@@ -657,6 +824,13 @@ struct llama_mmap::impl {
  
          throw std::runtime_error("mmap not supported");
      }
@@ -570,7 +702,12 @@ index 715a6e3..0844ad4 100644
  #endif
  
      void * addr;
-@@ -672,6 +774,38 @@ void * llama_mmap::addr() const { return pimpl->addr; }
+@@ -668,10 +842,65 @@ llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
+ llama_mmap::~llama_mmap() = default;
+ 
+ size_t llama_mmap::size() const { return pimpl->size; }
++const char * llama_mmap::path() const { return pimpl->file_path.c_str(); }
+ void * llama_mmap::addr() const { return pimpl->addr; }
  
  void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
  
@@ -602,6 +739,28 @@ index 715a6e3..0844ad4 100644
 +#endif
 +}
 +
++int llama_mmap::sample_pages_range(size_t first, size_t last, size_t max_pages,
++        uint64_t * requested, uint64_t * sampled, uint64_t * resident,
++        uint64_t * nonresident, uint64_t * unknown, uint64_t * page_size,
++        uint32_t * truncated) const {
++#if defined(__linux__) && defined(_POSIX_MAPPED_FILES)
++    return pimpl->sample_pages_range(first, last, max_pages, requested, sampled,
++        resident, nonresident, unknown, page_size, truncated);
++#else
++    (void) first;
++    (void) last;
++    (void) max_pages;
++    (void) requested;
++    (void) sampled;
++    (void) resident;
++    (void) nonresident;
++    (void) unknown;
++    (void) page_size;
++    (void) truncated;
++    return ENOTSUP;
++#endif
++}
++
 +bool llama_mmap::contains_range(const void * ptr, size_t len, size_t * offset) const {
 +    return pimpl->contains_range(ptr, len, offset);
 +}
@@ -610,10 +769,23 @@ index 715a6e3..0844ad4 100644
  const bool llama_mmap::SUPPORTED  = true;
  #else
 diff --git a/src/llama-mmap.h b/src/llama-mmap.h
-index cc28c8a..84eded4 100644
+index cc28c8a..5c61d99 100644
 --- a/src/llama-mmap.h
 +++ b/src/llama-mmap.h
-@@ -55,6 +55,14 @@ struct llama_mmap {
+@@ -21,6 +21,7 @@ struct llama_file {
+ 
+     size_t tell() const;
+     size_t size() const;
++    const char * path() const;
+ 
+     int file_id() const; // fileno overload
+ 
+@@ -51,10 +52,24 @@ struct llama_mmap {
+     ~llama_mmap();
+ 
+     size_t size() const;
++    const char * path() const;
+     void * addr() const;
  
      void unmap_fragment(size_t first, size_t last);
  
@@ -621,6 +793,11 @@ index cc28c8a..84eded4 100644
 +    int advise_pages() const;
 +    int advise_pages_range(size_t first, size_t last) const;
 +    int prefetch_pages_range(size_t first, size_t last) const;
++    int sample_pages_range(size_t first, size_t last, size_t max_pages,
++                           uint64_t * requested, uint64_t * sampled,
++                           uint64_t * resident, uint64_t * nonresident,
++                           uint64_t * unknown, uint64_t * page_size,
++                           uint32_t * truncated) const;
 +
 +    // Check that [ptr, ptr+len) lies inside one currently mapped fragment.
 +    bool contains_range(const void * ptr, size_t len, size_t * offset) const;
@@ -643,7 +820,7 @@ index 43c396f..ddedb46 100644
  
      if (!fname.empty()) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index e195f50..4054786 100644
+index e195f50..20d5f87 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -26,13 +26,16 @@
@@ -765,7 +942,7 @@ index e195f50..4054786 100644
      uint64_t n_elements = 0;
  
      size_t n_bytes = 0;
-@@ -1223,6 +1314,237 @@ llama_model::~llama_model() {
+@@ -1223,6 +1314,281 @@ llama_model::~llama_model() {
      }
  }
  
@@ -910,7 +1087,11 @@ index e195f50..4054786 100644
 +        }
 +        out->file_backed = 1;
 +        out->mapping_index = (int32_t) mapping_index;
++        out->mapping_id = mapping_index;
++        out->mapping_generation = pimpl->instance_id;
 +        out->mapping_size = pimpl->mappings[mapping_index]->size();
++        out->file_path = pimpl->mappings[mapping_index]->path();
++        out->file_size = pimpl->mappings[mapping_index]->size();
 +        out->offset = offset;
 +        const uint64_t page = out->page_size;
 +        out->page_start = out->offset & ~(page - 1);
@@ -924,6 +1105,46 @@ index e195f50..4054786 100644
 +        out->page_end = (end + page - 1) & ~(page - 1);
 +        return 0;
 +    }
++    return 0;
++}
++
++int32_t llama_model::sample_tensor_pages(const char * name, uint64_t expected_generation,
++        uint64_t max_pages, llama_page_sample_result * out) const {
++    if (name == nullptr || out == nullptr || max_pages == 0) {
++        return -1;
++    }
++    *out = {};
++    out->max_pages = std::min<uint64_t>(max_pages, 4096);
++    if (expected_generation != 0 && expected_generation != pimpl->instance_id) {
++        out->error = ESTALE;
++        return 0;
++    }
++    for (int32_t index = 0; index < (int32_t) tensors_by_name.size(); ++index) {
++        if (tensors_by_name[(size_t) index].first != name) {
++            continue;
++        }
++        llama_tensor_mapping info;
++        if (tensor_mapping_info(index, &info) != 0) {
++            out->error = EINVAL;
++            return 0;
++        }
++        if (!info.file_backed || info.mapping_index < 0 ||
++                (size_t) info.mapping_index >= pimpl->mappings.size()) {
++            out->error = ENOTSUP;
++            return 0;
++        }
++        const uint64_t last = std::min(info.page_end, info.mapping_size);
++        const int rc = pimpl->mappings[(size_t) info.mapping_index]->sample_pages_range(
++            (size_t) info.page_start, (size_t) last, (size_t) out->max_pages,
++            &out->requested_pages, &out->sampled_pages, &out->resident_pages,
++            &out->nonresident_pages, &out->unknown_pages, &out->page_size,
++            &out->truncated);
++        out->mapping_id = info.mapping_id;
++        out->mapping_generation = info.mapping_generation;
++        out->error = rc == 0 ? 0 : (uint32_t) rc;
++        return 0;
++    }
++    out->error = ENOENT;
 +    return 0;
 +}
 +
@@ -1003,7 +1224,7 @@ index e195f50..4054786 100644
  void llama_model_base::load_stats(llama_model_loader & ml) {
      pimpl->n_elements = ml.n_elements;
      pimpl->n_bytes = ml.n_bytes;
-@@ -1731,7 +2053,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1731,7 +2097,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -1014,7 +1235,7 @@ index e195f50..4054786 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
-@@ -2820,6 +3144,99 @@ void llama_model_free(llama_model * model) {
+@@ -2820,6 +3188,108 @@ void llama_model_free(llama_model * model) {
      delete model;
  }
  
@@ -1037,6 +1258,15 @@ index e195f50..4054786 100644
 +    std::unique_lock<std::shared_mutex> lock(model->execution_gate(), std::try_to_lock);
 +    out->quiescent = lock.owns_lock() ? 1 : 0;
 +    return 0;
++}
++
++int32_t llama_model_sample_tensor_pages(const llama_model * model, const char * name,
++        uint64_t expected_generation, uint64_t max_pages,
++        struct llama_page_sample_result * out) {
++    if (model == nullptr) {
++        return -1;
++    }
++    return model->sample_tensor_pages(name, expected_generation, max_pages, out);
 +}
 +
 +int32_t llama_model_release_pages(llama_model * model) {
@@ -1115,7 +1345,7 @@ index e195f50..4054786 100644
      return model->hparams.n_ctx_train;
  }
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 984b2cf..2e1c6fc 100644
+index 984b2cf..c04e131 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -9,6 +9,7 @@
@@ -1126,7 +1356,7 @@ index 984b2cf..2e1c6fc 100644
  #include <string>
  #include <unordered_map>
  #include <unordered_set>
-@@ -738,6 +739,27 @@ struct llama_model {
+@@ -738,6 +739,29 @@ struct llama_model {
  
      std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
  
@@ -1146,6 +1376,8 @@ index 984b2cf..2e1c6fc 100644
 +
 +    int32_t tensor_mapping_count() const;
 +    int32_t tensor_mapping_info(int32_t index, llama_tensor_mapping * out) const;
++    int32_t sample_tensor_pages(const char * name, uint64_t expected_generation,
++            uint64_t max_pages, llama_page_sample_result * out) const;
 +    int32_t release_tensor_pages(const int32_t * indices, size_t n_indices,
 +            llama_model_page_release_result * out);
 +    int32_t prefetch_tensor_pages(const int32_t * indices, size_t n_indices,

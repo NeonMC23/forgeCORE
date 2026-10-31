@@ -41,6 +41,7 @@ fn main() {
             || !text.contains("llama_tensor_src_count")
             || !text.contains("llama_tensor_src_id")
             || !text.contains("llama_context_set_node_dispatch_observer")
+            || !text.contains("llama_model_sample_tensor_pages")
         {
             panic!(
                 "forge-sys: {} lacks the required native residency patch. Re-run `sh scripts/setup-native.sh` to apply patches/llama-model-residency.patch.",

@@ -129,6 +129,12 @@ fn tensor_mapping_metadata_is_exact_and_release_preserves_inference() {
                 mapping.offset.saturating_add(mapping.size) <= mapping.mapping_size,
                 "tensor range exceeds its mapping: {mapping:?}"
             );
+            assert!(mapping.mapping_id.is_some());
+            assert!(mapping.mapping_generation.is_some());
+            assert!(mapping
+                .file_size
+                .is_some_and(|size| size == mapping.mapping_size));
+            assert!(mapping.file_path.is_some());
             file_backed.push(index);
         } else {
             assert!(mapping.mapping_index.is_none());
@@ -166,4 +172,33 @@ fn tensor_mapping_metadata_is_exact_and_release_preserves_inference() {
         .decode(&tiny_batch())
         .expect("decode after tensor release");
     assert_eq!(model.n_params(), 1176);
+}
+
+#[test]
+fn tensor_page_sample_is_bounded_and_file_backed() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load_with_options(&path, &options()).expect("model");
+    let mappings = model.tensor_mappings().expect("tensor mappings");
+    let mapping = mappings
+        .iter()
+        .max_by_key(|mapping| mapping.size)
+        .expect("mapping");
+    let sample = model
+        .sample_tensor_pages(&mapping.name, 64)
+        .expect("sample");
+    eprintln!("sample={sample:?}");
+    assert!(sample.requested_pages > 0);
+    assert!(sample.sampled_pages <= 64);
+    assert_eq!(
+        sample.resident_pages + sample.nonresident_pages + sample.unknown_pages,
+        sample.sampled_pages
+    );
+    assert!(sample.mapping_generation != 0);
+    assert!(matches!(
+        sample.status,
+        forge_core::PageSampleStatus::Complete | forge_core::PageSampleStatus::Partial
+    ));
 }

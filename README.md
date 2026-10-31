@@ -121,6 +121,18 @@ kernel completion, final use, or release safety. The observer is disabled by
 default; `set_dispatch_observer(None)` synchronizes before removal. Event storage
 is bounded, drops the oldest events, and reports `dropped_events`.
 
+`Model::tensor_mappings()` now includes the mapping id, generation, file path,
+file size, and validated page range in addition to the tensor offset/size. The
+generation is the live model instance id; a new model/mapping set gets a new
+generation. `Model::sample_tensor_pages(name, max_pages)` performs a bounded
+Linux `mincore()` sample over only the validated file-backed range. It returns
+requested/sampled/resident/nonresident/unknown page counts, mapping identity,
+page size, truncation, and an explicit status. It is a point-in-time residency
+observation, not evidence of a tensor read, page fault, I/O, or final use.
+`NodeDispatchOptions.sample_pages` enables pre-dispatch sampling per declared
+source; zero disables it. The sample runs before the dispatch event is stored
+and before the worker barrier/kernel entry.
+
 ## Docs
 
 - `docs/PIVOT.md` — why the pivot, what was kept/removed, API and FFI

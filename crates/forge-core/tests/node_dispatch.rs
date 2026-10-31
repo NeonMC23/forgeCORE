@@ -34,7 +34,10 @@ fn dispatch_observer_is_opt_in_and_drains_to_none() {
 
     let mut context = Context::open(&model, &ContextOptions::default()).expect("traced context");
     context
-        .set_dispatch_observer(Some(NodeDispatchOptions { max_events: 4096 }))
+        .set_dispatch_observer(Some(NodeDispatchOptions {
+            max_events: 4096,
+            sample_pages: 0,
+        }))
         .expect("install observer");
     assert!(context.dispatch_observer_active());
     context.decode(&tiny_batch()).expect("decode");
@@ -106,6 +109,44 @@ fn dispatch_is_exactly_once_with_multiple_workers() {
 }
 
 #[test]
+fn pre_dispatch_sampling_is_bounded_and_generation_aware() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load(&path).expect("model");
+    let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
+    context
+        .set_dispatch_observer(Some(NodeDispatchOptions {
+            max_events: 4096,
+            sample_pages: 64,
+        }))
+        .expect("sampling observer");
+    context.decode(&tiny_batch()).expect("decode");
+    let events = context.dispatch_events();
+    let samples: Vec<_> = events
+        .iter()
+        .flat_map(|event| event.source_samples.iter())
+        .filter_map(|source| source.sample)
+        .collect();
+    assert!(!samples.is_empty());
+    assert!(samples.iter().any(|sample| {
+        sample.requested_pages > 0
+            && sample.sampled_pages > 0
+            && sample.mapping_generation != 0
+            && matches!(
+                sample.status,
+                forge_core::PageSampleStatus::Complete | forge_core::PageSampleStatus::Partial
+            )
+    }));
+    assert!(samples.iter().all(|sample| sample.sampled_pages <= 64));
+    assert!(samples.iter().all(|sample| sample.resident_pages
+        + sample.nonresident_pages
+        + sample.unknown_pages
+        == sample.sampled_pages));
+}
+
+#[test]
 fn dispatch_events_are_bounded_and_overflow_is_reported() {
     let Some(path) = fixture() else {
         eprintln!("SKIP: FORGE_TEST_MODEL not set");
@@ -114,7 +155,10 @@ fn dispatch_events_are_bounded_and_overflow_is_reported() {
     let model = Model::load(&path).expect("model");
     let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
     context
-        .set_dispatch_observer(Some(NodeDispatchOptions { max_events: 2 }))
+        .set_dispatch_observer(Some(NodeDispatchOptions {
+            max_events: 2,
+            sample_pages: 0,
+        }))
         .expect("observer");
     context.decode(&tiny_batch()).expect("decode");
     let summary = context.dispatch_summary().expect("summary");
@@ -174,11 +218,15 @@ fn dispatch_options_are_bounded() {
     let model = Model::load(&path).expect("model");
     let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
     assert!(context
-        .set_dispatch_observer(Some(NodeDispatchOptions { max_events: 0 }))
+        .set_dispatch_observer(Some(NodeDispatchOptions {
+            max_events: 0,
+            sample_pages: 0
+        }))
         .is_err());
     assert!(context
         .set_dispatch_observer(Some(NodeDispatchOptions {
-            max_events: MAX_NODE_DISPATCH_EVENTS + 1
+            max_events: MAX_NODE_DISPATCH_EVENTS + 1,
+            sample_pages: 0,
         }))
         .is_err());
 }

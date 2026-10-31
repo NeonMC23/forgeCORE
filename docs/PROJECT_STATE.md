@@ -84,8 +84,12 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
   opt-in CPU node-dispatch observer (`Context::set_dispatch_observer`) emits
   one event from worker 0 before each non-empty compute-enabled node; it is
   dispatch-start evidence only, not a tensor read, page-fault, I/O, completion,
-  or release proof. GPU execution is **not** validated on hardware in this
-  environment.
+  or release proof. Tensor mappings additionally expose a model-instance
+  generation, mapping id, file path/size, and validated page range. A bounded
+  Linux `mincore()` sample can be taken per named file-backed tensor; sampling
+  is opt-in, per-source, and occurs before dispatch publication/barrier. It is
+  still residency observation only. GPU execution is **not** validated on
+  hardware in this environment.
 - `Model → Context → Batch → decode → Logits` CPU inference path, with
   real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and
   `gptneox` (Pythia-70M).

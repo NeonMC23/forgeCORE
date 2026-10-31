@@ -86,6 +86,11 @@ The patch adds two narrow capabilities:
   non-empty compute-enabled node from worker 0, and adds a barrier after event
   publication only while installed. It is a dispatch-start observation, not a
   tensor read or residency proof.
+- Mapping identity and sampling metadata: `llama_tensor_mapping` carries
+  mapping id/generation, file path/size, and validated page bounds;
+  `llama_model_sample_tensor_pages()` performs bounded Linux `mincore()` over
+  a named file-backed tensor range. Unsupported platforms and invalid/stale
+  mappings return explicit status; no pointer is exposed.
 
 It does not change `llama_model_params` layout or the default `AUTO`/`MMAP`
 behavior. The upstream checkout HEAD remains the pinned SHA; the patch is

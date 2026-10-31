@@ -46,6 +46,7 @@ fn node_dispatch_observer_overhead_smoke() {
                 context
                     .set_dispatch_observer(Some(NodeDispatchOptions {
                         max_events: if drain { 4096 } else { 65_536 },
+                        sample_pages: 0,
                     }))
                     .expect("observer");
             }
@@ -82,6 +83,46 @@ fn node_dispatch_observer_overhead_smoke() {
             if enabled {
                 assert!(events > 0);
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual sampling overhead measurement"]
+fn pre_dispatch_sampling_overhead_smoke() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load(&path).expect("model");
+    for threads in [1usize, 4] {
+        for sample_pages in [0u64, 64] {
+            let mut options = ContextOptions::default();
+            options.n_threads = threads as u32;
+            options.n_threads_batch = threads as u32;
+            let mut context = Context::open(&model, &options).expect("context");
+            context
+                .set_dispatch_observer(Some(NodeDispatchOptions {
+                    max_events: 4096,
+                    sample_pages,
+                }))
+                .expect("observer");
+            context.decode(&batch_at(0)).expect("warmup");
+            let _ = context.take_dispatch_events();
+            let mut samples = Vec::new();
+            let mut observed = 0u64;
+            for repetition in 0..5 {
+                let position = 4 * (repetition as u32 + 1);
+                let started = Instant::now();
+                context.decode(&batch_at(position)).expect("decode");
+                samples.push(started.elapsed().as_nanos());
+                observed += context.dispatch_summary().expect("summary").events;
+                let _ = context.take_dispatch_events();
+            }
+            let median = median(&mut samples);
+            eprintln!(
+                "threads={threads} sample_pages={sample_pages} median_ns={median} events={observed}"
+            );
         }
     }
 }

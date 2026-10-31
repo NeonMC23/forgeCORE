@@ -277,6 +277,27 @@ pub struct llama_tensor_mapping {
     pub page_size: u64,
     pub page_start: u64,
     pub page_end: u64,
+    pub mapping_id: u64,
+    pub mapping_generation: u64,
+    pub file_path: *const c_char,
+    pub file_size: u64,
+}
+
+/// `struct llama_page_sample_result` (`llama.h`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct llama_page_sample_result {
+    pub requested_pages: u64,
+    pub sampled_pages: u64,
+    pub resident_pages: u64,
+    pub nonresident_pages: u64,
+    pub unknown_pages: u64,
+    pub page_size: u64,
+    pub max_pages: u64,
+    pub mapping_id: u64,
+    pub mapping_generation: u64,
+    pub truncated: u32,
+    pub error: u32,
 }
 
 /// `struct llama_model_lifetime_state` (`llama.h`).
@@ -773,6 +794,13 @@ unsafe extern "C" {
         n_indices: usize,
         out_requested_bytes: *mut u64,
     ) -> c_int;
+    pub fn llama_model_sample_tensor_pages(
+        model: *const llama_model,
+        name: *const c_char,
+        expected_generation: u64,
+        max_pages: u64,
+        out: *mut llama_page_sample_result,
+    ) -> c_int;
     pub fn llama_tensor_op_name(tensor: *const ggml_tensor) -> *const c_char;
     pub fn llama_tensor_src_count(tensor: *const ggml_tensor) -> c_int;
     pub fn llama_tensor_src_name(tensor: *const ggml_tensor, index: i32) -> *const c_char;
@@ -1027,7 +1055,7 @@ mod layout_tests {
 
     #[test]
     fn llama_tensor_mapping_layout() {
-        assert_eq!(size_of::<llama_tensor_mapping>(), 64);
+        assert_eq!(size_of::<llama_tensor_mapping>(), 96);
         assert_eq!(offset_of!(llama_tensor_mapping, name), 0);
         assert_eq!(offset_of!(llama_tensor_mapping, file_backed), 8);
         assert_eq!(offset_of!(llama_tensor_mapping, mapping_index), 12);
@@ -1037,6 +1065,11 @@ mod layout_tests {
         assert_eq!(offset_of!(llama_tensor_mapping, page_size), 40);
         assert_eq!(offset_of!(llama_tensor_mapping, page_start), 48);
         assert_eq!(offset_of!(llama_tensor_mapping, page_end), 56);
+        assert_eq!(offset_of!(llama_tensor_mapping, mapping_id), 64);
+        assert_eq!(offset_of!(llama_tensor_mapping, mapping_generation), 72);
+        assert_eq!(offset_of!(llama_tensor_mapping, file_path), 80);
+        assert_eq!(offset_of!(llama_tensor_mapping, file_size), 88);
+        assert_eq!(size_of::<llama_page_sample_result>(), 80);
         assert_eq!(size_of::<llama_model_page_release_result>(), 32);
         assert_eq!(size_of::<llama_model_lifetime_state>(), 32);
         assert_eq!(offset_of!(llama_model_lifetime_state, instance_id), 0);

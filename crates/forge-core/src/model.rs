@@ -182,6 +182,42 @@ pub struct TensorMappingInfo {
     /// Page-aligned end offset within the mapping (may round past the
     /// mapping file size; release clamps it).
     pub page_end: u64,
+    /// Stable within the loaded model; `None` when not file-backed.
+    pub mapping_id: Option<u64>,
+    /// Changes when the model/mapping set is recreated.
+    pub mapping_generation: Option<u64>,
+    pub file_path: Option<String>,
+    pub file_size: Option<u64>,
+}
+
+/// Status of one bounded pre-dispatch residency sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageSampleStatus {
+    Complete,
+    Partial,
+    #[default]
+    Unknown,
+    Unsupported,
+    Stale,
+    Missing,
+    Error,
+}
+
+/// Page residency sampled through native `mincore()` for one tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PageSample {
+    pub requested_pages: u64,
+    pub sampled_pages: u64,
+    pub resident_pages: u64,
+    pub nonresident_pages: u64,
+    pub unknown_pages: u64,
+    pub page_size: u64,
+    pub max_pages: u64,
+    pub mapping_id: u64,
+    pub mapping_generation: u64,
+    pub truncated: bool,
+    pub error: u32,
+    pub status: PageSampleStatus,
 }
 
 /// Outcome of a tensor-scoped page release request.
@@ -566,6 +602,10 @@ impl Model {
                 page_size: 0,
                 page_start: 0,
                 page_end: 0,
+                mapping_id: 0,
+                mapping_generation: 0,
+                file_path: ptr::null(),
+                file_size: 0,
             };
             // SAFETY: raw is a live model and out points to writable storage.
             let rc =
@@ -598,9 +638,77 @@ impl Model {
                 page_size: raw.page_size,
                 page_start: raw.page_start,
                 page_end: raw.page_end,
+                mapping_id: file_backed.then_some(raw.mapping_id),
+                mapping_generation: file_backed.then_some(raw.mapping_generation),
+                file_path: if raw.file_path.is_null() {
+                    None
+                } else {
+                    Some(
+                        unsafe { CStr::from_ptr(raw.file_path) }
+                            .to_str()
+                            .map_err(|_| Error::model("tensor mapping path is not UTF-8"))?
+                            .to_owned(),
+                    )
+                },
+                file_size: file_backed.then_some(raw.file_size),
             });
         }
         Ok(mappings)
+    }
+
+    /// Sample page residency for one named, file-backed tensor.
+    ///
+    /// The native layer validates the tensor name, mapping generation, mapping
+    /// fragment, page bounds, and the per-call page budget. Linux uses
+    /// `mincore()`; unsupported platforms return an explicit status. The
+    /// sample is a point-in-time observation, not proof of a read or fault.
+    pub fn sample_tensor_pages(&self, name: &str, max_pages: u64) -> Result<PageSample> {
+        if max_pages == 0 {
+            return Err(Error::invalid(
+                "sample_tensor_pages requires max_pages greater than zero",
+            ));
+        }
+        let name = CString::new(name).map_err(|_| Error::invalid("tensor name contains NUL"))?;
+        let generation = self.lifetime_state()?.instance_id;
+        let mut raw = forge_sys::llama_page_sample_result::default();
+        // SAFETY: raw model is live; name is NUL-terminated; out is writable.
+        let rc = unsafe {
+            forge_sys::llama_model_sample_tensor_pages(
+                self.inner.raw,
+                name.as_ptr(),
+                generation,
+                max_pages,
+                &mut raw,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::model(format!(
+                "native tensor page sampling failed with code {rc}"
+            )));
+        }
+        let status = match raw.error {
+            0 if raw.truncated != 0 || raw.unknown_pages > 0 => PageSampleStatus::Partial,
+            0 => PageSampleStatus::Complete,
+            95 => PageSampleStatus::Unsupported,
+            116 => PageSampleStatus::Stale,
+            2 => PageSampleStatus::Missing,
+            22 => PageSampleStatus::Error,
+            _ => PageSampleStatus::Unknown,
+        };
+        Ok(PageSample {
+            requested_pages: raw.requested_pages,
+            sampled_pages: raw.sampled_pages,
+            resident_pages: raw.resident_pages,
+            nonresident_pages: raw.nonresident_pages,
+            unknown_pages: raw.unknown_pages,
+            page_size: raw.page_size,
+            max_pages: raw.max_pages,
+            mapping_id: raw.mapping_id,
+            mapping_generation: raw.mapping_generation,
+            truncated: raw.truncated != 0,
+            error: raw.error,
+            status,
+        })
     }
 
     /// Release pages for selected model tensor indices.

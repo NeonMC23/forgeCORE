@@ -39,8 +39,9 @@ pub use batch::{Batch, BatchBuilder, SeqId, TokenId};
 pub use buffer::{Buffer, BufferType};
 pub use context::{
     AttentionType, Context, ContextOptions, ContextTraceOptions, Embeddings, FlashAttnType, Logits,
-    NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSummary, PoolingType,
-    TraceCompletion, TraceEvent, TracePhase, TraceSummary, MAX_NODE_DISPATCH_EVENTS,
+    NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSource,
+    NodeDispatchSummary, PoolingType, TraceCompletion, TraceEvent, TracePhase, TraceSummary,
+    MAX_NODE_DISPATCH_EVENTS, MAX_NODE_DISPATCH_SAMPLE_PAGES,
 };
 pub use device::{
     enumerate_devices, max_devices, supports_gpu_offload, supports_mlock, supports_mmap,
@@ -56,7 +57,8 @@ pub use gguf::{
 pub use graph::{Graph, NodeInfo, Plan, DEFAULT_GRAPH_CAPACITY};
 pub use memory::{Memory, SeqState, State};
 pub use model::{
-    GpuLayers, Model, ModelLoadMode, ModelOptions, PageReleaseResult, SplitMode, TensorMappingInfo,
+    GpuLayers, Model, ModelLoadMode, ModelOptions, PageReleaseResult, PageSample, PageSampleStatus,
+    SplitMode, TensorMappingInfo,
 };
 pub use quant::{block_spec, row_bytes, tensor_bytes, BlockSpec, QuantFormat};
 pub use residency::{
