@@ -166,9 +166,10 @@ fn sampling_strategy_overhead_smoke() {
         }
         let summary = context.dispatch_summary().expect("summary");
         eprintln!(
-            "strategy={strategy:?} median_ns={} cache_reuses={} cache_evictions={}",
+            "strategy={strategy:?} median_ns={} cache_reuses={} cache_skips={} cache_evictions={}",
             median(&mut samples),
             summary.cache_reuses,
+            summary.cache_skips,
             summary.cache_evictions
         );
     }
