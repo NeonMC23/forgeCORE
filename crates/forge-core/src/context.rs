@@ -295,7 +295,8 @@ pub struct NodeDispatchEvent {
     /// Declared source tensor names, in native source order, truncated to
     /// [`MAX_DISPATCH_SOURCES`] entries.
     pub source_names: Vec<String>,
-    /// Bounded per-source residency observations made before dispatch.
+    /// Bounded per-source mapping ranges and reference counts. Residency is
+    /// aggregated once in [`NodeDispatchEvent::dispatch_sample`].
     pub source_samples: Vec<NodeDispatchSource>,
     pub source_references: usize,
     pub sources_truncated: bool,
@@ -311,8 +312,9 @@ pub struct NodeDispatchSource {
     pub page_start: Option<u64>,
     pub page_end: Option<u64>,
     pub requested_pages: u64,
-    /// Nothing for a source with no validated mapping; aggregate residency is
-    /// reported once at the dispatch level.
+    /// Reserved for future per-source samples. Currently always `None`;
+    /// deduplicated residency is reported in
+    /// [`NodeDispatchEvent::dispatch_sample`].
     pub sample: Option<PageSample>,
 }
 
