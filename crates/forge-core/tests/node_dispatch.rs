@@ -59,6 +59,9 @@ fn dispatch_observer_is_opt_in_and_drains_to_none() {
     assert!(summary.retained_events > 0);
     let events = context.dispatch_events();
     assert_eq!(events.len(), summary.retained_events);
+    assert!(events.iter().all(|event| event.dispatch_sample.is_none()));
+    assert_eq!(summary.budget_total, 0);
+    assert_eq!(summary.budget_remaining, 0);
     assert!(events
         .iter()
         .all(|event| event.backend == forge_core::NodeDispatchBackend::Cpu));
@@ -282,6 +285,31 @@ fn adaptive_sampling_reuses_fresh_complete_ranges() {
         }
         assert!(first.events > 0);
     }
+}
+
+#[test]
+fn zero_sampling_budget_disables_sampling() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load(&path).expect("model");
+    let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
+    context
+        .set_dispatch_observer(Some(NodeDispatchOptions {
+            max_events: 1024,
+            sample_pages: 4096,
+            sample_budget: 0,
+            ..NodeDispatchOptions::default()
+        }))
+        .expect("observer");
+    context.decode(&tiny_batch()).expect("decode");
+    let summary = context.dispatch_summary().expect("summary");
+    assert_eq!(summary.budget_total, 0);
+    assert!(context
+        .dispatch_events()
+        .iter()
+        .all(|event| event.dispatch_sample.is_none()));
 }
 
 #[test]

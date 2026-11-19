@@ -715,7 +715,9 @@ impl DispatchState {
             .requested_pages
             .saturating_sub(aggregate.sampled_pages);
         aggregate.truncated |= aggregate.sampled_pages < aggregate.requested_pages;
-        event.dispatch_sample = aggregate;
+        if sampling_enabled {
+            event.dispatch_sample = aggregate;
+        }
         event.sources_truncated |= event.sources_truncated;
         let dispatch_sample = event.dispatch_sample;
         buffer.next_event_sequence = buffer.next_event_sequence.saturating_add(1);
