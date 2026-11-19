@@ -91,7 +91,10 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
   per mapping/generation for dispatch-level page deduplication. Systematic,
   targeted, and adaptive strategies share strict execution budgets; targeted
   skips fresh cached ranges and adaptive reuses them, with cache skips and
-  reuses reported explicitly. Cache entries are bounded and freshness-windowed. It is still residency observation only. GPU execution is **not** validated on
+  reuses reported explicitly. Cache entries are bounded and freshness-windowed.
+  Native per-page states let one deduplicated observation drive per-source
+  resident/nonresident/unknown, exclusive/shared, fresh/reused, skipped, and
+  budget-excluded accounting without redundant `mincore()` calls. It is still residency observation only. GPU execution is **not** validated on
   hardware in this environment.
 - `Model → Context → Batch → decode → Logits` CPU inference path, with
   real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and

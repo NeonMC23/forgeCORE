@@ -208,7 +208,14 @@ pub enum PageSampleStatus {
 pub struct PageSample {
     pub requested_pages: u64,
     pub sampled_pages: u64,
+    /// Pages intentionally not observed after the range cap, budget, or
+    /// strategy exclusions are accounted separately.
     pub unsampled_pages: u64,
+    /// Pages skipped because a fresh complete observation existed and the
+    /// selected strategy was `Targeted`.
+    pub skipped_pages: u64,
+    /// Pages not observed because the per-execution budget was exhausted.
+    pub budget_excluded_pages: u64,
     pub fresh_sampled_pages: u64,
     pub reused_pages: u64,
     pub resident_pages: u64,
@@ -708,6 +715,8 @@ impl Model {
             requested_pages: raw.requested_pages,
             sampled_pages: raw.sampled_pages,
             unsampled_pages: raw.requested_pages.saturating_sub(raw.sampled_pages),
+            skipped_pages: 0,
+            budget_excluded_pages: 0,
             fresh_sampled_pages: raw.sampled_pages,
             reused_pages: 0,
             resident_pages: raw.resident_pages,

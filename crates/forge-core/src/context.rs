@@ -311,7 +311,21 @@ pub struct NodeDispatchSource {
     pub mapping_generation: Option<u64>,
     pub page_start: Option<u64>,
     pub page_end: Option<u64>,
+    /// Pages referenced by this source's validated mapping range.
     pub requested_pages: u64,
+    /// Pages referenced only by this source within the dispatch.
+    pub exclusive_pages: u64,
+    /// Pages also referenced by at least one other source in this dispatch.
+    pub shared_pages: u64,
+    pub sampled_pages: u64,
+    pub fresh_pages: u64,
+    pub reused_pages: u64,
+    pub resident_pages: u64,
+    pub nonresident_pages: u64,
+    pub unknown_pages: u64,
+    pub skipped_pages: u64,
+    pub budget_excluded_pages: u64,
+    pub unsampled_pages: u64,
     /// Reserved for future per-source samples. Currently always `None`;
     /// deduplicated residency is reported in
     /// [`NodeDispatchEvent::dispatch_sample`].
@@ -341,7 +355,19 @@ struct RawDispatchSource {
     mapping_generation: u64,
     page_start: u64,
     page_end: u64,
+    page_size: u64,
     requested_pages: u64,
+    exclusive_pages: u64,
+    shared_pages: u64,
+    sampled_pages: u64,
+    fresh_pages: u64,
+    reused_pages: u64,
+    resident_pages: u64,
+    nonresident_pages: u64,
+    unknown_pages: u64,
+    skipped_pages: u64,
+    budget_excluded_pages: u64,
+    unsampled_pages: u64,
 }
 
 impl Default for RawDispatchSource {
@@ -354,7 +380,19 @@ impl Default for RawDispatchSource {
             mapping_generation: 0,
             page_start: 0,
             page_end: 0,
+            page_size: 0,
             requested_pages: 0,
+            exclusive_pages: 0,
+            shared_pages: 0,
+            sampled_pages: 0,
+            fresh_pages: 0,
+            reused_pages: 0,
+            resident_pages: 0,
+            nonresident_pages: 0,
+            unknown_pages: 0,
+            skipped_pages: 0,
+            budget_excluded_pages: 0,
+            unsampled_pages: 0,
         }
     }
 }
@@ -449,6 +487,35 @@ fn merge_dispatch_ranges(
     (merged, merged_count)
 }
 
+#[derive(Clone, Copy, Default)]
+struct SourceStats {
+    referenced_pages: u64,
+    exclusive_pages: u64,
+    shared_pages: u64,
+    sampled_pages: u64,
+    fresh_pages: u64,
+    reused_pages: u64,
+    resident_pages: u64,
+    nonresident_pages: u64,
+    unknown_pages: u64,
+    skipped_pages: u64,
+    budget_excluded_pages: u64,
+    unsampled_pages: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObservedProvenance {
+    Fresh,
+    Reused,
+    None,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnobservedClass {
+    BudgetExcluded,
+    Unsampled,
+}
+
 struct DispatchBuffer {
     max_events: usize,
     next_event_sequence: u64,
@@ -458,6 +525,7 @@ struct DispatchBuffer {
     events: VecDeque<RawDispatchEvent>,
 }
 
+#[derive(Clone, Default)]
 struct CachedRange {
     mapping_id: u64,
     mapping_generation: u64,
@@ -465,6 +533,7 @@ struct CachedRange {
     page_end: u64,
     last_event_sequence: u64,
     sample: PageSample,
+    states: Vec<(u64, u8)>,
 }
 
 struct DispatchState {
@@ -480,6 +549,9 @@ struct DispatchState {
     cache_capacity: usize,
     cache_ttl_events: u64,
     cache: RefCell<Vec<CachedRange>>,
+    state_bytes: RefCell<Vec<u8>>,
+    state_offsets: RefCell<Vec<u64>>,
+    state_pairs: RefCell<Vec<(u64, u8)>>,
     cache_reuses: RefCell<u64>,
     cache_skips: RefCell<u64>,
     cache_evictions: RefCell<u64>,
@@ -513,6 +585,9 @@ impl DispatchState {
             cache_capacity: options.cache_capacity,
             cache_ttl_events: options.cache_ttl_events,
             cache: RefCell::new(Vec::with_capacity(options.cache_capacity)),
+            state_bytes: RefCell::new(Vec::new()),
+            state_offsets: RefCell::new(Vec::new()),
+            state_pairs: RefCell::new(Vec::new()),
             cache_reuses: RefCell::new(0),
             cache_skips: RefCell::new(0),
             cache_evictions: RefCell::new(0),
@@ -578,6 +653,7 @@ impl DispatchState {
                                 mapping.mapping_generation.unwrap_or(0);
                             event.sources[source_index].page_start = mapping.page_start;
                             event.sources[source_index].page_end = mapping.page_end;
+                            event.sources[source_index].page_size = mapping.page_size;
                             if mapping.file_backed
                                 && mapping.page_size > 0
                                 && mapping.page_end > mapping.page_start
@@ -618,6 +694,16 @@ impl DispatchState {
             ..PageSample::default()
         };
         let sampling_enabled = self.sample_pages > 0 && self.sample_budget > 0;
+        let stored_sources = event.source_count as usize;
+        let mut source_stats = [SourceStats::default(); MAX_DISPATCH_SOURCES];
+        for (index, source) in event.sources.iter().take(stored_sources).enumerate() {
+            source_stats[index].referenced_pages = source.requested_pages;
+            if source.requested_pages > 0 {
+                let shared = source_shared_pages(&event.sources[..stored_sources], index);
+                source_stats[index].shared_pages = shared;
+                source_stats[index].exclusive_pages = source.requested_pages.saturating_sub(shared);
+            }
+        }
         if sampling_enabled && !self.model.is_null() {
             let Ok(mut execution_budget) = self.execution_budget.try_borrow_mut() else {
                 return;
@@ -626,11 +712,7 @@ impl DispatchState {
             for range in merged.iter().take(merged_count) {
                 let pages =
                     range.page_end.saturating_sub(range.page_start) / range.page_size.max(1);
-                if pages == 0 || budget == 0 {
-                    continue;
-                }
-                let max_pages = pages.min(self.sample_pages).min(budget);
-                if max_pages == 0 {
+                if pages == 0 {
                     continue;
                 }
                 let cached = self.cached_range(range, buffer.next_event_sequence);
@@ -638,36 +720,80 @@ impl DispatchState {
                     if let Ok(mut skips) = self.cache_skips.try_borrow_mut() {
                         *skips = skips.saturating_add(1);
                     }
+                    add_skipped_attribution(
+                        range,
+                        &event.sources[..stored_sources],
+                        &mut source_stats,
+                        &mut aggregate,
+                    );
                     continue;
                 }
                 if self.strategy == NodeSamplingStrategy::Adaptive {
-                    if let Some(cached_sample) = cached {
-                        let mut sample = cached_sample;
+                    if let Some(cached) = cached {
+                        let mut sample = cached.sample;
                         sample.reused_pages = sample.sampled_pages;
                         sample.fresh_sampled_pages = 0;
                         sample.sampled_at_sequence = buffer.next_event_sequence;
                         if let Ok(mut reuses) = self.cache_reuses.try_borrow_mut() {
                             *reuses = reuses.saturating_add(1);
                         }
-                        aggregate.sampled_pages =
-                            aggregate.sampled_pages.saturating_add(sample.sampled_pages);
-                        aggregate.fresh_sampled_pages =
-                            aggregate.fresh_sampled_pages.saturating_add(0);
-                        aggregate.reused_pages =
-                            aggregate.reused_pages.saturating_add(sample.reused_pages);
-                        aggregate.resident_pages = aggregate
-                            .resident_pages
-                            .saturating_add(sample.resident_pages);
-                        aggregate.nonresident_pages = aggregate
-                            .nonresident_pages
-                            .saturating_add(sample.nonresident_pages);
-                        aggregate.unknown_pages =
-                            aggregate.unknown_pages.saturating_add(sample.unknown_pages);
+                        add_range_attribution(
+                            range,
+                            &event.sources[..stored_sources],
+                            &mut source_stats,
+                            &cached.states,
+                            ObservedProvenance::Reused,
+                            UnobservedClass::Unsampled,
+                            &mut aggregate,
+                        );
                         copy_aggregate_mapping(&mut aggregate, &sample);
                         continue;
                     }
                 }
-                let mut sample = forge_sys::llama_page_sample_result::default();
+                if budget == 0 {
+                    add_range_attribution(
+                        range,
+                        &event.sources[..stored_sources],
+                        &mut source_stats,
+                        &[],
+                        ObservedProvenance::None,
+                        UnobservedClass::BudgetExcluded,
+                        &mut aggregate,
+                    );
+                    continue;
+                }
+                let max_pages = pages.min(self.sample_pages).min(budget);
+                if max_pages == 0 {
+                    add_range_attribution(
+                        range,
+                        &event.sources[..stored_sources],
+                        &mut source_stats,
+                        &[],
+                        ObservedProvenance::None,
+                        UnobservedClass::Unsampled,
+                        &mut aggregate,
+                    );
+                    continue;
+                }
+                let Ok(mut state_bytes) = self.state_bytes.try_borrow_mut() else {
+                    continue;
+                };
+                let Ok(mut state_offsets) = self.state_offsets.try_borrow_mut() else {
+                    continue;
+                };
+                let Ok(mut state_pairs) = self.state_pairs.try_borrow_mut() else {
+                    continue;
+                };
+                let capacity = usize::try_from(max_pages).unwrap_or(0);
+                state_bytes.resize(capacity, 0);
+                state_offsets.resize(capacity, 0);
+                state_pairs.clear();
+                let mut sample = forge_sys::llama_page_sample_result {
+                    page_states: state_bytes.as_mut_ptr(),
+                    page_offsets: state_offsets.as_mut_ptr(),
+                    state_capacity: max_pages,
+                    ..forge_sys::llama_page_sample_result::default()
+                };
                 let rc = unsafe {
                     forge_sys::llama_model_sample_mapping_pages(
                         self.model,
@@ -683,46 +809,89 @@ impl DispatchState {
                         &mut sample,
                     )
                 };
+                let written = usize::try_from(sample.states_written)
+                    .unwrap_or(0)
+                    .min(capacity);
+                state_pairs
+                    .extend((0..written).map(|index| (state_offsets[index], state_bytes[index])));
                 let sampled = page_sample_from_raw(rc, sample);
-                let sampled_pages = sampled.sampled_pages;
-                aggregate.sampled_pages = aggregate.sampled_pages.saturating_add(sampled_pages);
-                aggregate.fresh_sampled_pages =
-                    aggregate.fresh_sampled_pages.saturating_add(sampled_pages);
-                aggregate.resident_pages = aggregate
-                    .resident_pages
-                    .saturating_add(sampled.resident_pages);
-                aggregate.nonresident_pages = aggregate
-                    .nonresident_pages
-                    .saturating_add(sampled.nonresident_pages);
-                aggregate.unknown_pages = aggregate
-                    .unknown_pages
-                    .saturating_add(sampled.unknown_pages);
+                debug_assert_eq!(
+                    state_pairs.len() as u64,
+                    sampled.sampled_pages,
+                    "native page states must cover every sampled page"
+                );
+                let budget_after = budget.saturating_sub(sampled.sampled_pages);
+                let unobserved_class = if budget_after == 0 && sampled.sampled_pages < pages {
+                    UnobservedClass::BudgetExcluded
+                } else {
+                    UnobservedClass::Unsampled
+                };
+                add_range_attribution(
+                    range,
+                    &event.sources[..stored_sources],
+                    &mut source_stats,
+                    &state_pairs,
+                    ObservedProvenance::Fresh,
+                    unobserved_class,
+                    &mut aggregate,
+                );
                 copy_aggregate_mapping(&mut aggregate, &sampled);
                 aggregate.truncated |= sampled.truncated;
                 if sampled.error != 0 {
                     aggregate.error = sampled.error;
                 }
-                budget = budget.saturating_sub(sampled_pages);
+                budget = budget_after;
                 *execution_budget = budget;
-                if sampled.status == PageSampleStatus::Complete {
-                    self.cache_range(range, buffer.next_event_sequence, sampled);
+                if sampled.status == PageSampleStatus::Complete && state_pairs.len() as u64 == pages
+                {
+                    self.cache_range(
+                        range,
+                        buffer.next_event_sequence,
+                        sampled,
+                        state_pairs.clone(),
+                    );
                 }
             }
         }
+        for (index, source) in event.sources.iter_mut().take(stored_sources).enumerate() {
+            let stats = &mut source_stats[index];
+            stats.unsampled_pages = stats
+                .referenced_pages
+                .saturating_sub(stats.sampled_pages)
+                .saturating_sub(stats.skipped_pages)
+                .saturating_sub(stats.budget_excluded_pages);
+            source.exclusive_pages = stats.exclusive_pages;
+            source.shared_pages = stats.shared_pages;
+            source.sampled_pages = stats.sampled_pages;
+            source.fresh_pages = stats.fresh_pages;
+            source.reused_pages = stats.reused_pages;
+            source.resident_pages = stats.resident_pages;
+            source.nonresident_pages = stats.nonresident_pages;
+            source.unknown_pages = stats.unknown_pages;
+            source.skipped_pages = stats.skipped_pages;
+            source.budget_excluded_pages = stats.budget_excluded_pages;
+            source.unsampled_pages = stats.unsampled_pages;
+        }
+        aggregate.unsampled_pages = aggregate
+            .requested_pages
+            .saturating_sub(aggregate.sampled_pages)
+            .saturating_sub(aggregate.skipped_pages)
+            .saturating_sub(aggregate.budget_excluded_pages);
         aggregate.status = if !sampling_enabled || aggregate.sampled_pages == 0 {
             PageSampleStatus::Unknown
         } else if aggregate.sampled_pages < aggregate.requested_pages
             || aggregate.unknown_pages > 0
+            || aggregate.skipped_pages > 0
+            || aggregate.budget_excluded_pages > 0
             || aggregate.truncated
         {
             PageSampleStatus::Partial
         } else {
             PageSampleStatus::Complete
         };
-        aggregate.unsampled_pages = aggregate
-            .requested_pages
-            .saturating_sub(aggregate.sampled_pages);
-        aggregate.truncated |= aggregate.sampled_pages < aggregate.requested_pages;
+        aggregate.truncated |= aggregate.sampled_pages < aggregate.requested_pages
+            || aggregate.skipped_pages > 0
+            || aggregate.budget_excluded_pages > 0;
         if sampling_enabled {
             event.dispatch_sample = aggregate;
         }
@@ -735,7 +904,7 @@ impl DispatchState {
         buffer.events.push_back(event);
     }
 
-    fn cached_range(&self, range: &DispatchRange, sequence: u64) -> Option<PageSample> {
+    fn cached_range(&self, range: &DispatchRange, sequence: u64) -> Option<CachedRange> {
         if !matches!(
             self.strategy,
             NodeSamplingStrategy::Targeted | NodeSamplingStrategy::Adaptive
@@ -750,12 +919,19 @@ impl DispatchState {
                 && entry.page_start == range.page_start
                 && entry.page_end == range.page_end
                 && sequence.saturating_sub(entry.last_event_sequence) <= self.cache_ttl_events
-                && entry.sample.status == PageSampleStatus::Complete)
-                .then_some(entry.sample)
+                && entry.sample.status == PageSampleStatus::Complete
+                && entry.states.len() as u64 == entry.sample.requested_pages)
+                .then(|| entry.clone())
         })
     }
 
-    fn cache_range(&self, range: &DispatchRange, sequence: u64, sample: PageSample) {
+    fn cache_range(
+        &self,
+        range: &DispatchRange,
+        sequence: u64,
+        sample: PageSample,
+        states: Vec<(u64, u8)>,
+    ) {
         if self.cache_capacity == 0 || self.strategy == NodeSamplingStrategy::Systematic {
             return;
         }
@@ -770,6 +946,7 @@ impl DispatchState {
         }) {
             entry.last_event_sequence = sequence;
             entry.sample = sample;
+            entry.states = states;
             return;
         }
         if cache.len() >= self.cache_capacity {
@@ -792,6 +969,7 @@ impl DispatchState {
             page_end: range.page_end,
             last_event_sequence: sequence,
             sample,
+            states,
         });
     }
 
@@ -871,6 +1049,181 @@ fn text_from_raw(bytes: &[u8], len: u16) -> Option<String> {
     (len > 0).then(|| String::from_utf8_lossy(&bytes[..len]).into_owned())
 }
 
+fn source_shared_pages(sources: &[RawDispatchSource], index: usize) -> u64 {
+    let source = &sources[index];
+    if source.requested_pages == 0 || source.page_size == 0 {
+        return 0;
+    }
+    let mut intervals = [(0u64, 0u64); MAX_DISPATCH_SOURCES];
+    let mut count = 0usize;
+    for (other_index, other) in sources.iter().enumerate() {
+        if other_index == index
+            || other.mapping_id != source.mapping_id
+            || other.mapping_generation != source.mapping_generation
+            || other.page_size != source.page_size
+            || other.requested_pages == 0
+        {
+            continue;
+        }
+        let start = source.page_start.max(other.page_start);
+        let end = source.page_end.min(other.page_end);
+        if start < end {
+            intervals[count] = (start, end);
+            count += 1;
+        }
+    }
+    intervals[..count].sort_unstable_by_key(|interval| interval.0);
+    let mut merged = [(0u64, 0u64); MAX_DISPATCH_SOURCES];
+    let mut merged_count = 0usize;
+    for &(start, end) in intervals.iter().take(count) {
+        if merged_count > 0 && start <= merged[merged_count - 1].1 {
+            merged[merged_count - 1].1 = merged[merged_count - 1].1.max(end);
+        } else {
+            merged[merged_count] = (start, end);
+            merged_count += 1;
+        }
+    }
+    merged
+        .iter()
+        .take(merged_count)
+        .map(|(start, end)| (end - start) / source.page_size)
+        .fold(0u64, u64::saturating_add)
+}
+
+fn add_range_attribution(
+    range: &DispatchRange,
+    sources: &[RawDispatchSource],
+    stats: &mut [SourceStats; MAX_DISPATCH_SOURCES],
+    states: &[(u64, u8)],
+    provenance: ObservedProvenance,
+    unobserved_class: UnobservedClass,
+    global: &mut PageSample,
+) {
+    let range_pages = range.page_end.saturating_sub(range.page_start) / range.page_size.max(1);
+    let observed = u64::try_from(states.len())
+        .unwrap_or(u64::MAX)
+        .min(range_pages);
+    global.sampled_pages = global.sampled_pages.saturating_add(observed);
+    match provenance {
+        ObservedProvenance::Fresh => {
+            global.fresh_sampled_pages = global.fresh_sampled_pages.saturating_add(observed);
+        }
+        ObservedProvenance::Reused => {
+            global.reused_pages = global.reused_pages.saturating_add(observed);
+        }
+        ObservedProvenance::None => {}
+    }
+    for &(_, state) in states {
+        match state {
+            1 => global.resident_pages = global.resident_pages.saturating_add(1),
+            0 => global.nonresident_pages = global.nonresident_pages.saturating_add(1),
+            _ => global.unknown_pages = global.unknown_pages.saturating_add(1),
+        }
+    }
+    let unobserved = range_pages.saturating_sub(observed);
+    match unobserved_class {
+        UnobservedClass::BudgetExcluded => {
+            global.budget_excluded_pages = global.budget_excluded_pages.saturating_add(unobserved);
+        }
+        UnobservedClass::Unsampled => {
+            global.unsampled_pages = global.unsampled_pages.saturating_add(unobserved);
+        }
+    }
+    for (source_index, source) in sources.iter().enumerate() {
+        if source.requested_pages == 0
+            || source.mapping_id != range.mapping_id
+            || source.mapping_generation != range.mapping_generation
+            || source.page_size != range.page_size
+        {
+            continue;
+        }
+        let start = range.page_start.max(source.page_start);
+        let end = range.page_end.min(source.page_end);
+        if start >= end {
+            continue;
+        }
+        let source_pages = (end - start) / source.page_size.max(1);
+        let mut source_observed = 0u64;
+        for &(offset, state) in states {
+            if offset < start || offset >= end {
+                continue;
+            }
+            source_observed = source_observed.saturating_add(1);
+            match state {
+                1 => {
+                    stats[source_index].resident_pages =
+                        stats[source_index].resident_pages.saturating_add(1)
+                }
+                0 => {
+                    stats[source_index].nonresident_pages =
+                        stats[source_index].nonresident_pages.saturating_add(1)
+                }
+                _ => {
+                    stats[source_index].unknown_pages =
+                        stats[source_index].unknown_pages.saturating_add(1)
+                }
+            }
+        }
+        let source_observed = source_observed.min(source_pages);
+        stats[source_index].sampled_pages = stats[source_index]
+            .sampled_pages
+            .saturating_add(source_observed);
+        match provenance {
+            ObservedProvenance::Fresh => {
+                stats[source_index].fresh_pages = stats[source_index]
+                    .fresh_pages
+                    .saturating_add(source_observed);
+            }
+            ObservedProvenance::Reused => {
+                stats[source_index].reused_pages = stats[source_index]
+                    .reused_pages
+                    .saturating_add(source_observed);
+            }
+            ObservedProvenance::None => {}
+        }
+        let source_unobserved = source_pages.saturating_sub(source_observed);
+        match unobserved_class {
+            UnobservedClass::BudgetExcluded => {
+                stats[source_index].budget_excluded_pages = stats[source_index]
+                    .budget_excluded_pages
+                    .saturating_add(source_unobserved);
+            }
+            UnobservedClass::Unsampled => {
+                stats[source_index].unsampled_pages = stats[source_index]
+                    .unsampled_pages
+                    .saturating_add(source_unobserved);
+            }
+        }
+    }
+}
+
+fn add_skipped_attribution(
+    range: &DispatchRange,
+    sources: &[RawDispatchSource],
+    stats: &mut [SourceStats; MAX_DISPATCH_SOURCES],
+    global: &mut PageSample,
+) {
+    let pages = range.page_end.saturating_sub(range.page_start) / range.page_size.max(1);
+    global.skipped_pages = global.skipped_pages.saturating_add(pages);
+    for (source_index, source) in sources.iter().enumerate() {
+        if source.requested_pages == 0
+            || source.mapping_id != range.mapping_id
+            || source.mapping_generation != range.mapping_generation
+            || source.page_size != range.page_size
+        {
+            continue;
+        }
+        let start = range.page_start.max(source.page_start);
+        let end = range.page_end.min(source.page_end);
+        if start >= end {
+            continue;
+        }
+        stats[source_index].skipped_pages = stats[source_index]
+            .skipped_pages
+            .saturating_add((end - start) / source.page_size.max(1));
+    }
+}
+
 fn copy_aggregate_mapping(aggregate: &mut PageSample, sample: &PageSample) {
     if aggregate.mapping_size == 0 {
         aggregate.mapping_id = sample.mapping_id;
@@ -901,6 +1254,8 @@ fn page_sample_from_raw(rc: i32, raw: forge_sys::llama_page_sample_result) -> Pa
         requested_pages: raw.requested_pages,
         sampled_pages: raw.sampled_pages,
         unsampled_pages: raw.requested_pages.saturating_sub(raw.sampled_pages),
+        skipped_pages: 0,
+        budget_excluded_pages: 0,
         fresh_sampled_pages: raw.sampled_pages,
         reused_pages: 0,
         resident_pages: raw.resident_pages,
@@ -937,6 +1292,17 @@ fn raw_to_event(raw: &RawDispatchEvent) -> NodeDispatchEvent {
                 page_start: (source.requested_pages > 0).then_some(source.page_start),
                 page_end: (source.requested_pages > 0).then_some(source.page_end),
                 requested_pages: source.requested_pages,
+                exclusive_pages: source.exclusive_pages,
+                shared_pages: source.shared_pages,
+                sampled_pages: source.sampled_pages,
+                fresh_pages: source.fresh_pages,
+                reused_pages: source.reused_pages,
+                resident_pages: source.resident_pages,
+                nonresident_pages: source.nonresident_pages,
+                unknown_pages: source.unknown_pages,
+                skipped_pages: source.skipped_pages,
+                budget_excluded_pages: source.budget_excluded_pages,
+                unsampled_pages: source.unsampled_pages,
                 sample: None,
             });
         }
@@ -2183,5 +2549,174 @@ mod dispatch_range_tests {
         assert_eq!(count, 0);
         let (_, count) = merge(&[DispatchRange::default()]);
         assert_eq!(count, 0);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_attribution_tests {
+    use super::*;
+
+    fn source(
+        mapping: u64,
+        generation: u64,
+        start: u64,
+        end: u64,
+        page_size: u64,
+    ) -> RawDispatchSource {
+        RawDispatchSource {
+            mapping_id: mapping,
+            mapping_generation: generation,
+            page_start: start,
+            page_end: end,
+            page_size,
+            requested_pages: end.saturating_sub(start) / page_size,
+            ..RawDispatchSource::default()
+        }
+    }
+
+    fn range(start: u64, end: u64, page_size: u64) -> DispatchRange {
+        DispatchRange {
+            mapping_id: 1,
+            mapping_generation: 1,
+            page_start: start,
+            page_end: end,
+            page_size,
+        }
+    }
+
+    #[test]
+    fn shared_page_count_merges_overlaps_without_double_counting() {
+        let page = 4096;
+        let sources = [
+            source(1, 1, 0, 4 * page, page),
+            source(1, 1, 0, 4 * page, page),
+            source(1, 1, 2 * page, 6 * page, page),
+        ];
+        assert_eq!(source_shared_pages(&sources[..3], 0), 4);
+        assert_eq!(source_shared_pages(&sources[..3], 1), 4);
+        assert_eq!(source_shared_pages(&sources[..3], 2), 2);
+    }
+
+    #[test]
+    fn shared_page_count_is_mapping_and_generation_aware() {
+        let page = 4096;
+        let sources = [
+            source(1, 1, 0, 4 * page, page),
+            source(2, 1, 0, 4 * page, page),
+            source(1, 2, 0, 4 * page, page),
+        ];
+        assert_eq!(source_shared_pages(&sources, 0), 0);
+        assert_eq!(source_shared_pages(&sources, 1), 0);
+        assert_eq!(source_shared_pages(&sources, 2), 0);
+    }
+
+    #[test]
+    fn attribution_counts_each_shared_page_once_globally() {
+        let page = 4096;
+        let sources = [
+            source(1, 1, 0, 4 * page, page),
+            source(1, 1, 0, 2 * page, page),
+        ];
+        let mut stats = [SourceStats::default(); MAX_DISPATCH_SOURCES];
+        stats[0].referenced_pages = 4;
+        stats[0].shared_pages = 2;
+        stats[0].exclusive_pages = 2;
+        stats[1].referenced_pages = 2;
+        stats[1].shared_pages = 2;
+        stats[1].exclusive_pages = 0;
+        let mut global = PageSample {
+            requested_pages: 4,
+            ..PageSample::default()
+        };
+        let states = [(0, 1), (page, 1), (2 * page, 0), (3 * page, 0)];
+        add_range_attribution(
+            &range(0, 4 * page, page),
+            &sources,
+            &mut stats,
+            &states,
+            ObservedProvenance::Fresh,
+            UnobservedClass::Unsampled,
+            &mut global,
+        );
+        assert_eq!(global.sampled_pages, 4);
+        assert_eq!(global.fresh_sampled_pages, 4);
+        assert_eq!(global.resident_pages, 2);
+        assert_eq!(global.nonresident_pages, 2);
+        assert_eq!(global.unknown_pages, 0);
+        assert_eq!(global.unsampled_pages, 0);
+        assert_eq!(stats[0].sampled_pages, 4);
+        assert_eq!(stats[0].resident_pages, 2);
+        assert_eq!(stats[0].nonresident_pages, 2);
+        assert_eq!(stats[1].sampled_pages, 2);
+        assert_eq!(stats[1].resident_pages, 2);
+        assert_eq!(stats[1].nonresident_pages, 0);
+    }
+
+    #[test]
+    fn attribution_keeps_budget_skip_and_unknown_distinct() {
+        let page = 4096;
+        let sources = [source(1, 1, 0, 4 * page, page)];
+        let mut stats = [SourceStats::default(); MAX_DISPATCH_SOURCES];
+        stats[0].referenced_pages = 4;
+        let mut global = PageSample {
+            requested_pages: 4,
+            ..PageSample::default()
+        };
+        let states = [(0, 1), (page, 2)];
+        add_range_attribution(
+            &range(0, 4 * page, page),
+            &sources,
+            &mut stats,
+            &states,
+            ObservedProvenance::Reused,
+            UnobservedClass::Unsampled,
+            &mut global,
+        );
+        assert_eq!(global.sampled_pages, 2);
+        assert_eq!(global.reused_pages, 2);
+        assert_eq!(global.resident_pages, 1);
+        assert_eq!(global.unknown_pages, 1);
+        assert_eq!(global.unsampled_pages, 2);
+        assert_eq!(global.budget_excluded_pages, 0);
+
+        let mut budget_global = PageSample {
+            requested_pages: 4,
+            ..PageSample::default()
+        };
+        let mut budget_stats = [SourceStats::default(); MAX_DISPATCH_SOURCES];
+        budget_stats[0].referenced_pages = 4;
+        add_range_attribution(
+            &range(0, 4 * page, page),
+            &sources,
+            &mut budget_stats,
+            &[],
+            ObservedProvenance::None,
+            UnobservedClass::BudgetExcluded,
+            &mut budget_global,
+        );
+        assert_eq!(budget_global.budget_excluded_pages, 4);
+        assert_eq!(budget_global.unsampled_pages, 0);
+        assert_eq!(budget_global.unknown_pages, 0);
+        assert_eq!(budget_stats[0].budget_excluded_pages, 4);
+    }
+
+    #[test]
+    fn skipped_attribution_preserves_shared_sources() {
+        let page = 4096;
+        let sources = [
+            source(1, 1, 0, 4 * page, page),
+            source(1, 1, 0, 2 * page, page),
+        ];
+        let mut stats = [SourceStats::default(); MAX_DISPATCH_SOURCES];
+        stats[0].referenced_pages = 4;
+        stats[1].referenced_pages = 2;
+        let mut global = PageSample {
+            requested_pages: 4,
+            ..PageSample::default()
+        };
+        add_skipped_attribution(&range(0, 4 * page, page), &sources, &mut stats, &mut global);
+        assert_eq!(global.skipped_pages, 4);
+        assert_eq!(stats[0].skipped_pages, 4);
+        assert_eq!(stats[1].skipped_pages, 2);
     }
 }

@@ -301,6 +301,10 @@ pub struct llama_page_sample_result {
     pub tensor_size: u64,
     pub page_start: u64,
     pub page_end: u64,
+    pub page_states: *mut u8,
+    pub page_offsets: *mut u64,
+    pub state_capacity: u64,
+    pub states_written: u64,
     pub truncated: u32,
     pub error: u32,
 }
@@ -1083,7 +1087,15 @@ mod layout_tests {
         assert_eq!(offset_of!(llama_tensor_mapping, mapping_generation), 72);
         assert_eq!(offset_of!(llama_tensor_mapping, file_path), 80);
         assert_eq!(offset_of!(llama_tensor_mapping, file_size), 88);
-        assert_eq!(size_of::<llama_page_sample_result>(), 120);
+        assert_eq!(size_of::<llama_page_sample_result>(), 152);
+        assert_eq!(offset_of!(llama_page_sample_result, page_start), 96);
+        assert_eq!(offset_of!(llama_page_sample_result, page_end), 104);
+        assert_eq!(offset_of!(llama_page_sample_result, page_states), 112);
+        assert_eq!(offset_of!(llama_page_sample_result, page_offsets), 120);
+        assert_eq!(offset_of!(llama_page_sample_result, state_capacity), 128);
+        assert_eq!(offset_of!(llama_page_sample_result, states_written), 136);
+        assert_eq!(offset_of!(llama_page_sample_result, truncated), 144);
+        assert_eq!(offset_of!(llama_page_sample_result, error), 148);
         assert_eq!(size_of::<llama_model_page_release_result>(), 32);
         assert_eq!(size_of::<llama_model_lifetime_state>(), 32);
         assert_eq!(offset_of!(llama_model_lifetime_state, instance_id), 0);
