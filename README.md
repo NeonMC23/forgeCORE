@@ -165,7 +165,9 @@ cache or applies memory pressure. A transition is claimed only when the
 observations actually show all pages becoming nonresident.
 
 See [`docs/RESIDENCY_VALIDATION.md`](docs/RESIDENCY_VALIDATION.md) for the
-method, storage caveats, and verified behavior.
+method, storage caveats, and verified behavior, and
+[`docs/MAPPING_LIFECYCLE.md`](docs/MAPPING_LIFECYCLE.md) for mapping identity
+and invalidation assumptions.
 
 ## Docs
 

@@ -202,3 +202,71 @@ fn tensor_page_sample_is_bounded_and_file_backed() {
         forge_core::PageSampleStatus::Complete | forge_core::PageSampleStatus::Partial
     ));
 }
+
+#[test]
+fn mapping_identity_is_stable_within_a_model_and_changes_across_instances() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load_with_options(&path, &options()).expect("first model");
+    let first = model.tensor_mappings().expect("first mappings");
+    let first_file_backed: Vec<_> = first.iter().filter(|mapping| mapping.file_backed).collect();
+    assert!(!first_file_backed.is_empty());
+
+    let generation = first_file_backed[0]
+        .mapping_generation
+        .expect("mapping generation");
+    assert!(generation != 0);
+    assert!(first_file_backed
+        .iter()
+        .all(|mapping| mapping.mapping_generation == Some(generation)));
+    let identities: Vec<_> = first_file_backed
+        .iter()
+        .map(|mapping| {
+            (
+                mapping.name.clone(),
+                mapping.mapping_id,
+                mapping.page_start,
+                mapping.page_end,
+            )
+        })
+        .collect();
+
+    // Opening and dropping contexts must not change model mapping identity.
+    for _ in 0..2 {
+        let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
+        context.decode(&tiny_batch()).expect("decode");
+    }
+    let second = model.tensor_mappings().expect("second mappings");
+    assert_eq!(first, second);
+
+    // A separately loaded model gets a distinct instance generation even
+    // though the local mapping indices are reused.
+    let other = Model::load_with_options(&path, &options()).expect("second model");
+    let third = other.tensor_mappings().expect("third mappings");
+    let third_file_backed: Vec<_> = third.iter().filter(|mapping| mapping.file_backed).collect();
+    assert!(!third_file_backed.is_empty());
+    let other_generation = third_file_backed[0]
+        .mapping_generation
+        .expect("other generation");
+    assert_ne!(generation, other_generation);
+
+    // Re-reading the first model's metadata after another model has loaded
+    // still yields the original generation and ranges.
+    let fourth = model.tensor_mappings().expect("fourth mappings");
+    assert_eq!(first, fourth);
+    assert_eq!(
+        identities,
+        fourth
+            .iter()
+            .filter(|mapping| mapping.file_backed)
+            .map(|mapping| (
+                mapping.name.clone(),
+                mapping.mapping_id,
+                mapping.page_start,
+                mapping.page_end
+            ))
+            .collect::<Vec<_>>()
+    );
+}
