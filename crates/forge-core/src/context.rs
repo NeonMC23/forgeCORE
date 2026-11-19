@@ -34,10 +34,10 @@ use crate::batch::{Batch, SeqId};
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::memory::{Memory, SeqState, State};
-use crate::model::{Model, ModelInner, PageSample, PageSampleStatus};
+use crate::model::{Model, ModelInner, PageSample, PageSampleStatus, TensorMappingInfo};
 use crate::residency::ContextLifetimeState;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::rc::Rc;
@@ -219,19 +219,40 @@ pub struct TraceSummary {
 /// Maximum number of CPU node-dispatch events retained in one context.
 pub const MAX_NODE_DISPATCH_EVENTS: usize = 65_536;
 pub const MAX_NODE_DISPATCH_SAMPLE_PAGES: u64 = 4096;
+pub const MAX_NODE_DISPATCH_CACHE: usize = 65_536;
 const NODE_NAME_CAPACITY: usize = 128;
 const OP_NAME_CAPACITY: usize = 64;
 const SOURCE_NAME_CAPACITY: usize = 128;
 const MAX_DISPATCH_SOURCES: usize = 8;
+
+/// Deterministic pre-dispatch sampling strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NodeSamplingStrategy {
+    /// Sample ranges in mapping/page order without adaptive reuse.
+    Systematic,
+    /// Prioritize ranges without a valid cached observation.
+    #[default]
+    Targeted,
+    /// Reuse fresh complete range observations and sample stale/missing ranges.
+    Adaptive,
+}
 
 /// Opt-in CPU node-dispatch observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeDispatchOptions {
     /// Maximum retained events. Must be in `1..=MAX_NODE_DISPATCH_EVENTS`.
     pub max_events: usize,
-    /// Maximum pages sampled per declared source tensor. Zero disables
+    /// Maximum pages sampled per merged dispatch range. Zero disables
     /// pre-dispatch residency sampling.
     pub sample_pages: u64,
+    /// Maximum unique pages sampled per dispatch. Zero disables sampling.
+    pub sample_budget: u64,
+    pub strategy: NodeSamplingStrategy,
+    /// Maximum cached range observations retained by the context.
+    pub cache_capacity: usize,
+    /// Number of event sequences for which a complete cached range is fresh.
+    /// Zero disables cache reuse.
+    pub cache_ttl_events: u64,
 }
 
 impl Default for NodeDispatchOptions {
@@ -239,6 +260,10 @@ impl Default for NodeDispatchOptions {
         Self {
             max_events: 4096,
             sample_pages: 0,
+            sample_budget: 0,
+            strategy: NodeSamplingStrategy::Targeted,
+            cache_capacity: 1024,
+            cache_ttl_events: 1024,
         }
     }
 }
@@ -272,12 +297,22 @@ pub struct NodeDispatchEvent {
     pub source_names: Vec<String>,
     /// Bounded per-source residency observations made before dispatch.
     pub source_samples: Vec<NodeDispatchSource>,
+    pub source_references: usize,
     pub sources_truncated: bool,
+    /// Deduplicated page observation for the whole dispatch.
+    pub dispatch_sample: Option<PageSample>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDispatchSource {
     pub name: String,
+    pub mapping_id: Option<u64>,
+    pub mapping_generation: Option<u64>,
+    pub page_start: Option<u64>,
+    pub page_end: Option<u64>,
+    pub requested_pages: u64,
+    /// Nothing for a source with no validated mapping; aggregate residency is
+    /// reported once at the dispatch level.
     pub sample: Option<PageSample>,
 }
 
@@ -288,6 +323,10 @@ pub struct NodeDispatchSummary {
     pub dropped_events: u64,
     pub retained_events: usize,
     pub max_events: usize,
+    pub cache_reuses: u64,
+    pub cache_evictions: u64,
+    pub budget_total: u64,
+    pub budget_remaining: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -295,7 +334,11 @@ struct RawDispatchSource {
     name: [u8; SOURCE_NAME_CAPACITY],
     len: u16,
     truncated: bool,
-    sample: PageSample,
+    mapping_id: u64,
+    mapping_generation: u64,
+    page_start: u64,
+    page_end: u64,
+    requested_pages: u64,
 }
 
 impl Default for RawDispatchSource {
@@ -304,7 +347,11 @@ impl Default for RawDispatchSource {
             name: [0; SOURCE_NAME_CAPACITY],
             len: 0,
             truncated: false,
-            sample: PageSample::default(),
+            mapping_id: 0,
+            mapping_generation: 0,
+            page_start: 0,
+            page_end: 0,
+            requested_pages: 0,
         }
     }
 }
@@ -326,7 +373,9 @@ struct RawDispatchEvent {
     op_name_truncated: bool,
     sources: [RawDispatchSource; MAX_DISPATCH_SOURCES],
     source_count: u8,
+    source_references: u16,
     sources_truncated: bool,
+    dispatch_sample: PageSample,
 }
 
 impl Default for RawDispatchEvent {
@@ -347,9 +396,54 @@ impl Default for RawDispatchEvent {
             op_name_truncated: false,
             sources: [RawDispatchSource::default(); MAX_DISPATCH_SOURCES],
             source_count: 0,
+            source_references: 0,
             sources_truncated: false,
+            dispatch_sample: PageSample::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct DispatchRange {
+    mapping_id: u64,
+    mapping_generation: u64,
+    page_start: u64,
+    page_end: u64,
+    page_size: u64,
+}
+
+fn merge_dispatch_ranges(
+    mut ranges: [DispatchRange; MAX_DISPATCH_SOURCES],
+    count: usize,
+) -> ([DispatchRange; MAX_DISPATCH_SOURCES], usize) {
+    ranges[..count].sort_unstable_by_key(|range| {
+        (
+            range.mapping_id,
+            range.mapping_generation,
+            range.page_start,
+            range.page_end,
+        )
+    });
+    let mut merged = [DispatchRange::default(); MAX_DISPATCH_SOURCES];
+    let mut merged_count = 0usize;
+    for range in ranges.iter().take(count) {
+        if *range == DispatchRange::default() {
+            continue;
+        }
+        if merged_count > 0 {
+            let previous = &mut merged[merged_count - 1];
+            if previous.mapping_id == range.mapping_id
+                && previous.mapping_generation == range.mapping_generation
+                && range.page_start <= previous.page_end
+            {
+                previous.page_end = previous.page_end.max(range.page_end);
+                continue;
+            }
+        }
+        merged[merged_count] = *range;
+        merged_count += 1;
+    }
+    (merged, merged_count)
 }
 
 struct DispatchBuffer {
@@ -361,12 +455,30 @@ struct DispatchBuffer {
     events: VecDeque<RawDispatchEvent>,
 }
 
+struct CachedRange {
+    mapping_id: u64,
+    mapping_generation: u64,
+    page_start: u64,
+    page_end: u64,
+    last_event_sequence: u64,
+    sample: PageSample,
+}
+
 struct DispatchState {
     buffer: RefCell<DispatchBuffer>,
     model_instance_id: u64,
     context_id: u64,
     model: *const forge_sys::llama_model,
+    mappings: BTreeMap<String, TensorMappingInfo>,
     sample_pages: u64,
+    sample_budget: u64,
+    execution_budget: RefCell<u64>,
+    strategy: NodeSamplingStrategy,
+    cache_capacity: usize,
+    cache_ttl_events: u64,
+    cache: RefCell<Vec<CachedRange>>,
+    cache_reuses: RefCell<u64>,
+    cache_evictions: RefCell<u64>,
 }
 
 impl DispatchState {
@@ -374,28 +486,40 @@ impl DispatchState {
         model_instance_id: u64,
         context_id: u64,
         model: *const forge_sys::llama_model,
-        sample_pages: u64,
-        max_events: usize,
+        mappings: BTreeMap<String, TensorMappingInfo>,
+        options: NodeDispatchOptions,
     ) -> Self {
         Self {
             buffer: RefCell::new(DispatchBuffer {
-                max_events,
+                max_events: options.max_events,
                 next_event_sequence: 0,
                 execution_sequence: 0,
                 total_events: 0,
                 dropped_events: 0,
-                events: VecDeque::with_capacity(max_events),
+                events: VecDeque::with_capacity(options.max_events),
             }),
             model_instance_id,
             context_id,
             model,
-            sample_pages,
+            mappings,
+            sample_pages: options.sample_pages,
+            sample_budget: options.sample_budget,
+            execution_budget: RefCell::new(options.sample_budget),
+            strategy: options.strategy,
+            cache_capacity: options.cache_capacity,
+            cache_ttl_events: options.cache_ttl_events,
+            cache: RefCell::new(Vec::with_capacity(options.cache_capacity)),
+            cache_reuses: RefCell::new(0),
+            cache_evictions: RefCell::new(0),
         }
     }
 
     fn begin_execution(&self) {
         if let Ok(mut buffer) = self.buffer.try_borrow_mut() {
             buffer.execution_sequence = buffer.execution_sequence.saturating_add(1);
+        }
+        if let Ok(mut budget) = self.execution_budget.try_borrow_mut() {
+            *budget = self.sample_budget;
         }
     }
 
@@ -413,6 +537,8 @@ impl DispatchState {
             n_threads: u32::try_from(threads).unwrap_or(0),
             ..RawDispatchEvent::default()
         };
+        let mut ranges = [DispatchRange::default(); MAX_DISPATCH_SOURCES];
+        let mut range_count = 0usize;
         if !node.is_null() {
             // SAFETY: the scheduler owns the node for this callback. All
             // pointers are copied immediately; no native pointer is retained.
@@ -428,35 +554,168 @@ impl DispatchState {
             let source_total = usize::try_from(source_count).unwrap_or(0);
             let stored = source_total.min(MAX_DISPATCH_SOURCES);
             event.source_count = stored as u8;
+            event.source_references = source_total.min(u16::MAX as usize) as u16;
             event.sources_truncated = source_total > stored;
             for source_index in 0..stored {
                 let index = i32::try_from(source_index).unwrap_or(0);
-                let (len, truncated) = unsafe {
-                    copy_c_name(
-                        forge_sys::llama_tensor_src_name(node, index),
-                        &mut event.sources[source_index].name,
-                    )
-                };
+                let name_pointer = unsafe { forge_sys::llama_tensor_src_name(node, index) };
+                let (len, truncated) =
+                    unsafe { copy_c_name(name_pointer, &mut event.sources[source_index].name) };
                 event.sources[source_index].len = len;
                 event.sources[source_index].truncated = truncated;
-                if self.sample_pages > 0 && !self.model.is_null() {
-                    let mut sample = forge_sys::llama_page_sample_result::default();
-                    let name_ptr = unsafe { forge_sys::llama_tensor_src_name(node, index) };
-                    if !name_ptr.is_null() {
-                        let rc = unsafe {
-                            forge_sys::llama_model_sample_tensor_pages(
-                                self.model,
-                                name_ptr,
-                                self.model_instance_id,
-                                self.sample_pages,
-                                &mut sample,
-                            )
-                        };
-                        event.sources[source_index].sample = page_sample_from_raw(rc, sample);
+                if !name_pointer.is_null() {
+                    // SAFETY: native name is NUL-terminated for the callback.
+                    if let Ok(name) = unsafe { CStr::from_ptr(name_pointer) }.to_str() {
+                        if let Some(mapping) = self.mappings.get(name) {
+                            event.sources[source_index].mapping_id =
+                                mapping.mapping_id.unwrap_or(0);
+                            event.sources[source_index].mapping_generation =
+                                mapping.mapping_generation.unwrap_or(0);
+                            event.sources[source_index].page_start = mapping.page_start;
+                            event.sources[source_index].page_end = mapping.page_end;
+                            if mapping.file_backed
+                                && mapping.page_size > 0
+                                && mapping.page_end > mapping.page_start
+                            {
+                                event.sources[source_index].requested_pages =
+                                    (mapping.page_end - mapping.page_start) / mapping.page_size;
+                                if let Some(mapping_id) = mapping.mapping_id {
+                                    ranges[range_count] = DispatchRange {
+                                        mapping_id,
+                                        mapping_generation: mapping.mapping_generation.unwrap_or(0),
+                                        page_start: mapping.page_start,
+                                        page_end: mapping.page_end,
+                                        page_size: mapping.page_size,
+                                    };
+                                    range_count += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+        // Deterministic merge of overlapping page ranges within this dispatch.
+        let (merged, merged_count) = merge_dispatch_ranges(ranges, range_count);
+        let unique_pages = merged
+            .iter()
+            .take(merged_count)
+            .map(|range| range.page_end.saturating_sub(range.page_start) / range.page_size.max(1))
+            .fold(0u64, u64::saturating_add);
+        let mut aggregate = PageSample {
+            requested_pages: unique_pages,
+            page_size: self
+                .mappings
+                .values()
+                .find_map(|mapping| (mapping.page_size > 0).then_some(mapping.page_size))
+                .unwrap_or(0),
+            mapping_generation: self.model_instance_id,
+            ..PageSample::default()
+        };
+        let sampling_enabled = self.sample_pages > 0 && self.sample_budget > 0;
+        if sampling_enabled && !self.model.is_null() {
+            let Ok(mut execution_budget) = self.execution_budget.try_borrow_mut() else {
+                return;
+            };
+            let mut budget = *execution_budget;
+            for range in merged.iter().take(merged_count) {
+                let pages =
+                    range.page_end.saturating_sub(range.page_start) / range.page_size.max(1);
+                if pages == 0 || budget == 0 {
+                    continue;
+                }
+                let max_pages = pages.min(self.sample_pages).min(budget);
+                if max_pages == 0 {
+                    continue;
+                }
+                let cached = self.cached_range(range, buffer.next_event_sequence);
+                if self.strategy == NodeSamplingStrategy::Targeted && cached.is_some() {
+                    continue;
+                }
+                if self.strategy == NodeSamplingStrategy::Adaptive {
+                    if let Some(cached_sample) = cached {
+                        let mut sample = cached_sample;
+                        sample.reused_pages = sample.sampled_pages;
+                        sample.fresh_sampled_pages = 0;
+                        sample.sampled_at_sequence = buffer.next_event_sequence;
+                        if let Ok(mut reuses) = self.cache_reuses.try_borrow_mut() {
+                            *reuses = reuses.saturating_add(1);
+                        }
+                        aggregate.sampled_pages =
+                            aggregate.sampled_pages.saturating_add(sample.sampled_pages);
+                        aggregate.fresh_sampled_pages =
+                            aggregate.fresh_sampled_pages.saturating_add(0);
+                        aggregate.reused_pages =
+                            aggregate.reused_pages.saturating_add(sample.reused_pages);
+                        aggregate.resident_pages = aggregate
+                            .resident_pages
+                            .saturating_add(sample.resident_pages);
+                        aggregate.nonresident_pages = aggregate
+                            .nonresident_pages
+                            .saturating_add(sample.nonresident_pages);
+                        aggregate.unknown_pages =
+                            aggregate.unknown_pages.saturating_add(sample.unknown_pages);
+                        continue;
+                    }
+                }
+                let mut sample = forge_sys::llama_page_sample_result::default();
+                let rc = unsafe {
+                    forge_sys::llama_model_sample_mapping_pages(
+                        self.model,
+                        range.mapping_id,
+                        range.mapping_generation,
+                        range.page_start,
+                        range.page_end.min(
+                            range
+                                .page_start
+                                .saturating_add(max_pages.saturating_mul(range.page_size)),
+                        ),
+                        max_pages,
+                        &mut sample,
+                    )
+                };
+                let sampled = page_sample_from_raw(rc, sample);
+                let sampled_pages = sampled.sampled_pages;
+                aggregate.sampled_pages = aggregate.sampled_pages.saturating_add(sampled_pages);
+                aggregate.fresh_sampled_pages =
+                    aggregate.fresh_sampled_pages.saturating_add(sampled_pages);
+                aggregate.resident_pages = aggregate
+                    .resident_pages
+                    .saturating_add(sampled.resident_pages);
+                aggregate.nonresident_pages = aggregate
+                    .nonresident_pages
+                    .saturating_add(sampled.nonresident_pages);
+                aggregate.unknown_pages = aggregate
+                    .unknown_pages
+                    .saturating_add(sampled.unknown_pages);
+                aggregate.truncated |= sampled.truncated;
+                if sampled.error != 0 {
+                    aggregate.error = sampled.error;
+                }
+                budget = budget.saturating_sub(sampled_pages);
+                *execution_budget = budget;
+                if sampled.status == PageSampleStatus::Complete {
+                    self.cache_range(range, buffer.next_event_sequence, sampled);
+                }
+            }
+        }
+        aggregate.status = if !sampling_enabled || aggregate.sampled_pages == 0 {
+            PageSampleStatus::Unknown
+        } else if aggregate.sampled_pages < aggregate.requested_pages
+            || aggregate.unknown_pages > 0
+            || aggregate.truncated
+        {
+            PageSampleStatus::Partial
+        } else {
+            PageSampleStatus::Complete
+        };
+        aggregate.unsampled_pages = aggregate
+            .requested_pages
+            .saturating_sub(aggregate.sampled_pages);
+        aggregate.truncated |= aggregate.sampled_pages < aggregate.requested_pages;
+        event.dispatch_sample = aggregate;
+        event.sources_truncated |= event.sources_truncated;
+        let dispatch_sample = event.dispatch_sample;
         buffer.next_event_sequence = buffer.next_event_sequence.saturating_add(1);
         buffer.total_events = buffer.total_events.saturating_add(1);
         if buffer.events.len() >= buffer.max_events {
@@ -464,6 +723,63 @@ impl DispatchState {
             buffer.dropped_events = buffer.dropped_events.saturating_add(1);
         }
         buffer.events.push_back(event);
+        let _ = dispatch_sample;
+    }
+
+    fn cached_range(&self, range: &DispatchRange, sequence: u64) -> Option<PageSample> {
+        if self.strategy != NodeSamplingStrategy::Adaptive || self.cache_ttl_events == 0 {
+            return None;
+        }
+        let cache = self.cache.try_borrow().ok()?;
+        cache.iter().find_map(|entry| {
+            (entry.mapping_id == range.mapping_id
+                && entry.mapping_generation == range.mapping_generation
+                && entry.page_start == range.page_start
+                && entry.page_end == range.page_end
+                && sequence.saturating_sub(entry.last_event_sequence) <= self.cache_ttl_events
+                && entry.sample.status == PageSampleStatus::Complete)
+                .then_some(entry.sample)
+        })
+    }
+
+    fn cache_range(&self, range: &DispatchRange, sequence: u64, sample: PageSample) {
+        if self.cache_capacity == 0 || self.strategy == NodeSamplingStrategy::Systematic {
+            return;
+        }
+        let Ok(mut cache) = self.cache.try_borrow_mut() else {
+            return;
+        };
+        if let Some(entry) = cache.iter_mut().find(|entry| {
+            entry.mapping_id == range.mapping_id
+                && entry.mapping_generation == range.mapping_generation
+                && entry.page_start == range.page_start
+                && entry.page_end == range.page_end
+        }) {
+            entry.last_event_sequence = sequence;
+            entry.sample = sample;
+            return;
+        }
+        if cache.len() >= self.cache_capacity {
+            if let Some(oldest) = cache
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_event_sequence)
+                .map(|(index, _)| index)
+            {
+                cache.remove(oldest);
+                if let Ok(mut evictions) = self.cache_evictions.try_borrow_mut() {
+                    *evictions = evictions.saturating_add(1);
+                }
+            }
+        }
+        cache.push(CachedRange {
+            mapping_id: range.mapping_id,
+            mapping_generation: range.mapping_generation,
+            page_start: range.page_start,
+            page_end: range.page_end,
+            last_event_sequence: sequence,
+            sample,
+        });
     }
 
     fn events(&self) -> Vec<NodeDispatchEvent> {
@@ -501,6 +817,22 @@ impl DispatchState {
             dropped_events: buffer.dropped_events,
             retained_events: buffer.events.len(),
             max_events: buffer.max_events,
+            cache_reuses: self
+                .cache_reuses
+                .try_borrow()
+                .map(|value| *value)
+                .unwrap_or(0),
+            cache_evictions: self
+                .cache_evictions
+                .try_borrow()
+                .map(|value| *value)
+                .unwrap_or(0),
+            budget_total: self.sample_budget,
+            budget_remaining: self
+                .execution_budget
+                .try_borrow()
+                .map(|value| *value)
+                .unwrap_or(0),
         }
     }
 }
@@ -538,6 +870,9 @@ fn page_sample_from_raw(rc: i32, raw: forge_sys::llama_page_sample_result) -> Pa
     PageSample {
         requested_pages: raw.requested_pages,
         sampled_pages: raw.sampled_pages,
+        unsampled_pages: raw.requested_pages.saturating_sub(raw.sampled_pages),
+        fresh_sampled_pages: raw.sampled_pages,
+        reused_pages: 0,
         resident_pages: raw.resident_pages,
         nonresident_pages: raw.nonresident_pages,
         unknown_pages: raw.unknown_pages,
@@ -546,6 +881,7 @@ fn page_sample_from_raw(rc: i32, raw: forge_sys::llama_page_sample_result) -> Pa
         mapping_id: raw.mapping_id,
         mapping_generation: raw.mapping_generation,
         mapping_size: raw.mapping_size,
+        sampled_at_sequence: 0,
         tensor_offset: raw.tensor_offset,
         tensor_size: raw.tensor_size,
         page_start: raw.page_start,
@@ -564,10 +900,14 @@ fn raw_to_event(raw: &RawDispatchEvent) -> NodeDispatchEvent {
             source_names.push(name.clone());
             source_samples.push(NodeDispatchSource {
                 name,
-                sample: (source.sample.status != PageSampleStatus::Unknown
-                    || source.sample.requested_pages > 0
-                    || source.sample.error != 0)
-                    .then_some(source.sample),
+                mapping_id: (source.requested_pages > 0 || source.mapping_generation != 0)
+                    .then_some(source.mapping_id),
+                mapping_generation: (source.mapping_generation != 0)
+                    .then_some(source.mapping_generation),
+                page_start: (source.requested_pages > 0).then_some(source.page_start),
+                page_end: (source.requested_pages > 0).then_some(source.page_end),
+                requested_pages: source.requested_pages,
+                sample: None,
             });
         }
     }
@@ -586,7 +926,11 @@ fn raw_to_event(raw: &RawDispatchEvent) -> NodeDispatchEvent {
         op_name_truncated: raw.op_name_truncated,
         source_names,
         source_samples,
+        source_references: raw.source_references as usize,
         sources_truncated: raw.sources_truncated,
+        dispatch_sample: (raw.dispatch_sample.requested_pages > 0
+            || raw.dispatch_sample.error != 0)
+            .then_some(raw.dispatch_sample),
     }
 }
 
@@ -937,6 +1281,7 @@ pub struct Context {
     trace: Option<Box<TraceState>>,
     model_instance_id: u64,
     model_raw: *const forge_sys::llama_model,
+    model_mappings: BTreeMap<String, TensorMappingInfo>,
     dispatch: Option<Box<DispatchState>>,
 }
 
@@ -1102,6 +1447,11 @@ impl Context {
                 trace: trace_state,
                 model_instance_id,
                 model_raw: model.raw(),
+                model_mappings: model
+                    .tensor_mappings()?
+                    .into_iter()
+                    .map(|mapping| (mapping.name.clone(), mapping))
+                    .collect(),
                 dispatch: None,
             })
         }
@@ -1246,9 +1596,16 @@ impl Context {
                 "node dispatch max_events must be in 1..={MAX_NODE_DISPATCH_EVENTS}"
             )));
         }
-        if options.sample_pages > MAX_NODE_DISPATCH_SAMPLE_PAGES {
+        if options.sample_pages > MAX_NODE_DISPATCH_SAMPLE_PAGES
+            || options.sample_budget > MAX_NODE_DISPATCH_SAMPLE_PAGES
+        {
             return Err(Error::invalid(format!(
-                "node dispatch sample_pages must be in 0..={MAX_NODE_DISPATCH_SAMPLE_PAGES}"
+                "node dispatch sample limits must be in 0..={MAX_NODE_DISPATCH_SAMPLE_PAGES}"
+            )));
+        }
+        if options.cache_capacity > MAX_NODE_DISPATCH_CACHE {
+            return Err(Error::invalid(format!(
+                "node dispatch cache_capacity must be in 0..={MAX_NODE_DISPATCH_CACHE}"
             )));
         }
         let context_id = self.lifetime_state()?.context_id;
@@ -1256,8 +1613,8 @@ impl Context {
             self.model_instance_id,
             context_id,
             self.model_raw,
-            options.sample_pages,
-            options.max_events,
+            self.model_mappings.clone(),
+            options,
         ));
         let pointer = (&*state as *const DispatchState)
             .cast_mut()
@@ -1747,5 +2104,54 @@ mod tests {
         assert_eq!(FlashAttnType::Auto.as_native(), -1);
         assert_eq!(FlashAttnType::Disabled.as_native(), 0);
         assert_eq!(FlashAttnType::Enabled.as_native(), 1);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_range_tests {
+    use super::*;
+
+    fn range(mapping: u64, generation: u64, start: u64, end: u64) -> DispatchRange {
+        DispatchRange {
+            mapping_id: mapping,
+            mapping_generation: generation,
+            page_start: start,
+            page_end: end,
+            page_size: 4096,
+        }
+    }
+
+    fn merge(ranges: &[DispatchRange]) -> ([DispatchRange; MAX_DISPATCH_SOURCES], usize) {
+        let mut input = [DispatchRange::default(); MAX_DISPATCH_SOURCES];
+        input[..ranges.len()].copy_from_slice(ranges);
+        merge_dispatch_ranges(input, ranges.len())
+    }
+
+    #[test]
+    fn identical_and_overlapping_ranges_merge_to_unique_pages() {
+        let (merged, count) = merge(&[range(1, 1, 0, 3), range(1, 1, 1, 4)]);
+        assert_eq!(count, 1);
+        assert_eq!(merged[0].page_start, 0);
+        assert_eq!(merged[0].page_end, 4);
+        assert_eq!(merged[0].page_end - merged[0].page_start, 4);
+    }
+
+    #[test]
+    fn adjacent_ranges_merge_and_distinct_mappings_do_not() {
+        let (merged, count) = merge(&[range(1, 1, 0, 2), range(1, 1, 2, 3)]);
+        assert_eq!(count, 1);
+        assert_eq!(merged[0].page_end, 3);
+        let (_, count) = merge(&[range(1, 1, 0, 2), range(2, 1, 0, 2)]);
+        assert_eq!(count, 2);
+        let (_, count) = merge(&[range(1, 1, 0, 2), range(1, 2, 0, 2)]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn empty_and_default_ranges_are_ignored() {
+        let (_, count) = merge(&[]);
+        assert_eq!(count, 0);
+        let (_, count) = merge(&[DispatchRange::default()]);
+        assert_eq!(count, 0);
     }
 }

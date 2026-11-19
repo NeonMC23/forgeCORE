@@ -806,6 +806,15 @@ unsafe extern "C" {
         max_pages: u64,
         out: *mut llama_page_sample_result,
     ) -> c_int;
+    pub fn llama_model_sample_mapping_pages(
+        model: *const llama_model,
+        mapping_id: u64,
+        expected_generation: u64,
+        page_start: u64,
+        page_end: u64,
+        max_pages: u64,
+        out: *mut llama_page_sample_result,
+    ) -> c_int;
     pub fn llama_tensor_op_name(tensor: *const ggml_tensor) -> *const c_char;
     pub fn llama_tensor_src_count(tensor: *const ggml_tensor) -> c_int;
     pub fn llama_tensor_src_name(tensor: *const ggml_tensor, index: i32) -> *const c_char;

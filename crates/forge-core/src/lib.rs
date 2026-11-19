@@ -40,8 +40,9 @@ pub use buffer::{Buffer, BufferType};
 pub use context::{
     AttentionType, Context, ContextOptions, ContextTraceOptions, Embeddings, FlashAttnType, Logits,
     NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSource,
-    NodeDispatchSummary, PoolingType, TraceCompletion, TraceEvent, TracePhase, TraceSummary,
-    MAX_NODE_DISPATCH_EVENTS, MAX_NODE_DISPATCH_SAMPLE_PAGES,
+    NodeDispatchSummary, NodeSamplingStrategy, PoolingType, TraceCompletion, TraceEvent,
+    TracePhase, TraceSummary, MAX_NODE_DISPATCH_CACHE, MAX_NODE_DISPATCH_EVENTS,
+    MAX_NODE_DISPATCH_SAMPLE_PAGES,
 };
 pub use device::{
     enumerate_devices, max_devices, supports_gpu_offload, supports_mlock, supports_mmap,

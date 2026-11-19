@@ -133,6 +133,27 @@ observation, not evidence of a tensor read, page fault, I/O, or final use.
 source; zero disables it. The sample runs before the dispatch event is stored
 and before the worker barrier/kernel entry.
 
+Sampling options are deterministic and bounded:
+
+- `sample_pages`: maximum pages per merged dispatch range;
+- `sample_budget`: maximum unique pages per execution, reset at each
+  `decode`;
+- `NodeSamplingStrategy::Systematic`: sample merged ranges in mapping/page
+  order without cache reuse;
+- `NodeSamplingStrategy::Targeted`: prioritize ranges without a valid cached
+  observation and skip already-fresh ranges;
+- `NodeSamplingStrategy::Adaptive`: reuse fresh complete cached range
+  observations and sample missing/stale ranges;
+- `cache_capacity`: bounded number of range observations;
+- `cache_ttl_events`: freshness window in event sequences. Zero disables
+  adaptive reuse.
+
+Overlapping source ranges are merged per mapping/generation before sampling;
+unique page totals are not duplicated. Per-source mapping ranges remain in the
+event for attribution. Cached observations are marked `reused_pages` and are
+not reported as fresh `mincore()` results. Dropped/truncated/unknown pages are
+explicit; a budget-excluded sample is partial, not a mapping census.
+
 ## Docs
 
 - `docs/PIVOT.md` — why the pivot, what was kept/removed, API and FFI

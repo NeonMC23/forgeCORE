@@ -89,8 +89,10 @@ The patch adds two narrow capabilities:
 - Mapping identity and sampling metadata: `llama_tensor_mapping` carries
   mapping id/generation, file path/size, and validated page bounds;
   `llama_model_sample_tensor_pages()` performs bounded Linux `mincore()` over
-  a named file-backed tensor range. Unsupported platforms and invalid/stale
-  mappings return explicit status; no pointer is exposed.
+  a named file-backed tensor range. A mapping-range API supports merged
+  dispatch ranges after the caller has validated the mapping id/generation.
+  Unsupported platforms and invalid/stale mappings return explicit status; no
+  pointer is exposed.
 
 It does not change `llama_model_params` layout or the default `AUTO`/`MMAP`
 behavior. The upstream checkout HEAD remains the pinned SHA; the patch is

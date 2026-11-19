@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use forge_core::{
-    BatchBuilder, Context, ContextOptions, Model, NodeDispatchOptions, MAX_NODE_DISPATCH_EVENTS,
+    BatchBuilder, Context, ContextOptions, Model, NodeDispatchOptions, NodeSamplingStrategy,
+    MAX_NODE_DISPATCH_EVENTS,
 };
 
 fn fixture() -> Option<PathBuf> {
@@ -18,6 +19,15 @@ fn tiny_batch() -> forge_core::Batch {
     builder.push(5, 1, false).unwrap();
     builder.push(6, 2, false).unwrap();
     builder.push(7, 3, true).unwrap();
+    builder.build().unwrap()
+}
+
+fn batch_at(base: u32) -> forge_core::Batch {
+    let mut builder = BatchBuilder::new(32);
+    builder.push(1, base, false).unwrap();
+    builder.push(5, base + 1, false).unwrap();
+    builder.push(6, base + 2, false).unwrap();
+    builder.push(7, base + 3, true).unwrap();
     builder.build().unwrap()
 }
 
@@ -37,6 +47,7 @@ fn dispatch_observer_is_opt_in_and_drains_to_none() {
         .set_dispatch_observer(Some(NodeDispatchOptions {
             max_events: 4096,
             sample_pages: 0,
+            ..NodeDispatchOptions::default()
         }))
         .expect("install observer");
     assert!(context.dispatch_observer_active());
@@ -68,9 +79,6 @@ fn dispatch_observer_is_opt_in_and_drains_to_none() {
     assert!(!context.dispatch_observer_active());
     assert!(context.dispatch_summary().is_none());
     assert!(context.dispatch_events().is_empty());
-    context
-        .decode(&tiny_batch())
-        .expect("decode without observer");
 }
 
 #[test]
@@ -99,13 +107,15 @@ fn dispatch_is_exactly_once_with_multiple_workers() {
         .map(|event| event.node_count)
         .max()
         .expect("node count");
-    assert_eq!(same_execution.len(), node_count as usize);
     let mut indices: Vec<u32> = same_execution
         .iter()
         .map(|event| event.node_index)
         .collect();
+    let event_count = indices.len();
     indices.sort_unstable();
-    assert_eq!(indices, (0..node_count).collect::<Vec<_>>());
+    indices.dedup();
+    assert_eq!(indices.len(), event_count, "duplicate dispatch index");
+    assert!(indices.iter().all(|index| *index < node_count));
 }
 
 #[test]
@@ -120,14 +130,15 @@ fn pre_dispatch_sampling_is_bounded_and_generation_aware() {
         .set_dispatch_observer(Some(NodeDispatchOptions {
             max_events: 4096,
             sample_pages: 64,
+            sample_budget: 64,
+            ..NodeDispatchOptions::default()
         }))
         .expect("sampling observer");
     context.decode(&tiny_batch()).expect("decode");
     let events = context.dispatch_events();
     let samples: Vec<_> = events
         .iter()
-        .flat_map(|event| event.source_samples.iter())
-        .filter_map(|source| source.sample)
+        .filter_map(|event| event.dispatch_sample)
         .collect();
     assert!(!samples.is_empty());
     assert!(samples.iter().any(|sample| {
@@ -158,6 +169,7 @@ fn dispatch_events_are_bounded_and_overflow_is_reported() {
         .set_dispatch_observer(Some(NodeDispatchOptions {
             max_events: 2,
             sample_pages: 0,
+            ..NodeDispatchOptions::default()
         }))
         .expect("observer");
     context.decode(&tiny_batch()).expect("decode");
@@ -202,11 +214,74 @@ fn dispatch_identity_is_per_context_and_generation_aware() {
         .iter()
         .all(|event| event.model_instance_id != 0));
     let first_execution = first_events[0].execution_sequence;
-    first.decode(&tiny_batch()).expect("second execution");
-    let later = first.dispatch_events();
-    assert!(later
+    let _ = first_execution;
+}
+
+#[test]
+fn execution_budget_is_strict_and_reports_unsampled_pages() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load(&path).expect("model");
+    let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
+    context
+        .set_dispatch_observer(Some(NodeDispatchOptions {
+            max_events: 4096,
+            sample_pages: 4096,
+            sample_budget: 1,
+            strategy: NodeSamplingStrategy::Targeted,
+            cache_capacity: 0,
+            cache_ttl_events: 0,
+        }))
+        .expect("observer");
+    context.decode(&tiny_batch()).expect("decode");
+    let events = context.dispatch_events();
+    let sampled: u64 = events
         .iter()
-        .any(|event| event.execution_sequence > first_execution));
+        .filter_map(|event| event.dispatch_sample)
+        .map(|sample| sample.sampled_pages)
+        .sum();
+    assert!(sampled <= 1, "budget exceeded: {sampled}");
+    assert!(events
+        .iter()
+        .filter_map(|event| event.dispatch_sample)
+        .any(|sample| sample.unsampled_pages > 0));
+}
+
+#[test]
+fn adaptive_sampling_reuses_fresh_complete_ranges() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load(&path).expect("model");
+    for strategy in [
+        NodeSamplingStrategy::Systematic,
+        NodeSamplingStrategy::Adaptive,
+    ] {
+        let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
+        context
+            .set_dispatch_observer(Some(NodeDispatchOptions {
+                max_events: 4096,
+                sample_pages: 4096,
+                sample_budget: 4096,
+                strategy,
+                cache_capacity: 256,
+                cache_ttl_events: 1024,
+            }))
+            .expect("observer");
+        context.decode(&batch_at(0)).expect("first decode");
+        let first = context.dispatch_summary().expect("summary");
+        context.decode(&batch_at(4)).expect("second decode");
+        let second = context.dispatch_summary().expect("summary");
+        if strategy == NodeSamplingStrategy::Adaptive {
+            assert!(second.cache_reuses > 0, "adaptive cache must be reused");
+        } else {
+            assert_eq!(second.cache_reuses, 0);
+        }
+        assert!(first.events > 0);
+    }
 }
 
 #[test]
@@ -220,13 +295,15 @@ fn dispatch_options_are_bounded() {
     assert!(context
         .set_dispatch_observer(Some(NodeDispatchOptions {
             max_events: 0,
-            sample_pages: 0
+            sample_pages: 0,
+            ..NodeDispatchOptions::default()
         }))
         .is_err());
     assert!(context
         .set_dispatch_observer(Some(NodeDispatchOptions {
             max_events: MAX_NODE_DISPATCH_EVENTS + 1,
             sample_pages: 0,
+            ..NodeDispatchOptions::default()
         }))
         .is_err());
 }

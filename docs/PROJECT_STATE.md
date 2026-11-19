@@ -87,8 +87,11 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
   or release proof. Tensor mappings additionally expose a model-instance
   generation, mapping id, file path/size, and validated page range. A bounded
   Linux `mincore()` sample can be taken per named file-backed tensor; sampling
-  is opt-in, per-source, and occurs before dispatch publication/barrier. It is
-  still residency observation only. GPU execution is **not** validated on
+  is opt-in and occurs before dispatch publication/barrier. Ranges are merged
+  per mapping/generation for dispatch-level page deduplication. Systematic,
+  targeted, and adaptive strategies share strict execution budgets; adaptive
+  cache entries are bounded, freshness-windowed, and explicitly marked when
+  reused. It is still residency observation only. GPU execution is **not** validated on
   hardware in this environment.
 - `Model → Context → Batch → decode → Logits` CPU inference path, with
   real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and

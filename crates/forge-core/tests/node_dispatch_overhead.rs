@@ -47,6 +47,7 @@ fn node_dispatch_observer_overhead_smoke() {
                     .set_dispatch_observer(Some(NodeDispatchOptions {
                         max_events: if drain { 4096 } else { 65_536 },
                         sample_pages: 0,
+                        ..NodeDispatchOptions::default()
                     }))
                     .expect("observer");
             }
@@ -105,6 +106,8 @@ fn pre_dispatch_sampling_overhead_smoke() {
                 .set_dispatch_observer(Some(NodeDispatchOptions {
                     max_events: 4096,
                     sample_pages,
+                    sample_budget: if sample_pages == 0 { 0 } else { 4096 },
+                    ..NodeDispatchOptions::default()
                 }))
                 .expect("observer");
             context.decode(&batch_at(0)).expect("warmup");
