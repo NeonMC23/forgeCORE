@@ -129,3 +129,47 @@ fn pre_dispatch_sampling_overhead_smoke() {
         }
     }
 }
+
+#[test]
+#[ignore = "manual sampling strategy comparison"]
+fn sampling_strategy_overhead_smoke() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load(&path).expect("model");
+    for strategy in [
+        forge_core::NodeSamplingStrategy::Systematic,
+        forge_core::NodeSamplingStrategy::Targeted,
+        forge_core::NodeSamplingStrategy::Adaptive,
+    ] {
+        let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
+        context
+            .set_dispatch_observer(Some(NodeDispatchOptions {
+                max_events: 4096,
+                sample_pages: 64,
+                sample_budget: 4096,
+                strategy,
+                cache_capacity: 1024,
+                cache_ttl_events: 1024,
+            }))
+            .expect("observer");
+        context.decode(&batch_at(0)).expect("warmup");
+        let _ = context.take_dispatch_events();
+        let mut samples = Vec::new();
+        for repetition in 0..5 {
+            let position = 4 * (repetition as u32 + 1);
+            let started = Instant::now();
+            context.decode(&batch_at(position)).expect("decode");
+            samples.push(started.elapsed().as_nanos());
+            let _ = context.take_dispatch_events();
+        }
+        let summary = context.dispatch_summary().expect("summary");
+        eprintln!(
+            "strategy={strategy:?} median_ns={} cache_reuses={} cache_evictions={}",
+            median(&mut samples),
+            summary.cache_reuses,
+            summary.cache_evictions
+        );
+    }
+}
