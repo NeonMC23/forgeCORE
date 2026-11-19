@@ -718,8 +718,6 @@ impl DispatchState {
         if sampling_enabled {
             event.dispatch_sample = aggregate;
         }
-        event.sources_truncated |= event.sources_truncated;
-        let dispatch_sample = event.dispatch_sample;
         buffer.next_event_sequence = buffer.next_event_sequence.saturating_add(1);
         buffer.total_events = buffer.total_events.saturating_add(1);
         if buffer.events.len() >= buffer.max_events {
@@ -727,7 +725,6 @@ impl DispatchState {
             buffer.dropped_events = buffer.dropped_events.saturating_add(1);
         }
         buffer.events.push_back(event);
-        let _ = dispatch_sample;
     }
 
     fn cached_range(&self, range: &DispatchRange, sequence: u64) -> Option<PageSample> {
