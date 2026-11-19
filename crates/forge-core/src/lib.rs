@@ -29,6 +29,7 @@ pub mod model;
 pub mod quant;
 pub mod reference;
 pub mod residency;
+pub mod residency_experiment;
 pub mod runtime;
 pub mod sampler;
 pub mod tensor;
@@ -64,6 +65,11 @@ pub use model::{
 pub use quant::{block_spec, row_bytes, tensor_bytes, BlockSpec, QuantFormat};
 pub use residency::{
     ContextLifetimeState, ModelLifetimeState, ResidencyError, RESIDENCY_CONTRACT_VERSION,
+};
+pub use residency_experiment::{
+    run_file_residency_experiment, ResidencyCounts, ResidencyExperimentConfig,
+    ResidencyExperimentCycle, ResidencyExperimentError, ResidencyExperimentReport,
+    TransitionOutcome, MAX_EXPERIMENT_CYCLES, MAX_EXPERIMENT_PAGES,
 };
 pub use runtime::{
     add, concat, div, get_rows, matmul, mul, norm, rms_norm, rope, scale, silu, soft_max,

@@ -155,6 +155,18 @@ event for attribution. Cached observations are marked `reused_pages` and are
 not reported as fresh `mincore()` results. Dropped/truncated/unknown pages are
 explicit; a budget-excluded sample is partial, not a mapping census.
 
+## Controlled residency validation
+
+`forge_core::residency_experiment` provides an isolated Linux validation
+harness for page-residency transitions. It maps a unique temporary file,
+touches known pages, observes `mincore()`, unmaps, requests a file-scoped
+`POSIX_FADV_DONTNEED`, remaps, and observes again. It never drops global page
+cache or applies memory pressure. A transition is claimed only when the
+observations actually show all pages becoming nonresident.
+
+See [`docs/RESIDENCY_VALIDATION.md`](docs/RESIDENCY_VALIDATION.md) for the
+method, storage caveats, and verified behavior.
+
 ## Docs
 
 - `docs/PIVOT.md` — why the pivot, what was kept/removed, API and FFI

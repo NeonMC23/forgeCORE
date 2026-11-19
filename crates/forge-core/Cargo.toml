@@ -6,3 +6,6 @@ license = "MIT"
 
 [dependencies]
 forge-sys = { path = "../forge-sys" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
