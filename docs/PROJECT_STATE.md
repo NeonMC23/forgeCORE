@@ -89,9 +89,9 @@ export FORGE_LLAMA_DIR="/home/neon/Documents/CODE LOCAL/forge/native"
   Linux `mincore()` sample can be taken per named file-backed tensor; sampling
   is opt-in and occurs before dispatch publication/barrier. Ranges are merged
   per mapping/generation for dispatch-level page deduplication. Systematic,
-  targeted, and adaptive strategies share strict execution budgets; adaptive
-  cache entries are bounded, freshness-windowed, and explicitly marked when
-  reused. It is still residency observation only. GPU execution is **not** validated on
+  targeted, and adaptive strategies share strict execution budgets; targeted
+  skips fresh cached ranges and adaptive reuses them, with cache skips and
+  reuses reported explicitly. Cache entries are bounded and freshness-windowed. It is still residency observation only. GPU execution is **not** validated on
   hardware in this environment.
 - `Model → Context → Batch → decode → Logits` CPU inference path, with
   real-model validation on `llama` (SmolLM2), `qwen2` (Qwen2.5-1.5B), and

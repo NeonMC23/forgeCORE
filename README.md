@@ -136,17 +136,18 @@ and before the worker barrier/kernel entry.
 Sampling options are deterministic and bounded:
 
 - `sample_pages`: maximum pages per merged dispatch range;
-- `sample_budget`: maximum unique pages per execution, reset at each
-  `decode`;
+- `sample_budget`: maximum fresh unique pages per execution, reset at each
+  `decode`; reused cached pages do not consume it;
 - `NodeSamplingStrategy::Systematic`: sample merged ranges in mapping/page
   order without cache reuse;
-- `NodeSamplingStrategy::Targeted`: prioritize ranges without a valid cached
-  observation and skip already-fresh ranges;
+- `NodeSamplingStrategy::Targeted`: sample uncached ranges and skip ranges with
+  a fresh complete cached observation; skipped ranges are reported through
+  `cache_skips`, not as fresh samples;
 - `NodeSamplingStrategy::Adaptive`: reuse fresh complete cached range
   observations and sample missing/stale ranges;
 - `cache_capacity`: bounded number of range observations;
 - `cache_ttl_events`: freshness window in event sequences. Zero disables
-  adaptive reuse.
+  targeted/adaptive cache lookup.
 
 Overlapping source ranges are merged per mapping/generation before sampling;
 unique page totals are not duplicated. Per-source mapping ranges remain in the

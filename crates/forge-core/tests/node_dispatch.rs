@@ -253,7 +253,7 @@ fn execution_budget_is_strict_and_reports_unsampled_pages() {
 }
 
 #[test]
-fn adaptive_sampling_reuses_fresh_complete_ranges() {
+fn sampling_strategies_have_distinct_cache_behavior() {
     let Some(path) = fixture() else {
         eprintln!("SKIP: FORGE_TEST_MODEL not set");
         return;
@@ -261,6 +261,7 @@ fn adaptive_sampling_reuses_fresh_complete_ranges() {
     let model = Model::load(&path).expect("model");
     for strategy in [
         NodeSamplingStrategy::Systematic,
+        NodeSamplingStrategy::Targeted,
         NodeSamplingStrategy::Adaptive,
     ] {
         let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
@@ -278,10 +279,20 @@ fn adaptive_sampling_reuses_fresh_complete_ranges() {
         let first = context.dispatch_summary().expect("summary");
         context.decode(&batch_at(4)).expect("second decode");
         let second = context.dispatch_summary().expect("summary");
-        if strategy == NodeSamplingStrategy::Adaptive {
-            assert!(second.cache_reuses > 0, "adaptive cache must be reused");
-        } else {
-            assert_eq!(second.cache_reuses, 0);
+        match strategy {
+            NodeSamplingStrategy::Adaptive => {
+                assert!(second.cache_reuses > 0, "adaptive cache must be reused");
+                assert_eq!(second.cache_skips, 0);
+            }
+            NodeSamplingStrategy::Targeted => {
+                assert!(second.cache_skips > 0, "targeted must skip fresh ranges");
+                assert_eq!(second.cache_reuses, 0);
+                assert!(second.events.checked_sub(second.cache_skips).is_some());
+            }
+            NodeSamplingStrategy::Systematic => {
+                assert_eq!(second.cache_reuses, 0);
+                assert_eq!(second.cache_skips, 0);
+            }
         }
         assert!(first.events > 0);
     }

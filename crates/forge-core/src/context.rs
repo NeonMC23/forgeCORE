@@ -324,6 +324,7 @@ pub struct NodeDispatchSummary {
     pub retained_events: usize,
     pub max_events: usize,
     pub cache_reuses: u64,
+    pub cache_skips: u64,
     pub cache_evictions: u64,
     pub budget_total: u64,
     pub budget_remaining: u64,
@@ -478,6 +479,7 @@ struct DispatchState {
     cache_ttl_events: u64,
     cache: RefCell<Vec<CachedRange>>,
     cache_reuses: RefCell<u64>,
+    cache_skips: RefCell<u64>,
     cache_evictions: RefCell<u64>,
 }
 
@@ -510,6 +512,7 @@ impl DispatchState {
             cache_ttl_events: options.cache_ttl_events,
             cache: RefCell::new(Vec::with_capacity(options.cache_capacity)),
             cache_reuses: RefCell::new(0),
+            cache_skips: RefCell::new(0),
             cache_evictions: RefCell::new(0),
         }
     }
@@ -630,6 +633,9 @@ impl DispatchState {
                 }
                 let cached = self.cached_range(range, buffer.next_event_sequence);
                 if self.strategy == NodeSamplingStrategy::Targeted && cached.is_some() {
+                    if let Ok(mut skips) = self.cache_skips.try_borrow_mut() {
+                        *skips = skips.saturating_add(1);
+                    }
                     continue;
                 }
                 if self.strategy == NodeSamplingStrategy::Adaptive {
@@ -728,7 +734,11 @@ impl DispatchState {
     }
 
     fn cached_range(&self, range: &DispatchRange, sequence: u64) -> Option<PageSample> {
-        if self.strategy != NodeSamplingStrategy::Adaptive || self.cache_ttl_events == 0 {
+        if !matches!(
+            self.strategy,
+            NodeSamplingStrategy::Targeted | NodeSamplingStrategy::Adaptive
+        ) || self.cache_ttl_events == 0
+        {
             return None;
         }
         let cache = self.cache.try_borrow().ok()?;
@@ -820,6 +830,11 @@ impl DispatchState {
             max_events: buffer.max_events,
             cache_reuses: self
                 .cache_reuses
+                .try_borrow()
+                .map(|value| *value)
+                .unwrap_or(0),
+            cache_skips: self
+                .cache_skips
                 .try_borrow()
                 .map(|value| *value)
                 .unwrap_or(0),
