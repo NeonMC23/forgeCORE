@@ -655,6 +655,7 @@ impl DispatchState {
                             .saturating_add(sample.nonresident_pages);
                         aggregate.unknown_pages =
                             aggregate.unknown_pages.saturating_add(sample.unknown_pages);
+                        copy_aggregate_mapping(&mut aggregate, &sample);
                         continue;
                     }
                 }
@@ -688,6 +689,7 @@ impl DispatchState {
                 aggregate.unknown_pages = aggregate
                     .unknown_pages
                     .saturating_add(sampled.unknown_pages);
+                copy_aggregate_mapping(&mut aggregate, &sampled);
                 aggregate.truncated |= sampled.truncated;
                 if sampled.error != 0 {
                     aggregate.error = sampled.error;
@@ -851,6 +853,18 @@ unsafe fn copy_c_name(pointer: *const c_char, destination: &mut [u8]) -> (u16, b
 fn text_from_raw(bytes: &[u8], len: u16) -> Option<String> {
     let len = (len as usize).min(bytes.len());
     (len > 0).then(|| String::from_utf8_lossy(&bytes[..len]).into_owned())
+}
+
+fn copy_aggregate_mapping(aggregate: &mut PageSample, sample: &PageSample) {
+    if aggregate.mapping_size == 0 {
+        aggregate.mapping_id = sample.mapping_id;
+        aggregate.mapping_generation = sample.mapping_generation;
+        aggregate.mapping_size = sample.mapping_size;
+        aggregate.tensor_offset = sample.tensor_offset;
+        aggregate.tensor_size = sample.tensor_size;
+        aggregate.page_start = sample.page_start;
+        aggregate.page_end = sample.page_end;
+    }
 }
 
 fn page_sample_from_raw(rc: i32, raw: forge_sys::llama_page_sample_result) -> PageSample {
