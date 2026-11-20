@@ -88,6 +88,8 @@ pub enum ExperimentStorage {
 pub struct ResidencyExperimentReport {
     /// Always `controlled-file-mapping`, not a production model mapping.
     pub preparation: &'static str,
+    /// Monotonic identity for this isolated experiment mapping.
+    pub mapping_generation: u64,
     /// The observation and eviction requests actually used.
     pub method: &'static str,
     pub platform: &'static str,
@@ -202,6 +204,7 @@ mod platform {
     };
 
     static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static EXPERIMENT_GENERATION: AtomicU64 = AtomicU64::new(0);
     const METHOD: &str =
         "mmap(MAP_SHARED) + touch + mincore + munmap + posix_fadvise(DONTNEED) + mmap + mincore";
     const PREPARATION: &str = "controlled-file-mapping";
@@ -349,6 +352,7 @@ mod platform {
         config: ResidencyExperimentConfig,
     ) -> Result<ResidencyExperimentReport, ResidencyExperimentError> {
         let page_size = page_size()?;
+        let mapping_generation = EXPERIMENT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
         let directory = config
             .directory
             .clone()
@@ -426,6 +430,7 @@ mod platform {
 
         Ok(ResidencyExperimentReport {
             preparation: PREPARATION,
+            mapping_generation,
             method: METHOD,
             platform: PLATFORM,
             storage,
@@ -468,6 +473,16 @@ mod platform {
         len: usize,
         page_size: u64,
     ) -> Result<ResidencyCounts, ResidencyExperimentError> {
+        let pages = expected_pages(addr, len, page_size)?;
+        let mut states = vec![0u8; pages];
+        sample_mapping_into(addr, len, page_size, &mut states)
+    }
+
+    fn expected_pages(
+        addr: *mut c_void,
+        len: usize,
+        page_size: u64,
+    ) -> Result<usize, ResidencyExperimentError> {
         if addr.is_null() || len == 0 {
             return Err(ResidencyExperimentError::Observation(
                 "empty mapping".to_string(),
@@ -479,8 +494,22 @@ mod platform {
                 "mapping shorter than one page".to_string(),
             ));
         }
-        let mut states = vec![0u8; pages];
-        // SAFETY: `states` is sized for `len / page_size` bytes, as required
+        Ok(pages)
+    }
+
+    fn sample_mapping_into(
+        addr: *mut c_void,
+        len: usize,
+        page_size: u64,
+        states: &mut [u8],
+    ) -> Result<ResidencyCounts, ResidencyExperimentError> {
+        let pages = expected_pages(addr, len, page_size)?;
+        if states.len() < pages {
+            return Err(ResidencyExperimentError::Observation(
+                "page-state buffer is too small".to_string(),
+            ));
+        }
+        // SAFETY: `states` has at least `len / page_size` bytes, as required
         // by mincore, and `addr`/`len` describe a live mapping.
         let result = unsafe { libc::mincore(addr, len, states.as_mut_ptr()) };
         if result != 0 {
@@ -494,7 +523,7 @@ mod platform {
             sampled_pages: pages as u64,
             ..ResidencyCounts::default()
         };
-        for state in states {
+        for state in states.iter().take(pages) {
             if state & 1 != 0 {
                 counts.resident_pages += 1;
             } else {
@@ -536,6 +565,22 @@ mod platform {
                 sample_mapping(std::ptr::null_mut(), 0, page_size),
                 Err(ResidencyExperimentError::Observation(_))
             ));
+        }
+
+        #[test]
+        fn a_released_mapping_is_not_reported_as_nonresident() {
+            let page_size = page_size().expect("page size");
+            let mut mapping =
+                TempMapping::create(1, page_size, &std::env::temp_dir()).expect("mapping");
+            let address = mapping.addr;
+            let length = mapping.len;
+            // Allocate the state buffer before unmapping so the allocator
+            // cannot reuse the released address during the probe.
+            let mut states = vec![0u8; 1];
+            assert!(mapping.unmap());
+            let error = sample_mapping_into(address, length, page_size, &mut states)
+                .expect_err("unmapped probe");
+            assert!(matches!(error, ResidencyExperimentError::Observation(_)));
         }
     }
 }
