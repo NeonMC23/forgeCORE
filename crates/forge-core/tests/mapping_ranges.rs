@@ -270,3 +270,84 @@ fn mapping_identity_is_stable_within_a_model_and_changes_across_instances() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL; copies the model to an isolated temporary file"]
+fn isolated_model_mapping_transition_is_observed_or_explicitly_not_claimed() {
+    use std::os::fd::AsRawFd;
+
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let unique = format!(
+        "forge-model-residency-{}-{}.gguf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    );
+    let copy = std::env::temp_dir().join(unique);
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(copy.clone());
+    std::fs::copy(&path, &copy).expect("copy model");
+    let model = Model::load_with_options(&copy, &options()).expect("copied model");
+    let mappings = model.tensor_mappings().expect("mappings");
+    let selected = mappings
+        .iter()
+        .filter(|mapping| mapping.file_backed)
+        .max_by_key(|mapping| mapping.size)
+        .map(|mapping| mapping.name.clone())
+        .expect("file-backed tensor");
+    let before = model
+        .sample_tensor_pages(&selected, 64)
+        .expect("baseline sample");
+    let generation = before.mapping_generation;
+    drop(model);
+    let file = std::fs::File::open(&copy).expect("open copy");
+    // File-scoped advisory request on the isolated copy only, after the
+    // model mapping has been released.
+    let fadvise = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    let mut no_prefetch = options();
+    no_prefetch.load_mode = ModelLoadMode::MmapNoPrefetch;
+    let reloaded = Model::load_with_options(&copy, &no_prefetch).expect("reloaded model");
+    let after = reloaded
+        .sample_tensor_pages(&selected, 64)
+        .expect("post-eviction sample");
+    assert_ne!(generation, 0);
+    assert_ne!(after.mapping_generation, generation);
+    assert_eq!(
+        before.sampled_pages,
+        before.resident_pages
+            + before.nonresident_pages
+            + before.unknown_pages
+            + before.failed_pages
+    );
+    assert_eq!(
+        after.sampled_pages,
+        after.resident_pages + after.nonresident_pages + after.unknown_pages + after.failed_pages
+    );
+    assert!(before.mapping_generation != 0);
+    eprintln!(
+            "model_mapping before resident={} nonresident={} unknown={} failed={} fadvise_ok={} after resident={} nonresident={} unknown={} failed={}",
+            before.resident_pages,
+            before.nonresident_pages,
+            before.unknown_pages,
+            before.failed_pages,
+            fadvise == 0,
+            after.resident_pages,
+            after.nonresident_pages,
+            after.unknown_pages,
+            after.failed_pages
+        );
+    // The advisory request is not proof of a physical transition. If the
+    // kernel reports nonresident pages, that is an observation, not a
+    // performance claim.
+    assert!(after.requested_pages > 0);
+}
