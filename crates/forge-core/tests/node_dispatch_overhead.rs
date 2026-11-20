@@ -174,3 +174,139 @@ fn sampling_strategy_overhead_smoke() {
         );
     }
 }
+
+fn quantile(sorted: &[u128], numerator: usize, denominator: usize) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let index = (sorted.len() - 1) * numerator / denominator;
+    sorted[index]
+}
+
+#[derive(Default)]
+struct SamplingTotals {
+    requested: u64,
+    sampled: u64,
+    fresh: u64,
+    reused: u64,
+    skipped: u64,
+    budget_excluded: u64,
+    unsampled: u64,
+    resident: u64,
+    nonresident: u64,
+    unknown: u64,
+    cache_reuses: u64,
+    cache_skips: u64,
+    cache_evictions: u64,
+    events: u64,
+}
+
+#[test]
+#[ignore = "manual statistical sampling benchmark"]
+fn statistical_sampling_benchmark() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let runs = std::env::var("FORGE_BENCH_RUNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(7)
+        .max(3);
+    let iterations = std::env::var("FORGE_BENCH_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5)
+        .max(1);
+    let threads = std::env::var("FORGE_BENCH_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    let model = Model::load(&path).expect("model");
+    let configs: [(&str, Option<forge_core::NodeSamplingStrategy>); 4] = [
+        ("disabled", None),
+        (
+            "systematic",
+            Some(forge_core::NodeSamplingStrategy::Systematic),
+        ),
+        ("targeted", Some(forge_core::NodeSamplingStrategy::Targeted)),
+        ("adaptive", Some(forge_core::NodeSamplingStrategy::Adaptive)),
+    ];
+    for (name, strategy) in configs {
+        let mut samples = Vec::with_capacity(runs * iterations);
+        let mut totals = SamplingTotals::default();
+        for _ in 0..runs {
+            let mut options = ContextOptions::default();
+            options.n_threads = threads;
+            options.n_threads_batch = threads;
+            let mut context = Context::open(&model, &options).expect("context");
+            let sampling = strategy.is_some();
+            context
+                .set_dispatch_observer(Some(NodeDispatchOptions {
+                    max_events: 4096,
+                    sample_pages: if sampling { 64 } else { 0 },
+                    sample_budget: if sampling { 4096 } else { 0 },
+                    strategy: strategy.unwrap_or_default(),
+                    cache_capacity: 1024,
+                    cache_ttl_events: 1024,
+                }))
+                .expect("observer");
+            context.decode(&batch_at(0)).expect("warmup");
+            let _ = context.take_dispatch_events();
+            for iteration in 0..iterations {
+                let position = 4 * (iteration as u32 + 1);
+                let started = Instant::now();
+                context
+                    .decode(&batch_at(position))
+                    .expect("measured decode");
+                samples.push(started.elapsed().as_nanos());
+                for event in context.take_dispatch_events() {
+                    totals.events += 1;
+                    let Some(sample) = event.dispatch_sample else {
+                        continue;
+                    };
+                    totals.requested += sample.requested_pages;
+                    totals.sampled += sample.sampled_pages;
+                    totals.fresh += sample.fresh_sampled_pages;
+                    totals.reused += sample.reused_pages;
+                    totals.skipped += sample.skipped_pages;
+                    totals.budget_excluded += sample.budget_excluded_pages;
+                    totals.unsampled += sample.unsampled_pages;
+                    totals.resident += sample.resident_pages;
+                    totals.nonresident += sample.nonresident_pages;
+                    totals.unknown += sample.unknown_pages;
+                }
+            }
+            let summary = context.dispatch_summary().expect("summary");
+            totals.cache_reuses += summary.cache_reuses;
+            totals.cache_skips += summary.cache_skips;
+            totals.cache_evictions += summary.cache_evictions;
+        }
+        samples.sort_unstable();
+        let median = quantile(&samples, 1, 2);
+        let min = *samples.first().unwrap_or(&0);
+        let max = *samples.last().unwrap_or(&0);
+        let q1 = quantile(&samples, 1, 4);
+        let q3 = quantile(&samples, 3, 4);
+        eprintln!(
+            "{{\"config\":\"{name}\",\"threads\":{threads},\"runs\":{runs},\"iterations\":{iterations},\"measurements\":{},\"sample_pages\":{},\"sample_budget\":{},\"median_ns\":{median},\"min_ns\":{min},\"max_ns\":{max},\"q1_ns\":{q1},\"q3_ns\":{q3},\"events\":{},\"requested_pages\":{},\"sampled_pages\":{},\"fresh_pages\":{},\"reused_pages\":{},\"skipped_pages\":{},\"budget_excluded_pages\":{},\"unsampled_pages\":{},\"resident_pages\":{},\"nonresident_pages\":{},\"unknown_pages\":{},\"cache_reuses\":{},\"cache_skips\":{},\"cache_evictions\":{},\"condition\":\"warm-cache-uncontrolled\"}}",
+            samples.len(),
+            if strategy.is_some() { 64 } else { 0 },
+            if strategy.is_some() { 4096 } else { 0 },
+            totals.events,
+            totals.requested,
+            totals.sampled,
+            totals.fresh,
+            totals.reused,
+            totals.skipped,
+            totals.budget_excluded,
+            totals.unsampled,
+            totals.resident,
+            totals.nonresident,
+            totals.unknown,
+            totals.cache_reuses,
+            totals.cache_skips,
+            totals.cache_evictions
+        );
+    }
+}

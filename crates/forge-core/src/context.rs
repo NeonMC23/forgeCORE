@@ -2585,6 +2585,39 @@ mod dispatch_attribution_tests {
     }
 
     #[test]
+    #[ignore = "manual range-merge microbenchmark"]
+    fn dispatch_range_merge_microbench() {
+        let page = 4096u64;
+        let mut input = [DispatchRange::default(); MAX_DISPATCH_SOURCES];
+        for (index, slot) in input.iter_mut().enumerate() {
+            let start = (index as u64 % 3) * 64 * page + (index as u64) * 8 * page;
+            *slot = DispatchRange {
+                mapping_id: index as u64 / 4,
+                mapping_generation: 1,
+                page_start: start,
+                page_end: start + 32 * page,
+                page_size: page,
+            };
+        }
+        let iterations = std::env::var("FORGE_MICROBENCH_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(100_000);
+        let started = std::time::Instant::now();
+        let mut merged_count = 0usize;
+        for _ in 0..iterations {
+            let (merged, count) = merge_dispatch_ranges(input, MAX_DISPATCH_SOURCES);
+            merged_count = count;
+            std::hint::black_box(merged[0]);
+        }
+        let elapsed = started.elapsed().as_nanos();
+        eprintln!(
+            "range_merge iterations={iterations} merged_count={merged_count} ns_per_iter={}",
+            elapsed / u128::from(iterations)
+        );
+    }
+
+    #[test]
     fn shared_page_count_merges_overlaps_without_double_counting() {
         let page = 4096;
         let sources = [

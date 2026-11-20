@@ -431,3 +431,57 @@ fn dispatch_attribution_invariants_hold_on_a_real_model() {
         );
     }
 }
+
+#[test]
+fn cache_capacity_is_bounded_and_evictions_are_counted() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load(&path).expect("model");
+    let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
+    context
+        .set_dispatch_observer(Some(NodeDispatchOptions {
+            max_events: 4096,
+            sample_pages: 64,
+            sample_budget: 4096,
+            strategy: NodeSamplingStrategy::Adaptive,
+            cache_capacity: 1,
+            cache_ttl_events: 1024,
+        }))
+        .expect("observer");
+    context.decode(&batch_at(0)).expect("first decode");
+    let first = context.dispatch_summary().expect("summary");
+    context.decode(&batch_at(4)).expect("second decode");
+    let second = context.dispatch_summary().expect("summary");
+    assert!(
+        second.cache_evictions > first.cache_evictions,
+        "capacity-one cache must evict: first={first:?} second={second:?}"
+    );
+    assert!(second.cache_reuses <= second.events);
+}
+
+#[test]
+fn zero_cache_capacity_disables_reuse_and_eviction() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let model = Model::load(&path).expect("model");
+    let mut context = Context::open(&model, &ContextOptions::default()).expect("context");
+    context
+        .set_dispatch_observer(Some(NodeDispatchOptions {
+            max_events: 4096,
+            sample_pages: 64,
+            sample_budget: 4096,
+            strategy: NodeSamplingStrategy::Adaptive,
+            cache_capacity: 0,
+            cache_ttl_events: 1024,
+        }))
+        .expect("observer");
+    context.decode(&batch_at(0)).expect("first decode");
+    context.decode(&batch_at(4)).expect("second decode");
+    let summary = context.dispatch_summary().expect("summary");
+    assert_eq!(summary.cache_reuses, 0);
+    assert_eq!(summary.cache_evictions, 0);
+}
