@@ -69,6 +69,9 @@ changes.
 - Concurrent experiments use distinct files and mappings.
 - Invalid or missing mappings return an observation error, not a false
   nonresident count.
+- Native page states distinguish resident, nonresident, unknown, and failed;
+  a `mincore()` chunk failure is reported as failed pages, not unknown or
+  nonresident.
 - tmpfs remains explicitly non-transitional where the kernel cannot satisfy
   the eviction request.
 

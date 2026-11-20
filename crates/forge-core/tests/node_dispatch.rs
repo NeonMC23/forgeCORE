@@ -385,7 +385,10 @@ fn dispatch_attribution_invariants_hold_on_a_real_model() {
         );
         assert_eq!(
             sample.sampled_pages,
-            sample.resident_pages + sample.nonresident_pages + sample.unknown_pages,
+            sample.resident_pages
+                + sample.nonresident_pages
+                + sample.unknown_pages
+                + sample.failed_pages,
             "global observed states must be exact: {sample:?}"
         );
         assert!(sample.budget_excluded_pages <= sample.requested_pages);
@@ -407,7 +410,10 @@ fn dispatch_attribution_invariants_hold_on_a_real_model() {
             );
             assert_eq!(
                 source.sampled_pages,
-                source.resident_pages + source.nonresident_pages + source.unknown_pages,
+                source.resident_pages
+                    + source.nonresident_pages
+                    + source.unknown_pages
+                    + source.failed_pages,
                 "source observed states must be exact: {source:?}"
             );
             assert_eq!(

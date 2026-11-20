@@ -221,6 +221,8 @@ pub struct PageSample {
     pub resident_pages: u64,
     pub nonresident_pages: u64,
     pub unknown_pages: u64,
+    /// Pages whose native observation failed. Distinct from unknown.
+    pub failed_pages: u64,
     pub page_size: u64,
     pub max_pages: u64,
     pub mapping_id: u64,
@@ -722,6 +724,7 @@ impl Model {
             resident_pages: raw.resident_pages,
             nonresident_pages: raw.nonresident_pages,
             unknown_pages: raw.unknown_pages,
+            failed_pages: raw.failed_pages,
             page_size: raw.page_size,
             max_pages: raw.max_pages,
             mapping_id: raw.mapping_id,

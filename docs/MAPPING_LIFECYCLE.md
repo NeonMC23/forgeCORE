@@ -1,5 +1,9 @@
 # Mapping identity and invalidation
 
+**Scope:** the pinned native revision
+`7fe450e19305b828c199d602c23a8337aaa1f03b`. This guarantee must be re-audited
+before any native pin change.
+
 This document records the native lifecycle assumptions behind
 `TensorMappingInfo`, `PageSample`, and the adaptive dispatch cache.
 
@@ -56,6 +60,20 @@ The mapping test suite verifies:
   local mapping indices.
 - Re-reading the first model after another model load still returns its
   original generation and ranges.
+
+## Re-audit requirements
+
+If the native pin changes, re-check at least:
+
+- `llama_model_loader::init_mappings` and all `unmap_fragment` call sites;
+- whether mappings can move, split, or be recreated after model construction;
+- whether a context can outlive or replace a mapping;
+- whether file descriptors or backing inodes can change;
+- whether tensor-to-mapping relationships can change after load;
+- whether the public load path still returns only fully constructed models.
+
+A native revision that mutates mappings after load would require a new mapping
+epoch or re-snapshot, not assumption of the current guarantee.
 
 ## Remaining limitation
 

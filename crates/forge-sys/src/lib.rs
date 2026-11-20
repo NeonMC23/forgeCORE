@@ -292,6 +292,7 @@ pub struct llama_page_sample_result {
     pub resident_pages: u64,
     pub nonresident_pages: u64,
     pub unknown_pages: u64,
+    pub failed_pages: u64,
     pub page_size: u64,
     pub max_pages: u64,
     pub mapping_id: u64,
@@ -1087,15 +1088,17 @@ mod layout_tests {
         assert_eq!(offset_of!(llama_tensor_mapping, mapping_generation), 72);
         assert_eq!(offset_of!(llama_tensor_mapping, file_path), 80);
         assert_eq!(offset_of!(llama_tensor_mapping, file_size), 88);
-        assert_eq!(size_of::<llama_page_sample_result>(), 152);
-        assert_eq!(offset_of!(llama_page_sample_result, page_start), 96);
-        assert_eq!(offset_of!(llama_page_sample_result, page_end), 104);
-        assert_eq!(offset_of!(llama_page_sample_result, page_states), 112);
-        assert_eq!(offset_of!(llama_page_sample_result, page_offsets), 120);
-        assert_eq!(offset_of!(llama_page_sample_result, state_capacity), 128);
-        assert_eq!(offset_of!(llama_page_sample_result, states_written), 136);
-        assert_eq!(offset_of!(llama_page_sample_result, truncated), 144);
-        assert_eq!(offset_of!(llama_page_sample_result, error), 148);
+        assert_eq!(size_of::<llama_page_sample_result>(), 160);
+        assert_eq!(offset_of!(llama_page_sample_result, failed_pages), 40);
+        assert_eq!(offset_of!(llama_page_sample_result, page_size), 48);
+        assert_eq!(offset_of!(llama_page_sample_result, page_start), 104);
+        assert_eq!(offset_of!(llama_page_sample_result, page_end), 112);
+        assert_eq!(offset_of!(llama_page_sample_result, page_states), 120);
+        assert_eq!(offset_of!(llama_page_sample_result, page_offsets), 128);
+        assert_eq!(offset_of!(llama_page_sample_result, state_capacity), 136);
+        assert_eq!(offset_of!(llama_page_sample_result, states_written), 144);
+        assert_eq!(offset_of!(llama_page_sample_result, truncated), 152);
+        assert_eq!(offset_of!(llama_page_sample_result, error), 156);
         assert_eq!(size_of::<llama_model_page_release_result>(), 32);
         assert_eq!(size_of::<llama_model_lifetime_state>(), 32);
         assert_eq!(offset_of!(llama_model_lifetime_state, instance_id), 0);

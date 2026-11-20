@@ -323,6 +323,7 @@ pub struct NodeDispatchSource {
     pub resident_pages: u64,
     pub nonresident_pages: u64,
     pub unknown_pages: u64,
+    pub failed_pages: u64,
     pub skipped_pages: u64,
     pub budget_excluded_pages: u64,
     pub unsampled_pages: u64,
@@ -365,6 +366,7 @@ struct RawDispatchSource {
     resident_pages: u64,
     nonresident_pages: u64,
     unknown_pages: u64,
+    failed_pages: u64,
     skipped_pages: u64,
     budget_excluded_pages: u64,
     unsampled_pages: u64,
@@ -390,6 +392,7 @@ impl Default for RawDispatchSource {
             resident_pages: 0,
             nonresident_pages: 0,
             unknown_pages: 0,
+            failed_pages: 0,
             skipped_pages: 0,
             budget_excluded_pages: 0,
             unsampled_pages: 0,
@@ -498,6 +501,7 @@ struct SourceStats {
     resident_pages: u64,
     nonresident_pages: u64,
     unknown_pages: u64,
+    failed_pages: u64,
     skipped_pages: u64,
     budget_excluded_pages: u64,
     unsampled_pages: u64,
@@ -868,6 +872,7 @@ impl DispatchState {
             source.resident_pages = stats.resident_pages;
             source.nonresident_pages = stats.nonresident_pages;
             source.unknown_pages = stats.unknown_pages;
+            source.failed_pages = stats.failed_pages;
             source.skipped_pages = stats.skipped_pages;
             source.budget_excluded_pages = stats.budget_excluded_pages;
             source.unsampled_pages = stats.unsampled_pages;
@@ -881,6 +886,7 @@ impl DispatchState {
             PageSampleStatus::Unknown
         } else if aggregate.sampled_pages < aggregate.requested_pages
             || aggregate.unknown_pages > 0
+            || aggregate.failed_pages > 0
             || aggregate.skipped_pages > 0
             || aggregate.budget_excluded_pages > 0
             || aggregate.truncated
@@ -1117,7 +1123,8 @@ fn add_range_attribution(
         match state {
             1 => global.resident_pages = global.resident_pages.saturating_add(1),
             0 => global.nonresident_pages = global.nonresident_pages.saturating_add(1),
-            _ => global.unknown_pages = global.unknown_pages.saturating_add(1),
+            2 => global.unknown_pages = global.unknown_pages.saturating_add(1),
+            _ => global.failed_pages = global.failed_pages.saturating_add(1),
         }
     }
     let unobserved = range_pages.saturating_sub(observed);
@@ -1158,9 +1165,13 @@ fn add_range_attribution(
                     stats[source_index].nonresident_pages =
                         stats[source_index].nonresident_pages.saturating_add(1)
                 }
-                _ => {
+                2 => {
                     stats[source_index].unknown_pages =
                         stats[source_index].unknown_pages.saturating_add(1)
+                }
+                _ => {
+                    stats[source_index].failed_pages =
+                        stats[source_index].failed_pages.saturating_add(1)
                 }
             }
         }
@@ -1261,6 +1272,7 @@ fn page_sample_from_raw(rc: i32, raw: forge_sys::llama_page_sample_result) -> Pa
         resident_pages: raw.resident_pages,
         nonresident_pages: raw.nonresident_pages,
         unknown_pages: raw.unknown_pages,
+        failed_pages: raw.failed_pages,
         page_size: raw.page_size,
         max_pages: raw.max_pages,
         mapping_id: raw.mapping_id,
@@ -1300,6 +1312,7 @@ fn raw_to_event(raw: &RawDispatchEvent) -> NodeDispatchEvent {
                 resident_pages: source.resident_pages,
                 nonresident_pages: source.nonresident_pages,
                 unknown_pages: source.unknown_pages,
+                failed_pages: source.failed_pages,
                 skipped_pages: source.skipped_pages,
                 budget_excluded_pages: source.budget_excluded_pages,
                 unsampled_pages: source.unsampled_pages,
@@ -2683,6 +2696,35 @@ mod dispatch_attribution_tests {
         assert_eq!(stats[1].sampled_pages, 2);
         assert_eq!(stats[1].resident_pages, 2);
         assert_eq!(stats[1].nonresident_pages, 0);
+    }
+
+    #[test]
+    fn attribution_keeps_failed_pages_distinct_from_unknown() {
+        let page = 4096;
+        let sources = [source(1, 1, 0, 4 * page, page)];
+        let mut stats = [SourceStats::default(); MAX_DISPATCH_SOURCES];
+        stats[0].referenced_pages = 4;
+        let mut global = PageSample {
+            requested_pages: 4,
+            ..PageSample::default()
+        };
+        let states = [(0, 1), (page, 2), (2 * page, 3)];
+        add_range_attribution(
+            &range(0, 4 * page, page),
+            &sources,
+            &mut stats,
+            &states,
+            ObservedProvenance::Fresh,
+            UnobservedClass::Unsampled,
+            &mut global,
+        );
+        assert_eq!(global.sampled_pages, 3);
+        assert_eq!(global.resident_pages, 1);
+        assert_eq!(global.unknown_pages, 1);
+        assert_eq!(global.failed_pages, 1);
+        assert_eq!(global.unsampled_pages, 1);
+        assert_eq!(stats[0].failed_pages, 1);
+        assert_eq!(stats[0].unknown_pages, 1);
     }
 
     #[test]
