@@ -959,6 +959,11 @@ unsafe extern "C" {
         out: *mut llama_buffer_memory_info,
     ) -> i32;
     pub fn llama_context_stage_layer_cuda(ctx: *mut llama_context, layer: i32) -> i32;
+    pub fn llama_context_layer_staging_bytes(
+        ctx: *const llama_context,
+        layer: i32,
+        out_bytes: *mut u64,
+    ) -> i32;
     pub fn llama_context_staged_layer_info(
         ctx: *const llama_context,
         layer: i32,

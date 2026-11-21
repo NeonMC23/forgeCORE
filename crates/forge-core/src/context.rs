@@ -1936,6 +1936,23 @@ impl Context {
         Ok(())
     }
 
+    /// Exact aligned CUDA byte total for a layer, without allocating.
+    pub fn staged_layer_bytes(&self, layer: u32) -> Result<u64> {
+        let layer_i32 =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        let mut bytes = 0u64;
+        // SAFETY: live context; native validates layer and writes out.
+        let rc = unsafe {
+            forge_sys::llama_context_layer_staging_bytes(self.raw, layer_i32, &mut bytes)
+        };
+        if rc != 0 {
+            return Err(Error::context(format!(
+                "native staging byte query failed for layer {layer}"
+            )));
+        }
+        Ok(bytes)
+    }
+
     pub fn staged_layer_info(&self, layer: u32) -> Result<StagedLayerInfo> {
         let layer_i32 =
             i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;

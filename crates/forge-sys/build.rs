@@ -52,6 +52,7 @@ fn main() {
             || !text.contains("llama_model_tensor_storage_entry")
             || !text.contains("llama_model_memory_breakdown_count")
             || !text.contains("llama_context_stage_layer_cuda")
+            || !text.contains("llama_context_layer_staging_bytes")
             || !text.contains("llama_context_staged_layer_info")
             || !text.contains("llama_context_memory_breakdown_count")
             || !text.contains("llama_context_memory_breakdown_entry")
