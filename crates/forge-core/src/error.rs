@@ -41,6 +41,11 @@ impl Error {
         Self(format!("context error: {}", message.into()))
     }
 
+    /// Staged-residency lifecycle failure (busy, invalid state, not staged, ...).
+    pub fn staging(message: impl Into<String>) -> Self {
+        Self(format!("staging error: {}", message.into()))
+    }
+
     /// Batch construction or batch validation failure.
     pub fn batch(message: impl Into<String>) -> Self {
         Self(format!("batch error: {}", message.into()))

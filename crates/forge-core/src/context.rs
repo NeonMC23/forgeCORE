@@ -1671,6 +1671,100 @@ pub struct StagedTensorInfo {
     pub layer: u32,
 }
 
+/// Native graph lifecycle phase. Observational: only successful graph
+/// invalidation proves that no cached graph can consume previous staged sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphPhase {
+    Idle,
+    Building,
+    Prepared,
+    Executing,
+    CompletionPending,
+    Quiescing,
+    Invalidating,
+    Invalidated,
+    Rebuilding,
+    Failed,
+    Destroying,
+    Unknown(u32),
+}
+
+impl GraphPhase {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Idle,
+            1 => Self::Building,
+            2 => Self::Prepared,
+            3 => Self::Executing,
+            4 => Self::CompletionPending,
+            5 => Self::Quiescing,
+            6 => Self::Invalidating,
+            7 => Self::Invalidated,
+            8 => Self::Rebuilding,
+            9 => Self::Failed,
+            10 => Self::Destroying,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Building => "building",
+            Self::Prepared => "prepared",
+            Self::Executing => "executing",
+            Self::CompletionPending => "completion_pending",
+            Self::Quiescing => "quiescing",
+            Self::Invalidating => "invalidating",
+            Self::Invalidated => "invalidated",
+            Self::Rebuilding => "rebuilding",
+            Self::Failed => "failed",
+            Self::Destroying => "destroying",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// Coarse-grained native staged-residency lifecycle snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingLifecycleState {
+    pub graph_phase: GraphPhase,
+    pub graph_invalidated: bool,
+    pub resident_layers: u32,
+    pub resident_bytes: u64,
+    pub allocation_count: u64,
+    pub release_count: u64,
+    pub reuse_count: u64,
+    pub staging_failures: u64,
+    pub graph_invalidation_count: u64,
+    pub graph_rebuild_count: u64,
+    pub scheduler_reset_count: u64,
+    pub invalidation_failures: u64,
+    pub quiescence_wait_ns: u64,
+    pub last_quiescence_wait_ns: u64,
+    pub eviction_supported: bool,
+    pub allocation_reuse_supported: bool,
+    pub transfer_compute_overlap_supported: bool,
+}
+
+fn staging_error(operation: &str, layer: Option<u32>, code: i32) -> Error {
+    let kind = match code {
+        1 => "not_staged",
+        2 => "busy",
+        3 => "no_cuda",
+        4 => "allocation_failed",
+        5 => "invalid_state",
+        -1 => "invalid_argument",
+        _ => "unknown",
+    };
+    match layer {
+        Some(layer) => Error::staging(format!(
+            "{operation} failed for layer {layer}: {kind} (native code {code})"
+        )),
+        None => Error::staging(format!("{operation} failed: {kind} (native code {code})")),
+    }
+}
+
 /// One buffer-type entry from the native context memory breakdown.
 ///
 /// `model_bytes`, `context_bytes`, and `compute_bytes` are disjoint within the
@@ -2001,6 +2095,88 @@ impl Context {
             device_ptr: raw.device_ptr,
             bytes: raw.bytes,
             layer,
+        })
+    }
+
+    /// Quiesce outstanding work and invalidate all cached graph results and
+    /// scheduler mappings. After success no cached graph can consume the
+    /// current staged sources, so they may be evicted or added before the next
+    /// graph build. Idempotent.
+    pub fn invalidate_graph(&self) -> Result<()> {
+        // SAFETY: self.raw is a live context; native performs quiescence and
+        // only resets state it owns.
+        let rc = unsafe { forge_sys::llama_context_invalidate_graph(self.raw) };
+        if rc != 0 {
+            return Err(staging_error("invalidate_graph", None, rc));
+        }
+        Ok(())
+    }
+
+    /// Release one staged layer after successful invalidation. The native layer
+    /// refuses with `busy` when any graph, scheduler mapping or execution can
+    /// still reference the allocation.
+    pub fn evict_layer_cuda(&self, layer: u32) -> Result<()> {
+        let layer_i32 =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        // SAFETY: live context; native validates state and layer.
+        let rc = unsafe { forge_sys::llama_context_evict_layer_cuda(self.raw, layer_i32) };
+        if rc != 0 {
+            return Err(staging_error("evict_layer_cuda", Some(layer), rc));
+        }
+        Ok(())
+    }
+
+    /// Native lifecycle phases, staged bytes and mutation counters.
+    pub fn staging_state(&self) -> Result<StagingLifecycleState> {
+        let mut raw = forge_sys::llama_staging_state::default();
+        // SAFETY: live context, writable out.
+        let rc = unsafe { forge_sys::llama_context_staging_state(self.raw, &mut raw) };
+        if rc != 0 {
+            return Err(Error::context("native staging state query failed"));
+        }
+        Ok(StagingLifecycleState {
+            graph_phase: GraphPhase::from_raw(raw.graph_phase),
+            graph_invalidated: raw.graph_invalidated != 0,
+            resident_layers: raw.resident_layers,
+            resident_bytes: raw.resident_bytes,
+            allocation_count: raw.allocation_count,
+            release_count: raw.release_count,
+            reuse_count: raw.reuse_count,
+            staging_failures: raw.staging_failures,
+            graph_invalidation_count: raw.graph_invalidation_count,
+            graph_rebuild_count: raw.graph_rebuild_count,
+            scheduler_reset_count: raw.scheduler_reset_count,
+            invalidation_failures: raw.invalidation_failures,
+            quiescence_wait_ns: raw.quiescence_wait_ns,
+            last_quiescence_wait_ns: raw.last_quiescence_wait_ns,
+            eviction_supported: raw.eviction_supported != 0,
+            allocation_reuse_supported: raw.allocation_reuse_supported != 0,
+            transfer_compute_overlap_supported: raw.transfer_compute_overlap_supported != 0,
+        })
+    }
+
+    pub fn staged_layer_count(&self) -> Result<u32> {
+        // SAFETY: live context.
+        let count = unsafe { forge_sys::llama_context_staged_layer_count(self.raw) };
+        u32::try_from(count).map_err(|_| Error::context("native staged layer count failed"))
+    }
+
+    pub fn staged_layer_at(&self, index: u32) -> Result<StagedLayerInfo> {
+        let index_i32 =
+            i32::try_from(index).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        let mut raw = forge_sys::llama_staged_layer_info::default();
+        // SAFETY: live context, valid index per native check, writable out.
+        let rc = unsafe { forge_sys::llama_context_staged_layer_at(self.raw, index_i32, &mut raw) };
+        if rc != 0 {
+            return Err(Error::context(format!(
+                "staged layer at index {index} is unavailable"
+            )));
+        }
+        Ok(StagedLayerInfo {
+            layer: u32::try_from(raw.layer).unwrap_or(0),
+            tensor_count: u32::try_from(raw.tensor_count).unwrap_or(0),
+            device_bytes: raw.device_bytes,
+            graph_substitutions: raw.graph_substitutions,
         })
     }
 

@@ -321,6 +321,30 @@ impl Default for llama_staged_tensor_info {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
+pub struct llama_staging_state {
+    pub graph_phase: u32,
+    pub graph_invalidated: u32,
+    pub resident_layers: u32,
+    pub reserved: u32,
+    pub resident_bytes: u64,
+    pub allocation_count: u64,
+    pub release_count: u64,
+    pub reuse_count: u64,
+    pub staging_failures: u64,
+    pub graph_invalidation_count: u64,
+    pub graph_rebuild_count: u64,
+    pub scheduler_reset_count: u64,
+    pub invalidation_failures: u64,
+    pub quiescence_wait_ns: u64,
+    pub last_quiescence_wait_ns: u64,
+    pub eviction_supported: u32,
+    pub allocation_reuse_supported: u32,
+    pub transfer_compute_overlap_supported: u32,
+    pub reserved2: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct llama_staged_layer_info {
     pub layer: i32,
     pub tensor_count: i32,
@@ -975,6 +999,18 @@ unsafe extern "C" {
         layer: i32,
         index: i32,
         out: *mut llama_staged_tensor_info,
+    ) -> i32;
+    pub fn llama_context_invalidate_graph(ctx: *mut llama_context) -> i32;
+    pub fn llama_context_evict_layer_cuda(ctx: *mut llama_context, layer: i32) -> i32;
+    pub fn llama_context_staging_state(
+        ctx: *const llama_context,
+        out: *mut llama_staging_state,
+    ) -> i32;
+    pub fn llama_context_staged_layer_count(ctx: *const llama_context) -> i32;
+    pub fn llama_context_staged_layer_at(
+        ctx: *const llama_context,
+        index: i32,
+        out: *mut llama_staged_layer_info,
     ) -> i32;
     pub fn llama_context_memory_breakdown_count(ctx: *const llama_context) -> i32;
     pub fn llama_context_memory_breakdown_entry(

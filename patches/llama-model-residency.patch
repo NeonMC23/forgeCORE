@@ -134,7 +134,7 @@ index 1df0f2b..0ed23e1 100644
          return (void *)ggml_numa_init;
      }
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b..15c8c15 100644
+index 31bbf8b..9118fa9 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -210,6 +210,7 @@ extern "C" {
@@ -324,7 +324,7 @@ index 31bbf8b..15c8c15 100644
      LLAMA_API struct llama_context * llama_init_from_model(
                       struct llama_model * model,
              struct llama_context_params   params);
-@@ -594,6 +767,110 @@ extern "C" {
+@@ -594,6 +767,187 @@ extern "C" {
      LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
@@ -432,11 +432,88 @@ index 31bbf8b..15c8c15 100644
 +    LLAMA_API int32_t llama_context_staged_tensor_info(
 +            const struct llama_context * ctx, int32_t layer, int32_t index,
 +            struct llama_staged_tensor_info * out);
++
++    // Explicit graph lifecycle. The phase is observational and is advanced by
++    // the native execution path; callers must not assume that a phase alone
++    // proves pointer safety. Invalidation is the operation that establishes
++    // that no cached graph can consume the previous staged sources.
++    enum llama_context_graph_phase {
++        LLAMA_CONTEXT_GRAPH_IDLE               = 0,
++        LLAMA_CONTEXT_GRAPH_BUILDING           = 1,
++        LLAMA_CONTEXT_GRAPH_PREPARED           = 2,
++        LLAMA_CONTEXT_GRAPH_EXECUTING          = 3,
++        LLAMA_CONTEXT_GRAPH_COMPLETION_PENDING = 4,
++        LLAMA_CONTEXT_GRAPH_QUIESCING          = 5,
++        LLAMA_CONTEXT_GRAPH_INVALIDATING       = 6,
++        LLAMA_CONTEXT_GRAPH_INVALIDATED        = 7,
++        LLAMA_CONTEXT_GRAPH_REBUILDING         = 8,
++        LLAMA_CONTEXT_GRAPH_FAILED             = 9,
++        LLAMA_CONTEXT_GRAPH_DESTROYING         = 10,
++    };
++
++    // Typed results for staged-source mutation. Positive values are failures;
++    // -1 is an invalid argument. Callers must treat any non-zero value as a
++    // failed operation and must not assume the previous selection changed.
++    enum llama_context_staging_error {
++        LLAMA_CONTEXT_STAGING_OK               = 0,
++        LLAMA_CONTEXT_STAGING_NOT_STAGED       = 1,
++        LLAMA_CONTEXT_STAGING_BUSY             = 2,
++        LLAMA_CONTEXT_STAGING_NO_CUDA          = 3,
++        LLAMA_CONTEXT_STAGING_ALLOC_FAILED     = 4,
++        LLAMA_CONTEXT_STAGING_INVALID_STATE    = 5,
++        LLAMA_CONTEXT_STAGING_INVALID_ARGUMENT = -1,
++    };
++
++    struct llama_staging_state {
++        uint32_t graph_phase;
++        uint32_t graph_invalidated;              // 1 if no cached graph can consume the staged sources
++        uint32_t resident_layers;
++        uint32_t reserved;
++        uint64_t resident_bytes;
++        uint64_t allocation_count;
++        uint64_t release_count;
++        uint64_t reuse_count;                    // always 0 until capacity reuse is genuinely implemented
++        uint64_t staging_failures;
++        uint64_t graph_invalidation_count;
++        uint64_t graph_rebuild_count;
++        uint64_t scheduler_reset_count;
++        uint64_t invalidation_failures;
++        uint64_t quiescence_wait_ns;
++        uint64_t last_quiescence_wait_ns;
++        uint32_t eviction_supported;
++        uint32_t allocation_reuse_supported;
++        uint32_t transfer_compute_overlap_supported;
++        uint32_t reserved2;
++    };
++
++    // Quiesce outstanding work, reset the cached graph results (which frees all
++    // graph nodes and substituted source pointers) and reset scheduler
++    // mappings/copies. After success no cached graph can consume the staged
++    // sources and staged layers may be evicted or added before the next graph
++    // build. Idempotent. Returns 0 or -1.
++    LLAMA_API int32_t llama_context_invalidate_graph(struct llama_context * ctx);
++
++    // Release one staged layer after successful invalidation. Returns 0, a
++    // positive llama_context_staging_error, or -1 for invalid input. The layer
++    // buffer is freed only when no graph, scheduler mapping or execution can
++    // reference it. Does not evict implicitly.
++    LLAMA_API int32_t llama_context_evict_layer_cuda(
++            struct llama_context * ctx, int32_t layer);
++
++    // Coarse-grained native lifecycle and counter snapshot.
++    LLAMA_API int32_t llama_context_staging_state(
++            const struct llama_context * ctx,
++            struct llama_staging_state * out);
++    LLAMA_API int32_t llama_context_staged_layer_count(const struct llama_context * ctx);
++    LLAMA_API int32_t llama_context_staged_layer_at(
++            const struct llama_context * ctx, int32_t index,
++            struct llama_staged_layer_info * out);
++
      LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fcd4dfb..3adff83 100644
+index fcd4dfb..ffc63cd 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -447,9 +524,11 @@ index fcd4dfb..3adff83 100644
  #include "llama-arch.h"
  #include "llama-graph.h"
  #include "llama-impl.h"
-@@ -14,7 +15,10 @@
+@@ -13,8 +14,12 @@
+ #include "llama-sampler.h"
  #include "llama.h"
  
++#include <algorithm>
  #include <cinttypes>
 +#include <cerrno>
  #include <cmath>
@@ -458,7 +537,7 @@ index fcd4dfb..3adff83 100644
  #include <cstring>
  #include <limits>
  #include <stdexcept>
-@@ -477,11 +481,17 @@ llama_context::llama_context(
+@@ -477,11 +482,17 @@ llama_context::llama_context(
              sampling.token_ids_full_vocab[i] = i;
          }
      }
@@ -476,10 +555,15 @@ index fcd4dfb..3adff83 100644
  
      // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
      if (!model.hparams.no_alloc && !opt_ctx) {
-@@ -796,6 +806,13 @@ void llama_context::synchronize() {
+@@ -796,6 +807,18 @@ void llama_context::synchronize() {
  
      n_queued_tokens = 0;
      t_compute_start_us = 0;
++
++    if (graph_phase == LLAMA_CONTEXT_GRAPH_EXECUTING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_COMPLETION_PENDING) {
++        graph_phase = LLAMA_CONTEXT_GRAPH_IDLE;
++    }
 +
 +    // The scheduler is now quiescent. Keep this after backend synchronization:
 +    // an exclusive page release must not observe the gate free earlier.
@@ -490,7 +574,7 @@ index fcd4dfb..3adff83 100644
  }
  
  const llama_model & llama_context::get_model() const {
-@@ -810,6 +827,34 @@ ggml_backend_sched_t llama_context::get_sched() const {
+@@ -810,6 +833,34 @@ ggml_backend_sched_t llama_context::get_sched() const {
      return sched.get();
  }
  
@@ -525,15 +609,48 @@ index fcd4dfb..3adff83 100644
  uint32_t llama_context::n_ctx() const {
      return cparams.n_ctx;
  }
-@@ -1423,6 +1468,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1413,6 +1464,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+ 
+         n_reused++;
++        // A reused graph still references the current staged sources.
++        staged_graph_invalidated = false;
++        graph_phase = LLAMA_CONTEXT_GRAPH_PREPARED;
+     } else {
+         gf_res_prev_active = nullptr;
+         res->reset();
+@@ -1422,23 +1476,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
          //const auto t_start_us = ggml_time_us();
  
++        graph_phase = LLAMA_CONTEXT_GRAPH_BUILDING;
          gf = model.build_graph(gparams);
 +        apply_staged_layers(gf);
  
          //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
  
-@@ -2585,9 +2631,22 @@ ggml_status llama_context::graph_compute(
+         if (!gf) {
+             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
++            graph_phase = LLAMA_CONTEXT_GRAPH_FAILED;
+             ret = GGML_STATUS_FAILED;
+             return nullptr;
+         }
+ 
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
++            graph_phase = LLAMA_CONTEXT_GRAPH_FAILED;
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+         }
+ 
+         gf_res_prev_active = res;
++        staged_graph_invalidated = false;
++        ++graph_rebuild_count;
++        graph_phase = LLAMA_CONTEXT_GRAPH_PREPARED;
+     }
+ 
+     // set the input data for the input tensors
+@@ -2585,9 +2646,26 @@ ggml_status llama_context::graph_compute(
          set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
      }
  
@@ -546,17 +663,21 @@ index fcd4dfb..3adff83 100644
 +        model.execution_started();
 +    }
 +
++    graph_phase = LLAMA_CONTEXT_GRAPH_EXECUTING;
      auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
      if (status != GGML_STATUS_SUCCESS) {
++        graph_phase = LLAMA_CONTEXT_GRAPH_FAILED;
          LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
 +        if (execution_lock.owns_lock()) {
 +            model.execution_finished();
 +            execution_lock.unlock();
 +        }
++    } else {
++        graph_phase = LLAMA_CONTEXT_GRAPH_COMPLETION_PENDING;
      }
  
      // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
-@@ -3433,6 +3492,212 @@ void llama_context::perf_reset() {
+@@ -3433,6 +3511,321 @@ void llama_context::perf_reset() {
      n_reused    = 0;
  }
  
@@ -569,11 +690,17 @@ index fcd4dfb..3adff83 100644
 +
 +int32_t llama_context::stage_layer_cuda(int32_t layer) {
 +    if (layer < 0 || static_cast<uint32_t>(layer) >= model.hparams.n_layer_all) {
-+        return -1;
++        return LLAMA_CONTEXT_STAGING_INVALID_ARGUMENT;
 +    }
-+    if (has_inflight_execution() || gf_res_prev_active != nullptr) {
-+        LLAMA_LOG_ERROR("%s: cannot stage layer %d while a graph is active\n", __func__, layer);
-+        return -1;
++    if (has_inflight_execution() || gf_res_prev_active != nullptr ||
++        !staged_graph_invalidated ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_BUILDING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_EXECUTING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_COMPLETION_PENDING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_INVALIDATING) {
++        LLAMA_LOG_ERROR("%s: cannot stage layer %d while a graph may reference staged sources\n", __func__, layer);
++        ++staged_staging_failures;
++        return LLAMA_CONTEXT_STAGING_BUSY;
 +    }
 +    for (const auto & staged : staged_layers) {
 +        if (staged.layer == layer) {
@@ -654,6 +781,7 @@ index fcd4dfb..3adff83 100644
 +    }
 +    staged.device_bytes = total;
 +    staged_layers.push_back(std::move(staged));
++    ++staged_allocation_count;
 +    return 0;
 +}
 +
@@ -741,6 +869,108 @@ index fcd4dfb..3adff83 100644
 +    return -1;
 +}
 +
++int32_t llama_context::invalidate_graph() {
++    if (!sched) {
++        ++staged_invalidation_failures;
++        return LLAMA_CONTEXT_STAGING_INVALID_STATE;
++    }
++    graph_phase = LLAMA_CONTEXT_GRAPH_INVALIDATING;
++    const int64_t t0_us = ggml_time_us();
++    // Narrow quiescence: waits on each scheduler backend and releases the
++    // execution gate. This is not a device-wide synchronization.
++    synchronize();
++    const int64_t elapsed_us = ggml_time_us() - t0_us;
++    last_quiescence_wait_ns = static_cast<uint64_t>(elapsed_us > 0 ? elapsed_us : 0) * 1000ull;
++    quiescence_wait_ns += last_quiescence_wait_ns;
++
++    // Drops the cached reusable graph results. reset() reinitializes their
++    // ggml context, destroying every graph node and substituted source pointer.
++    gf_res_prev_active = nullptr;
++    for (auto & res : gf_res_prev) {
++        if (res) {
++            res->reset();
++        }
++    }
++
++    // Drops scheduler tensor mappings, copies and split state. The next
++    // split_graph rebuilds them for the new graph and staged selection.
++    ggml_backend_sched_reset(sched.get());
++    ++scheduler_reset_count;
++    ++graph_invalidation_count;
++    staged_graph_invalidated = true;
++    graph_phase = LLAMA_CONTEXT_GRAPH_INVALIDATED;
++    return LLAMA_CONTEXT_STAGING_OK;
++}
++
++int32_t llama_context::evict_layer_cuda(int32_t layer) {
++    if (layer < 0) {
++        return LLAMA_CONTEXT_STAGING_INVALID_ARGUMENT;
++    }
++    if (!staged_graph_invalidated || has_inflight_execution() ||
++        gf_res_prev_active != nullptr ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_BUILDING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_EXECUTING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_COMPLETION_PENDING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_INVALIDATING) {
++        return LLAMA_CONTEXT_STAGING_BUSY;
++    }
++    auto it = std::find_if(staged_layers.begin(), staged_layers.end(),
++            [layer](const llama_staged_layer & staged) { return staged.layer == layer; });
++    if (it == staged_layers.end()) {
++        return LLAMA_CONTEXT_STAGING_NOT_STAGED;
++    }
++    // Erasing the owning context and backend buffer releases the allocation.
++    // This is only reached after invalidation established that no graph or
++    // scheduler mapping can reference these tensors.
++    staged_layers.erase(it);
++    ++staged_release_count;
++    return LLAMA_CONTEXT_STAGING_OK;
++}
++
++int32_t llama_context::staging_state(llama_staging_state * out) const {
++    if (out == nullptr) {
++        return -1;
++    }
++    std::memset(out, 0, sizeof(*out));
++    out->graph_phase = graph_phase;
++    out->graph_invalidated = staged_graph_invalidated ? 1u : 0u;
++    out->resident_layers = static_cast<uint32_t>(staged_layers.size());
++    for (const auto & staged : staged_layers) {
++        out->resident_bytes += staged.device_bytes;
++    }
++    out->allocation_count = staged_allocation_count;
++    out->release_count = staged_release_count;
++    out->reuse_count = staged_reuse_count;
++    out->staging_failures = staged_staging_failures;
++    out->graph_invalidation_count = graph_invalidation_count;
++    out->graph_rebuild_count = graph_rebuild_count;
++    out->scheduler_reset_count = scheduler_reset_count;
++    out->invalidation_failures = staged_invalidation_failures;
++    out->quiescence_wait_ns = quiescence_wait_ns;
++    out->last_quiescence_wait_ns = last_quiescence_wait_ns;
++    out->eviction_supported = 1;
++    out->allocation_reuse_supported = 0;
++    out->transfer_compute_overlap_supported = 0;
++    return 0;
++}
++
++int32_t llama_context::staged_layer_count() const {
++    return static_cast<int32_t>(staged_layers.size());
++}
++
++int32_t llama_context::staged_layer_at(int32_t index, llama_staged_layer_info * out) const {
++    if (out == nullptr || index < 0 || index >= static_cast<int32_t>(staged_layers.size())) {
++        return -1;
++    }
++    const llama_staged_layer & staged = staged_layers[index];
++    std::memset(out, 0, sizeof(*out));
++    out->layer = staged.layer;
++    out->tensor_count = static_cast<int32_t>(staged.tensors.size());
++    out->device_bytes = staged.device_bytes;
++    out->graph_substitutions = staged.graph_substitutions;
++    return 0;
++}
++
 +void llama_context::apply_staged_layers(ggml_cgraph * gf) {
 +    if (gf == nullptr || staged_layers.empty()) {
 +        return;
@@ -769,7 +999,7 @@ index fcd4dfb..3adff83 100644
  llama_memory_breakdown llama_context::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
      for (const auto & [buft, size] : model.memory_breakdown()) {
-@@ -4406,6 +4671,89 @@ void llama_opt_epoch(
+@@ -4406,6 +4799,113 @@ void llama_opt_epoch(
  llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
      return ctx->memory_breakdown();
  }
@@ -796,6 +1026,30 @@ index fcd4dfb..3adff83 100644
 +        const struct llama_context * ctx, int32_t layer, int32_t index,
 +        struct llama_staged_tensor_info * out) {
 +    return ctx == nullptr ? -1 : ctx->staged_tensor_info(layer, index, out);
++}
++
++int32_t llama_context_invalidate_graph(struct llama_context * ctx) {
++    return ctx == nullptr ? LLAMA_CONTEXT_STAGING_INVALID_ARGUMENT : ctx->invalidate_graph();
++}
++
++int32_t llama_context_evict_layer_cuda(struct llama_context * ctx, int32_t layer) {
++    return ctx == nullptr ? LLAMA_CONTEXT_STAGING_INVALID_ARGUMENT : ctx->evict_layer_cuda(layer);
++}
++
++int32_t llama_context_staging_state(
++        const struct llama_context * ctx,
++        struct llama_staging_state * out) {
++    return ctx == nullptr ? -1 : ctx->staging_state(out);
++}
++
++int32_t llama_context_staged_layer_count(const struct llama_context * ctx) {
++    return ctx == nullptr ? -1 : ctx->staged_layer_count();
++}
++
++int32_t llama_context_staged_layer_at(
++        const struct llama_context * ctx, int32_t index,
++        struct llama_staged_layer_info * out) {
++    return ctx == nullptr ? -1 : ctx->staged_layer_at(index, out);
 +}
 +
 +
@@ -860,7 +1114,7 @@ index fcd4dfb..3adff83 100644
  llama_context * llama_get_ctx_other(struct llama_context * ctx) {
      return ctx->get_cparams().ctx_other;
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 77ef92f..9d861a6 100644
+index 77ef92f..c55bc31 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -13,6 +13,7 @@
@@ -901,7 +1155,7 @@ index 77ef92f..9d861a6 100644
      uint32_t n_threads()       const;
      uint32_t n_threads_batch() const;
  
-@@ -190,6 +207,13 @@ struct llama_context {
+@@ -190,6 +207,20 @@ struct llama_context {
  
      llama_memory_breakdown memory_breakdown() const;
  
@@ -912,20 +1166,42 @@ index 77ef92f..9d861a6 100644
 +    int32_t staged_tensor_count(int32_t layer) const;
 +    int32_t staged_tensor_info(int32_t layer, int32_t index, llama_staged_tensor_info * out) const;
 +
++    // Explicit graph/scheduler invalidation and dynamic staged-source mutation.
++    int32_t invalidate_graph();
++    int32_t evict_layer_cuda(int32_t layer);
++    int32_t staging_state(llama_staging_state * out) const;
++    int32_t staged_layer_count() const;
++    int32_t staged_layer_at(int32_t index, llama_staged_layer_info * out) const;
++
      //
      // training
      //
-@@ -352,6 +376,9 @@ private:
+@@ -352,6 +383,24 @@ private:
      ggml_backend_t backend_cpu = nullptr;
      std::vector<ggml_backend_ptr> backends;
  
 +    std::vector<llama_staged_layer> staged_layers;
 +    void apply_staged_layers(ggml_cgraph * gf);
 +
++    // Graph lifecycle and staged-source ownership facts. staged_graph_invalidated
++    // is true only when no cached reusable graph can consume the staged sources.
++    uint32_t graph_phase = LLAMA_CONTEXT_GRAPH_IDLE;
++    bool staged_graph_invalidated = true;
++    uint64_t staged_allocation_count = 0;
++    uint64_t staged_release_count = 0;
++    uint64_t staged_reuse_count = 0;
++    uint64_t staged_staging_failures = 0;
++    uint64_t graph_invalidation_count = 0;
++    uint64_t graph_rebuild_count = 0;
++    uint64_t scheduler_reset_count = 0;
++    uint64_t staged_invalidation_failures = 0;
++    uint64_t quiescence_wait_ns = 0;
++    uint64_t last_quiescence_wait_ns = 0;
++
      // training
      ggml_opt_context_t opt_ctx = nullptr;
  
-@@ -385,6 +412,13 @@ private:
+@@ -385,6 +434,13 @@ private:
      // env: LLAMA_GRAPH_REUSE_DISABLE
      bool graph_reuse_disable = false;
  

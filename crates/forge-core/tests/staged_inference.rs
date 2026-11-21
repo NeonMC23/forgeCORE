@@ -244,3 +244,90 @@ fn corrupting_staged_weights_changes_logits_proving_consumption() {
         "corrupting staged weights did not change logits; staged data may be ignored"
     );
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn staged_layer_eviction_requires_invalidation_and_supports_replacement() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(reason)) => {
+            eprintln!("SKIP: CUDA unavailable: {reason}");
+            return;
+        }
+        Err(error) => panic!("staging engine: {error}"),
+    };
+
+    let model = staging_model(&path).expect("CUDA device");
+    let mut options = ContextOptions::default();
+    options.n_ctx = 128;
+    let mut context = Context::open(&model, &options).expect("context");
+
+    fill_staged_layer(&model, &context, &engine, 0, None).expect("stage and fill layer 0");
+    let before = context.staging_state().expect("state before");
+    assert_eq!(before.resident_layers, 1);
+    assert!(before.graph_invalidated);
+
+    context.decode(&batch()).expect("decode with layer 0");
+
+    // A submitted graph still references the staged sources. Eviction must be
+    // refused until invalidation has quiesced and detached them.
+    let evict_error = context
+        .evict_layer_cuda(0)
+        .expect_err("eviction before invalidation must fail");
+    assert!(
+        evict_error.0.contains("busy"),
+        "expected typed busy error, got {evict_error}"
+    );
+
+    context
+        .invalidate_graph()
+        .expect("invalidate after execution");
+    // Idempotent invalidation.
+    context.invalidate_graph().expect("repeat invalidation");
+
+    let invalidated = context.staging_state().expect("state after invalidation");
+    assert!(invalidated.graph_invalidated);
+    assert!(invalidated.graph_invalidation_count >= 2);
+    assert!(invalidated.scheduler_reset_count >= 2);
+    assert!(invalidated.quiescence_wait_ns > 0);
+
+    context.evict_layer_cuda(0).expect("evict layer 0");
+    let duplicate = context
+        .evict_layer_cuda(0)
+        .expect_err("duplicate eviction must fail");
+    assert!(
+        duplicate.0.contains("not_staged"),
+        "expected typed not_staged error, got {duplicate}"
+    );
+
+    fill_staged_layer(&model, &context, &engine, 1, None).expect("stage and fill layer 1");
+
+    let mut next = BatchBuilder::new(8);
+    next.push(5, 4, true).unwrap();
+    let next = next.build().unwrap();
+    context.decode(&next).expect("decode with layer 1");
+    let lifecycle = context.staging_state().expect("state after replacement");
+    assert_eq!(lifecycle.resident_layers, 1);
+    assert_eq!(lifecycle.release_count, 1);
+    assert!(lifecycle.allocation_count >= 2);
+    assert!(lifecycle.graph_rebuild_count >= 2);
+    assert_eq!(lifecycle.reuse_count, 0);
+    assert!(lifecycle.eviction_supported);
+    assert!(!lifecycle.allocation_reuse_supported);
+    assert!(!lifecycle.transfer_compute_overlap_supported);
+
+    let info = context.staged_layer_info(1).expect("layer 1 info");
+    assert!(
+        info.graph_substitutions > 0,
+        "rebuilt graph did not consume the replacement layer: {info:?}"
+    );
+    assert!(
+        context.staged_layer_info(0).is_err(),
+        "evicted layer 0 must not remain resident"
+    );
+    assert!(!context.logits(0).expect("logits").values().is_empty());
+}

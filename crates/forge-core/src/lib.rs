@@ -40,9 +40,9 @@ pub use batch::{Batch, BatchBuilder, SeqId, TokenId};
 pub use buffer::{Buffer, BufferType};
 pub use context::{
     AttentionType, BufferMemory, Context, ContextOptions, ContextTraceOptions, Embeddings,
-    FlashAttnType, Logits, NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions,
+    FlashAttnType, GraphPhase, Logits, NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions,
     NodeDispatchSource, NodeDispatchSummary, NodeSamplingStrategy, PoolingType, StagedLayerInfo,
-    StagedTensorInfo, TraceCompletion, TraceEvent, TracePhase, TraceSummary,
+    StagedTensorInfo, StagingLifecycleState, TraceCompletion, TraceEvent, TracePhase, TraceSummary,
     MAX_NODE_DISPATCH_CACHE, MAX_NODE_DISPATCH_EVENTS, MAX_NODE_DISPATCH_SAMPLE_PAGES,
 };
 pub use device::{
