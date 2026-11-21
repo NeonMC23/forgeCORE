@@ -146,6 +146,24 @@ The script preserves the pin and the residency patch, keeps `GGML_CPU=ON` and
 `libggml-cuda.so` exports `ggml_backend_cuda_reg`. It refuses to run when
 `nvidia-smi` or `nvcc` is unusable.
 
+## Validated CUDA build (2026-11-21)
+
+A CUDA build was compiled and physically validated on the reference machine:
+
+- GPU: NVIDIA GeForce RTX 3050 Laptop GPU, compute capability 8.6, 4 GiB VRAM.
+- Driver/NVML: 620.70.06; CUDA toolkit 13.2.51; host compiler `g++-15`.
+- Build: `native/build-cuda`; artifact `libggml-cuda.so.0.25.1` with SM 86
+  cubins and exported `ggml_backend_cuda_reg`.
+- Runtime: `registered_backends()` returns CUDA (1 device) and CPU (1 device);
+  CUDA0 reports 3,974,103,040 bytes total.
+- Physical model load and generation succeeded with 1, 8, and 31 requested
+  layers. Native readback reported 8 effective layers (7 transformer + output)
+  and 31 effective layers (30 transformer + output).
+- CPU-only execution remains functional with the same CUDA build.
+
+Use `FORGE_LLAMA_BUILD_DIR=build-cuda` when running forgeCORE or downstream
+crates against the CUDA tree. The default `build` tree remains CPU-only.
+
 ## Runtime loader path
 
 `crates/forge-core/build.rs` records an rpath to

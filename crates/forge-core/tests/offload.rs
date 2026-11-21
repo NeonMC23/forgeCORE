@@ -368,6 +368,39 @@ fn tensor_split_without_devices_fails_natively() {
 // -- E. skip-gated real offload ---------------------------------------------
 
 #[test]
+#[ignore = "requires FORGE_TEST_MODEL and a CUDA-enabled native build"]
+fn gpu_effective_placement_readback_real_model() {
+    if !supports_gpu_offload() {
+        println!("SKIP: no GPU device registered");
+        return;
+    }
+    let Some(path) = fixture() else { return };
+    let gpu = enumerate_devices()
+        .into_iter()
+        .find(|d| matches!(d.device_type, DeviceType::Gpu | DeviceType::Igpu))
+        .expect("GPU device");
+    let mut options = ModelOptions::default();
+    options.gpu_layers = GpuLayers::Count(1);
+    options.split_mode = SplitMode::None;
+    options.main_gpu = 0;
+    options.devices = Some(vec![gpu]);
+    let model = Model::load_with_options(&path, &options).expect("GPU model load");
+    let effective = model.effective_gpu_layers().expect("effective readback");
+    assert!(effective >= 1, "expected offloaded layers, got {effective}");
+    assert_eq!(
+        model.output_device_type().expect("output placement"),
+        DeviceType::Gpu
+    );
+    let layers = model.n_layer().expect("layer count");
+    let gpu_transformer = (0..layers)
+        .filter(|il| model.layer_device_type(*il).expect("layer placement") != DeviceType::Cpu)
+        .count();
+    println!(
+        "GPU placement: effective={effective}, transformer_gpu={gpu_transformer}, transformer_total={layers}"
+    );
+}
+
+#[test]
 fn gpu_offload_smoke() {
     if !supports_gpu_offload() {
         println!("SKIP: no GPU device in this environment (llama_supports_gpu_offload is false)");

@@ -237,9 +237,13 @@ fn enumerate_devices_finds_cpu() {
     // Total build queries (values are build-dependent, must not abort).
     let _ = forge_core::supports_mmap();
     let _ = forge_core::supports_mlock();
-    assert!(
-        !forge_core::supports_gpu_offload(),
-        "CPU-only build offers no GPU offload"
+    let has_gpu = devices
+        .iter()
+        .any(|d| matches!(d.device_type, DeviceType::Gpu | DeviceType::Igpu));
+    assert_eq!(
+        forge_core::supports_gpu_offload(),
+        has_gpu,
+        "offload flag must match whether a GPU device is registered"
     );
 }
 
