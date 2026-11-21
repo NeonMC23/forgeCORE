@@ -10,7 +10,8 @@
 use forge_core::model::set_log_quiet;
 use forge_core::{
     enumerate_devices, max_devices, registered_backends, supports_gpu_offload, supports_mlock,
-    supports_mmap, DeviceType, GpuLayers, Model, ModelLoadMode, ModelOptions, SplitMode,
+    supports_mmap, Context, ContextOptions, DeviceType, GpuLayers, Model, ModelLoadMode,
+    ModelOptions, SplitMode,
 };
 use std::path::PathBuf;
 
@@ -397,6 +398,27 @@ fn gpu_effective_placement_readback_real_model() {
         .count();
     println!(
         "GPU placement: effective={effective}, transformer_gpu={gpu_transformer}, transformer_total={layers}"
+    );
+    let mut context_options = ContextOptions::default();
+    context_options.n_ctx = 128;
+    let context = Context::open(&model, &context_options).expect("GPU context");
+    let breakdown = context.memory_breakdown().expect("memory breakdown");
+    assert!(!breakdown.is_empty(), "native breakdown must not be empty");
+    for entry in &breakdown {
+        println!(
+            "memory: buffer={} device={} model={} context={} compute={}",
+            entry.buffer_type,
+            entry.device_name,
+            entry.model_bytes,
+            entry.context_bytes,
+            entry.compute_bytes
+        );
+    }
+    assert!(
+        breakdown
+            .iter()
+            .any(|entry| entry.device_name.contains("CUDA0") && entry.model_bytes > 0),
+        "expected a CUDA0 model allocation: {breakdown:?}"
     );
 }
 

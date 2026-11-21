@@ -39,10 +39,10 @@ pub use backend::Backend;
 pub use batch::{Batch, BatchBuilder, SeqId, TokenId};
 pub use buffer::{Buffer, BufferType};
 pub use context::{
-    AttentionType, Context, ContextOptions, ContextTraceOptions, Embeddings, FlashAttnType, Logits,
-    NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSource,
-    NodeDispatchSummary, NodeSamplingStrategy, PoolingType, TraceCompletion, TraceEvent,
-    TracePhase, TraceSummary, MAX_NODE_DISPATCH_CACHE, MAX_NODE_DISPATCH_EVENTS,
+    AttentionType, BufferMemory, Context, ContextOptions, ContextTraceOptions, Embeddings,
+    FlashAttnType, Logits, NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions,
+    NodeDispatchSource, NodeDispatchSummary, NodeSamplingStrategy, PoolingType, TraceCompletion,
+    TraceEvent, TracePhase, TraceSummary, MAX_NODE_DISPATCH_CACHE, MAX_NODE_DISPATCH_EVENTS,
     MAX_NODE_DISPATCH_SAMPLE_PAGES,
 };
 pub use device::{

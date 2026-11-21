@@ -134,7 +134,7 @@ index 1df0f2b..0ed23e1 100644
          return (void *)ggml_numa_init;
      }
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b..4e92d7d 100644
+index 31bbf8b..ca1b674 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -210,6 +210,7 @@ extern "C" {
@@ -324,7 +324,7 @@ index 31bbf8b..4e92d7d 100644
      LLAMA_API struct llama_context * llama_init_from_model(
                       struct llama_model * model,
              struct llama_context_params   params);
-@@ -594,6 +767,17 @@ extern "C" {
+@@ -594,6 +767,39 @@ extern "C" {
      LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
@@ -339,11 +339,33 @@ index 31bbf8b..4e92d7d 100644
 +    LLAMA_API int32_t llama_model_layer_device_type(const struct llama_model * model, int32_t il);
 +    // Returns the ggml_backend_dev_type value for the output layer, or -1.
 +    LLAMA_API int32_t llama_model_output_device_type(const struct llama_model * model);
++
++    // Read-only context memory breakdown. The pinned native implementation
++    // already maintains model/context/compute byte totals per backend buffer
++    // type. This C bridge copies names and sizes; no native pointer or C++
++    // container escapes. Entries are stable for one call sequence but the
++    // ordering is an implementation detail. `model_bytes` is model allocation,
++    // `context_bytes` is KV/context allocation, and `compute_bytes` is the
++    // temporary scheduler/graph allocation. They are disjoint within one
++    // entry and must not be added across buffer types without accounting for
++    // device and buffer-type overlap rules.
++    struct llama_buffer_memory_info {
++        char   buffer_type[128];
++        char   device_name[128];
++        size_t model_bytes;
++        size_t context_bytes;
++        size_t compute_bytes;
++    };
++
++    LLAMA_API int32_t llama_context_memory_breakdown_count(const struct llama_context * ctx);
++    LLAMA_API int32_t llama_context_memory_breakdown_entry(
++            const struct llama_context * ctx, int32_t index,
++            struct llama_buffer_memory_info * out);
      LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fcd4dfb..78a1d76 100644
+index fcd4dfb..743ac03 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -354,15 +376,18 @@ index fcd4dfb..78a1d76 100644
  #include "llama-arch.h"
  #include "llama-graph.h"
  #include "llama-impl.h"
-@@ -14,6 +15,7 @@
+@@ -14,7 +15,10 @@
  #include "llama.h"
  
  #include <cinttypes>
 +#include <cerrno>
  #include <cmath>
++#include <cstdio>
++#include <iterator>
  #include <cstring>
  #include <limits>
-@@ -477,11 +479,17 @@ llama_context::llama_context(
+ #include <stdexcept>
+@@ -477,11 +481,17 @@ llama_context::llama_context(
              sampling.token_ids_full_vocab[i] = i;
          }
      }
@@ -380,7 +405,7 @@ index fcd4dfb..78a1d76 100644
  
      // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
      if (!model.hparams.no_alloc && !opt_ctx) {
-@@ -796,6 +804,13 @@ void llama_context::synchronize() {
+@@ -796,6 +806,13 @@ void llama_context::synchronize() {
  
      n_queued_tokens = 0;
      t_compute_start_us = 0;
@@ -394,7 +419,7 @@ index fcd4dfb..78a1d76 100644
  }
  
  const llama_model & llama_context::get_model() const {
-@@ -810,6 +825,34 @@ ggml_backend_sched_t llama_context::get_sched() const {
+@@ -810,6 +827,34 @@ ggml_backend_sched_t llama_context::get_sched() const {
      return sched.get();
  }
  
@@ -429,7 +454,7 @@ index fcd4dfb..78a1d76 100644
  uint32_t llama_context::n_ctx() const {
      return cparams.n_ctx;
  }
-@@ -2585,9 +2628,22 @@ ggml_status llama_context::graph_compute(
+@@ -2585,9 +2630,22 @@ ggml_status llama_context::graph_compute(
          set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
      }
  
@@ -452,10 +477,46 @@ index fcd4dfb..78a1d76 100644
      }
  
      // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
-@@ -4407,6 +4463,28 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -4407,6 +4465,64 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
  
++int32_t llama_context_memory_breakdown_count(const struct llama_context * ctx) {
++    if (ctx == nullptr) {
++        return -1;
++    }
++    const llama_memory_breakdown breakdown = ctx->memory_breakdown();
++    return static_cast<int32_t>(breakdown.size());
++}
++
++int32_t llama_context_memory_breakdown_entry(
++        const struct llama_context * ctx, int32_t index,
++        struct llama_buffer_memory_info * out) {
++    if (ctx == nullptr || out == nullptr || index < 0) {
++        return -1;
++    }
++    const llama_memory_breakdown breakdown = ctx->memory_breakdown();
++    if (index >= static_cast<int32_t>(breakdown.size())) {
++        return -1;
++    }
++    auto it = breakdown.begin();
++    std::advance(it, index);
++    const ggml_backend_buffer_type_t buft = it->first;
++    const llama_memory_breakdown_data & data = it->second;
++
++    const char * buffer_name = ggml_backend_buft_name(buft);
++    const ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
++    const char * device_name = device == nullptr ? "" : ggml_backend_dev_name(device);
++    std::snprintf(out->buffer_type, sizeof(out->buffer_type), "%s",
++            buffer_name == nullptr ? "" : buffer_name);
++    std::snprintf(out->device_name, sizeof(out->device_name), "%s",
++            device_name == nullptr ? "" : device_name);
++    out->model_bytes   = data.model;
++    out->context_bytes = data.context;
++    out->compute_bytes = data.compute;
++    return 0;
++}
++
 +int32_t llama_context_set_node_dispatch_observer(
 +        llama_context * ctx,
 +        llama_node_dispatch_callback callback,

@@ -241,6 +241,29 @@ pub struct ggml_backend_dev_props {
     pub caps: ggml_backend_dev_caps,
 }
 
+/// `struct llama_buffer_memory_info` from the pinned read-only memory
+/// breakdown bridge. Names are fixed-size, NUL-terminated copies.
+#[repr(C)]
+pub struct llama_buffer_memory_info {
+    pub buffer_type: [c_char; 128],
+    pub device_name: [c_char; 128],
+    pub model_bytes: usize,
+    pub context_bytes: usize,
+    pub compute_bytes: usize,
+}
+
+impl Default for llama_buffer_memory_info {
+    fn default() -> Self {
+        Self {
+            buffer_type: [0; 128],
+            device_name: [0; 128],
+            model_bytes: 0,
+            context_bytes: 0,
+            compute_bytes: 0,
+        }
+    }
+}
+
 /// `struct llama_model_params` (`llama.h`). Construct via
 /// [`llama_model_default_params`], never by hand.
 #[repr(C)]
@@ -852,6 +875,12 @@ unsafe extern "C" {
         params: llama_context_params,
     ) -> *mut llama_context;
     pub fn llama_free(ctx: *mut llama_context);
+    pub fn llama_context_memory_breakdown_count(ctx: *const llama_context) -> i32;
+    pub fn llama_context_memory_breakdown_entry(
+        ctx: *const llama_context,
+        index: i32,
+        out: *mut llama_buffer_memory_info,
+    ) -> i32;
     pub fn llama_context_lifetime_state(
         ctx: *const llama_context,
         out: *mut llama_context_lifetime_state,

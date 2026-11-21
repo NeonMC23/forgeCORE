@@ -164,6 +164,28 @@ A CUDA build was compiled and physically validated on the reference machine:
 Use `FORGE_LLAMA_BUILD_DIR=build-cuda` when running forgeCORE or downstream
 crates against the CUDA tree. The default `build` tree remains CPU-only.
 
+### Memory breakdown bridge
+
+The pinned native context already computes model, KV/context, and compute byte
+totals per backend buffer type. A minimal read-only C bridge copies names and
+sizes (`llama_context_memory_breakdown_count` /
+`llama_context_memory_breakdown_entry`); no C++ container or pointer escapes.
+forgeCORE exposes it as `Context::memory_breakdown()`.
+
+Example on the RTX 3050 with one offloaded layer, 128 context:
+
+```text
+CUDA_Host device=CUDA0 model=0       context=0       compute=658,944
+CUDA0     device=CUDA0 model=30,083,840 context=0    compute=27,040,256
+CPU_Mapped device=     model=103,666,176 context=0   compute=0
+CPU        device=     model=0       context=5,898,240 compute=0
+```
+
+Entries are grouped by buffer type and are disjoint internally. Do not sum
+across buffer types or devices without respecting the native grouping. The
+bridge is a point-in-time snapshot; it is not an allocation/deallocation
+counter or a transfer counter.
+
 ## Runtime loader path
 
 `crates/forge-core/build.rs` records an rpath to

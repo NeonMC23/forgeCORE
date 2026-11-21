@@ -1653,6 +1653,29 @@ impl Embeddings {
     }
 }
 
+/// One buffer-type entry from the native context memory breakdown.
+///
+/// `model_bytes`, `context_bytes`, and `compute_bytes` are disjoint within the
+/// entry. Entries may share a device; do not sum across buffer types without
+/// understanding that the native breakdown is grouped by buffer type, not a
+/// unique physical allocation ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferMemory {
+    pub buffer_type: String,
+    pub device_name: String,
+    pub model_bytes: u64,
+    pub context_bytes: u64,
+    pub compute_bytes: u64,
+}
+
+impl BufferMemory {
+    pub fn total_bytes(&self) -> u64 {
+        self.model_bytes
+            .saturating_add(self.context_bytes)
+            .saturating_add(self.compute_bytes)
+    }
+}
+
 /// An owned libllama execution context bound to one [`Model`].
 pub struct Context {
     raw: *mut forge_sys::llama_context,
@@ -1877,6 +1900,46 @@ impl Context {
     /// padded by upstream).
     pub fn n_ctx_seq(&self) -> u32 {
         self.n_ctx_seq
+    }
+
+    /// Native model/context/compute byte breakdown grouped by backend buffer
+    /// type. The values are a point-in-time native snapshot after the context
+    /// exists; they are not a process-wide GPU memory measurement.
+    pub fn memory_breakdown(&self) -> Result<Vec<BufferMemory>> {
+        // SAFETY: self.raw is a live context for this borrow.
+        let count = unsafe { forge_sys::llama_context_memory_breakdown_count(self.raw) };
+        if count < 0 {
+            return Err(Error::context("native memory breakdown count failed"));
+        }
+        let mut entries = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut raw = forge_sys::llama_buffer_memory_info::default();
+            // SAFETY: index is in range and raw is writable.
+            let rc = unsafe {
+                forge_sys::llama_context_memory_breakdown_entry(self.raw, index, &mut raw)
+            };
+            if rc != 0 {
+                return Err(Error::context(format!(
+                    "native memory breakdown entry {index} failed"
+                )));
+            }
+            // SAFETY: the native bridge NUL-terminates both fixed arrays.
+            let buffer_type = unsafe { CStr::from_ptr(raw.buffer_type.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            // SAFETY: same as above.
+            let device_name = unsafe { CStr::from_ptr(raw.device_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            entries.push(BufferMemory {
+                buffer_type,
+                device_name,
+                model_bytes: u64::try_from(raw.model_bytes).unwrap_or(u64::MAX),
+                context_bytes: u64::try_from(raw.context_bytes).unwrap_or(u64::MAX),
+                compute_bytes: u64::try_from(raw.compute_bytes).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(entries)
     }
 
     /// Effective logical batch limit enforced by [`decode`](Context::decode).
