@@ -331,3 +331,65 @@ fn staged_layer_eviction_requires_invalidation_and_supports_replacement() {
     );
     assert!(!context.logits(0).expect("logits").values().is_empty());
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn replacement_layer_is_consumed_corruption_control() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(reason)) => {
+            eprintln!("SKIP: CUDA unavailable: {reason}");
+            return;
+        }
+        Err(error) => panic!("staging engine: {error}"),
+    };
+
+    let model = staging_model(&path).expect("CUDA device");
+    let mut options = ContextOptions::default();
+    options.n_ctx = 128;
+    let mut context = Context::open(&model, &options).expect("context");
+
+    fill_staged_layer(&model, &context, &engine, 0, None).expect("stage layer 0");
+    context.decode(&batch()).expect("decode layer 0");
+    let layer0_logits = logits(&mut context);
+
+    context.invalidate_graph().expect("invalidate layer 0");
+    context.evict_layer_cuda(0).expect("evict layer 0");
+    fill_staged_layer(&model, &context, &engine, 1, None).expect("stage layer 1");
+    context.memory().expect("kv memory").clear(true);
+    context.decode(&batch()).expect("decode layer 1");
+    let layer1_logits = logits(&mut context);
+
+    context.invalidate_graph().expect("invalidate layer 1");
+    context.evict_layer_cuda(1).expect("evict layer 1");
+    fill_staged_layer(&model, &context, &engine, 1, Some("blk.1.attn_q.weight"))
+        .expect("stage corrupted layer 1");
+    context.memory().expect("kv memory").clear(true);
+    context.decode(&batch()).expect("decode corrupted layer 1");
+    let corrupted_logits = logits(&mut context);
+
+    let base_difference = max_abs_diff(&layer0_logits, &layer1_logits);
+    let corruption_difference = max_abs_diff(&layer1_logits, &corrupted_logits);
+    let info = context.staged_layer_info(1).expect("layer 1 info");
+    eprintln!(
+        "replacement differences: layer0-vs-layer1={base_difference:.6}, corruption={corruption_difference:.6}, substitutions={}",
+        info.graph_substitutions
+    );
+    assert!(
+        info.graph_substitutions > 0,
+        "replacement graph did not substitute layer 1"
+    );
+    assert!(
+        corruption_difference > 1.0,
+        "corrupting the replacement staged layer did not change logits; staged data may be ignored"
+    );
+
+    let lifecycle = context.staging_state().expect("lifecycle");
+    assert!(lifecycle.graph_invalidation_count >= 2);
+    assert_eq!(lifecycle.release_count, 2);
+    assert_eq!(lifecycle.reuse_count, 0);
+}

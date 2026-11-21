@@ -334,6 +334,8 @@ pub struct llama_staging_state {
     pub graph_invalidation_count: u64,
     pub graph_rebuild_count: u64,
     pub scheduler_reset_count: u64,
+    pub graph_build_ns: u64,
+    pub last_graph_build_ns: u64,
     pub invalidation_failures: u64,
     pub quiescence_wait_ns: u64,
     pub last_quiescence_wait_ns: u64,
