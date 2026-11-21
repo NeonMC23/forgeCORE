@@ -47,6 +47,7 @@ fn main() {
             || !text.contains("llama_model_effective_gpu_layers")
             || !text.contains("llama_model_layer_device_type")
             || !text.contains("llama_model_output_device_type")
+            || !text.contains("llama_model_tensor_get_bytes")
             || !text.contains("llama_model_tensor_storage_count")
             || !text.contains("llama_model_tensor_storage_entry")
             || !text.contains("llama_model_memory_breakdown_count")

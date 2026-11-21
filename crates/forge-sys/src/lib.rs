@@ -910,6 +910,13 @@ unsafe extern "C" {
         params: llama_context_params,
     ) -> *mut llama_context;
     pub fn llama_free(ctx: *mut llama_context);
+    pub fn llama_model_tensor_get_bytes(
+        model: *const llama_model,
+        name: *const c_char,
+        offset: u64,
+        out: *mut std::ffi::c_void,
+        size: usize,
+    ) -> i32;
     pub fn llama_model_tensor_storage_count(model: *const llama_model) -> i32;
     pub fn llama_model_tensor_storage_entry(
         model: *const llama_model,

@@ -1,0 +1,12 @@
+[package]
+name = "forge-staging"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded native staging buffers and CUDA transfer primitives"
+
+[build-dependencies]
+cc = "1"
+
+[lib]
+path = "src/lib.rs"

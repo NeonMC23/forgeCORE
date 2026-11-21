@@ -348,6 +348,14 @@ impl ModelOptions {
     }
 }
 
+/// One layer's read-only tensor inventory for a staging prototype.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerStagingPlan {
+    pub layer: u32,
+    pub tensors: Vec<TensorStorageInfo>,
+    pub total_bytes: u64,
+}
+
 /// One model tensor and the backend buffer that owns it.
 ///
 /// Names and buffer identity are copied values. `buffer_index` is stable for
@@ -992,6 +1000,54 @@ impl Model {
             });
         }
         Ok(entries)
+    }
+
+    /// Read a bounded byte range from one named model tensor. The model must be
+    /// quiescent; this is a read-only copy and never mutates tensor storage.
+    pub fn read_tensor_bytes(&self, name: &str, offset: u64, out: &mut [u8]) -> Result<()> {
+        let name = CString::new(name)
+            .map_err(|_| Error::invalid("tensor name contains an interior NUL"))?;
+        // SAFETY: raw is a live model; name and out are valid for this call;
+        // the native side validates the tensor name and byte range.
+        let rc = unsafe {
+            forge_sys::llama_model_tensor_get_bytes(
+                self.inner.raw,
+                name.as_ptr(),
+                offset,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(Error::model(format!(
+                "tensor byte read failed for '{name:?}' at offset {offset} ({} bytes)",
+                out.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read-only tensor inventory for one `blk.N` layer.
+    pub fn layer_staging_plan(&self, layer: u32) -> Result<LayerStagingPlan> {
+        let tensors: Vec<TensorStorageInfo> = self
+            .tensor_storage()?
+            .into_iter()
+            .filter(|tensor| tensor.layer == Some(layer))
+            .collect();
+        if tensors.is_empty() {
+            return Err(Error::invalid(format!(
+                "layer {layer} has no model tensors"
+            )));
+        }
+        let total_bytes = tensors
+            .iter()
+            .try_fold(0u64, |total, tensor| total.checked_add(tensor.tensor_bytes))
+            .ok_or_else(|| Error::model("layer tensor byte total overflow"))?;
+        Ok(LayerStagingPlan {
+            layer,
+            tensors,
+            total_bytes,
+        })
     }
 
     /// Number of attention heads.

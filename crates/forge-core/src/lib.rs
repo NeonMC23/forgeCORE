@@ -51,6 +51,7 @@ pub use device::{
 };
 pub use dtype::DType;
 pub use error::{Error, Result};
+pub use forge_staging as staging;
 pub use gguf::{
     inspect as inspect_gguf, inspect_bytes as inspect_gguf_bytes,
     inspect_path as inspect_gguf_path, GgufInspection, GgufValueType, MetadataValue,
@@ -59,8 +60,8 @@ pub use gguf::{
 pub use graph::{Graph, NodeInfo, Plan, DEFAULT_GRAPH_CAPACITY};
 pub use memory::{Memory, SeqState, State};
 pub use model::{
-    GpuLayers, Model, ModelLoadMode, ModelOptions, PageReleaseResult, PageSample, PageSampleStatus,
-    SplitMode, TensorMappingInfo, TensorStorageInfo,
+    GpuLayers, LayerStagingPlan, Model, ModelLoadMode, ModelOptions, PageReleaseResult, PageSample,
+    PageSampleStatus, SplitMode, TensorMappingInfo, TensorStorageInfo,
 };
 pub use quant::{block_spec, row_bytes, tensor_bytes, BlockSpec, QuantFormat};
 pub use residency::{
