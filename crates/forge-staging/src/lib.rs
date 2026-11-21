@@ -335,6 +335,11 @@ impl StagingBuffer {
         self.context
     }
 
+    #[cfg(test)]
+    fn raw_handle(&self) -> u64 {
+        self.handle
+    }
+
     pub fn info(&self) -> Result<BufferInfo, StagingError> {
         let mut info = BufferInfo::default();
         check(unsafe { ffi::fstage_buffer_get_info(self.handle, &mut info) })?;
@@ -483,6 +488,55 @@ mod tests {
         let code = unsafe { ffi::fstage_engine_destroy(engine.raw_handle()) };
         assert_eq!(code, 5, "engine destroy with buffers must be BUSY");
         assert!(engine.cancel().is_err());
+        host.release().unwrap();
+        device.release().unwrap();
+    }
+
+    #[test]
+    fn allocation_failure_and_duplicate_release_are_typed() {
+        let engine = match Engine::new(0) {
+            Ok(engine) => engine,
+            Err(StagingError::Unsupported(_)) => {
+                println!("SKIP: CUDA driver unavailable");
+                return;
+            }
+            Err(error) => panic!("unexpected engine error: {error}"),
+        };
+        let error = match engine.allocate(MemoryType::Device, 1u64 << 50) {
+            Ok(_) => panic!("1 PiB device allocation must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StagingError::OutOfMemory(_) | StagingError::Cuda(_)
+        ));
+        let mut buffer = engine.allocate(MemoryType::PageableHost, 64).unwrap();
+        let handle = buffer.raw_handle();
+        buffer.release().unwrap();
+        let code = unsafe { ffi::fstage_buffer_release(handle) };
+        assert_eq!(code, 9, "duplicate release must be ALREADY_RELEASED");
+    }
+
+    #[test]
+    fn cancellation_during_transfer_is_explicitly_unsafe_to_cancel() {
+        let engine = match Engine::new(0) {
+            Ok(engine) => engine,
+            Err(StagingError::Unsupported(_)) => {
+                println!("SKIP: CUDA driver unavailable");
+                return;
+            }
+            Err(error) => panic!("unexpected engine error: {error}"),
+        };
+        let bytes = 64 * 1024 * 1024u64;
+        let mut host = engine.allocate(MemoryType::PinnedHost, bytes).unwrap();
+        let mut device = engine.allocate(MemoryType::Device, bytes).unwrap();
+        host.write_host(0, &vec![3u8; bytes as usize]).unwrap();
+        engine
+            .submit(&host, 0, &device, 0, bytes, Direction::HostToDevice)
+            .unwrap();
+        let error = engine.cancel().unwrap_err();
+        assert!(matches!(error, StagingError::Busy(_)));
+        let _ = engine.wait().unwrap();
         host.release().unwrap();
         device.release().unwrap();
     }
