@@ -134,7 +134,7 @@ index 1df0f2b..0ed23e1 100644
          return (void *)ggml_numa_init;
      }
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b..71c3295 100644
+index 31bbf8b..9e21a3d 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -210,6 +210,7 @@ extern "C" {
@@ -324,7 +324,7 @@ index 31bbf8b..71c3295 100644
      LLAMA_API struct llama_context * llama_init_from_model(
                       struct llama_model * model,
              struct llama_context_params   params);
-@@ -594,6 +767,78 @@ extern "C" {
+@@ -594,6 +767,107 @@ extern "C" {
      LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
@@ -400,11 +400,40 @@ index 31bbf8b..71c3295 100644
 +    LLAMA_API int32_t llama_model_tensor_get_bytes(
 +            const struct llama_model * model, const char * name,
 +            uint64_t offset, void * out, size_t size);
++
++    // Independent CUDA-resident layer storage. stage_layer_cuda allocates all
++    // blk.N weight tensors in a dedicated CUDA buffer (via the context's CUDA
++    // backend) and registers name substitutions applied after each new graph
++    // build, before scheduler allocation. The destination bytes are exposed as
++    // device pointers for a single-writer staging copy; no tensor or buffer
++    // pointer is rebound behind the scheduler. Release happens with the context.
++    struct llama_staged_tensor_info {
++        char     name[160];
++        uint64_t device_ptr;
++        uint64_t bytes;
++        int32_t  layer;
++    };
++    struct llama_staged_layer_info {
++        int32_t  layer;
++        int32_t  tensor_count;
++        uint64_t device_bytes;
++        uint64_t graph_substitutions;
++    };
++    LLAMA_API int32_t llama_context_stage_layer_cuda(
++            struct llama_context * ctx, int32_t layer);
++    LLAMA_API int32_t llama_context_staged_layer_info(
++            const struct llama_context * ctx, int32_t layer,
++            struct llama_staged_layer_info * out);
++    LLAMA_API int32_t llama_context_staged_tensor_count(
++            const struct llama_context * ctx, int32_t layer);
++    LLAMA_API int32_t llama_context_staged_tensor_info(
++            const struct llama_context * ctx, int32_t layer, int32_t index,
++            struct llama_staged_tensor_info * out);
      LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fcd4dfb..743ac03 100644
+index fcd4dfb..4407c0b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -493,7 +522,15 @@ index fcd4dfb..743ac03 100644
  uint32_t llama_context::n_ctx() const {
      return cparams.n_ctx;
  }
-@@ -2585,9 +2630,22 @@ ggml_status llama_context::graph_compute(
+@@ -1423,6 +1468,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         //const auto t_start_us = ggml_time_us();
+ 
+         gf = model.build_graph(gparams);
++        apply_staged_layers(gf);
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+ 
+@@ -2585,9 +2631,22 @@ ggml_status llama_context::graph_compute(
          set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
      }
  
@@ -516,10 +553,209 @@ index fcd4dfb..743ac03 100644
      }
  
      // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
-@@ -4407,6 +4465,64 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
-     return ctx->memory_breakdown();
+@@ -3433,6 +3492,177 @@ void llama_context::perf_reset() {
+     n_reused    = 0;
  }
  
++
++static bool staged_layer_name_matches(const std::string & name, int32_t layer) {
++    char prefix[32];
++    std::snprintf(prefix, sizeof(prefix), "blk.%d.", layer);
++    return name.rfind(prefix, 0) == 0;
++}
++
++int32_t llama_context::stage_layer_cuda(int32_t layer) {
++    if (layer < 0 || static_cast<uint32_t>(layer) >= model.hparams.n_layer_all) {
++        return -1;
++    }
++    if (has_inflight_execution() || gf_res_prev_active != nullptr) {
++        LLAMA_LOG_ERROR("%s: cannot stage layer %d while a graph is active\n", __func__, layer);
++        return -1;
++    }
++    for (const auto & staged : staged_layers) {
++        if (staged.layer == layer) {
++            return 0;
++        }
++    }
++
++    ggml_backend_buffer_type_t cuda_buft = nullptr;
++    for (const auto & backend : backends) {
++        const ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
++        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            cuda_buft = ggml_backend_get_default_buffer_type(backend.get());
++            break;
++        }
++    }
++    if (cuda_buft == nullptr) {
++        LLAMA_LOG_ERROR("%s: no CUDA backend available for layer staging\n", __func__);
++        return -1;
++    }
++
++    std::vector<const ggml_tensor *> sources;
++    for (const auto & [name, tensor] : model.tensors_by_name) {
++        if (tensor != nullptr && staged_layer_name_matches(name, layer)) {
++            sources.push_back(tensor);
++        }
++    }
++    if (sources.empty()) {
++        LLAMA_LOG_ERROR("%s: no tensors found for layer %d\n", __func__, layer);
++        return -1;
++    }
++
++    const size_t alignment = ggml_backend_buft_get_alignment(cuda_buft);
++    size_t total = 0;
++    for (const ggml_tensor * source : sources) {
++        const size_t alloc = ggml_backend_buft_get_alloc_size(cuda_buft, source);
++        total = (total + alignment - 1) / alignment * alignment;
++        total += alloc;
++    }
++    if (total == 0) {
++        LLAMA_LOG_ERROR("%s: zero staged byte total for layer %d\n", __func__, layer);
++        return -1;
++    }
++
++    const size_t ctx_size = ggml_tensor_overhead() * sources.size() + 4096;
++    ggml_init_params params = {
++        /*.mem_size   =*/ ctx_size,
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context * raw_ctx = ggml_init(params);
++    if (raw_ctx == nullptr) {
++        return -1;
++    }
++    llama_staged_layer staged;
++    staged.layer = layer;
++    staged.ctx.reset(raw_ctx);
++    staged.buf.reset(ggml_backend_buft_alloc_buffer(cuda_buft, total));
++    if (staged.buf == nullptr) {
++        return -1;
++    }
++    ggml_backend_buffer_set_usage(staged.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    char * base = static_cast<char *>(ggml_backend_buffer_get_base(staged.buf.get()));
++    size_t offset = 0;
++    for (const ggml_tensor * source : sources) {
++        ggml_tensor * copy = ggml_new_tensor(
++                staged.ctx.get(), source->type, ggml_n_dims(source), source->ne);
++        if (copy == nullptr) {
++            return -1;
++        }
++        ggml_set_name(copy, source->name);
++        offset = (offset + alignment - 1) / alignment * alignment;
++        if (ggml_backend_tensor_alloc(staged.buf.get(), copy, base + offset) != GGML_STATUS_SUCCESS) {
++            return -1;
++        }
++        offset += ggml_backend_buft_get_alloc_size(cuda_buft, copy);
++        staged.tensors.push_back(copy);
++        staged.by_name.emplace(source->name, copy);
++    }
++    staged.device_bytes = total;
++    staged_layers.push_back(std::move(staged));
++    return 0;
++}
++
++int32_t llama_context::staged_layer_info(int32_t layer, llama_staged_layer_info * out) const {
++    if (out == nullptr) {
++        return -1;
++    }
++    for (const auto & staged : staged_layers) {
++        if (staged.layer == layer) {
++            std::memset(out, 0, sizeof(*out));
++            out->layer = layer;
++            out->tensor_count = static_cast<int32_t>(staged.tensors.size());
++            out->device_bytes = staged.device_bytes;
++            out->graph_substitutions = staged.graph_substitutions;
++            return 0;
++        }
++    }
++    return -1;
++}
++
++int32_t llama_context::staged_tensor_count(int32_t layer) const {
++    for (const auto & staged : staged_layers) {
++        if (staged.layer == layer) {
++            return static_cast<int32_t>(staged.tensors.size());
++        }
++    }
++    return -1;
++}
++
++int32_t llama_context::staged_tensor_info(
++        int32_t layer, int32_t index, llama_staged_tensor_info * out) const {
++    if (out == nullptr || index < 0) {
++        return -1;
++    }
++    for (const auto & staged : staged_layers) {
++        if (staged.layer != layer) {
++            continue;
++        }
++        if (index >= static_cast<int32_t>(staged.tensors.size())) {
++            return -1;
++        }
++        const ggml_tensor * tensor = staged.tensors[index];
++        std::memset(out, 0, sizeof(*out));
++        std::snprintf(out->name, sizeof(out->name), "%s", tensor->name);
++        out->device_ptr = reinterpret_cast<uint64_t>(tensor->data);
++        out->bytes = ggml_nbytes(tensor);
++        out->layer = layer;
++        return 0;
++    }
++    return -1;
++}
++
++void llama_context::apply_staged_layers(ggml_cgraph * gf) {
++    if (gf == nullptr || staged_layers.empty()) {
++        return;
++    }
++    for (auto & staged : staged_layers) {
++        for (int32_t i = 0; i < ggml_graph_n_nodes(gf); ++i) {
++            ggml_tensor * node = ggml_graph_node(gf, i);
++            if (node == nullptr) {
++                continue;
++            }
++            for (int32_t s = 0; s < GGML_MAX_SRC; ++s) {
++                ggml_tensor * source = node->src[s];
++                if (source == nullptr) {
++                    continue;
++                }
++                auto it = staged.by_name.find(source->name);
++                if (it != staged.by_name.end()) {
++                    node->src[s] = it->second;
++                    staged.graph_substitutions++;
++                }
++            }
++        }
++    }
++}
++
+ llama_memory_breakdown llama_context::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
+     for (const auto & [buft, size] : model.memory_breakdown()) {
+@@ -4406,6 +4636,84 @@ void llama_opt_epoch(
+ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
+     return ctx->memory_breakdown();
+ }
++int32_t llama_context_stage_layer_cuda(struct llama_context * ctx, int32_t layer) {
++    return ctx == nullptr ? -1 : ctx->stage_layer_cuda(layer);
++}
++
++int32_t llama_context_staged_layer_info(
++        const struct llama_context * ctx, int32_t layer,
++        struct llama_staged_layer_info * out) {
++    return ctx == nullptr ? -1 : ctx->staged_layer_info(layer, out);
++}
++
++int32_t llama_context_staged_tensor_count(const struct llama_context * ctx, int32_t layer) {
++    return ctx == nullptr ? -1 : ctx->staged_tensor_count(layer);
++}
++
++int32_t llama_context_staged_tensor_info(
++        const struct llama_context * ctx, int32_t layer, int32_t index,
++        struct llama_staged_tensor_info * out) {
++    return ctx == nullptr ? -1 : ctx->staged_tensor_info(layer, index, out);
++}
++
++
 +int32_t llama_context_memory_breakdown_count(const struct llama_context * ctx) {
 +    if (ctx == nullptr) {
 +        return -1;
@@ -577,12 +813,11 @@ index fcd4dfb..743ac03 100644
 +    out->synchronized = out->inflight ? 0 : 1;
 +    return 0;
 +}
-+
+ 
  llama_context * llama_get_ctx_other(struct llama_context * ctx) {
      return ctx->get_cparams().ctx_other;
- }
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 77ef92f..822a4ad 100644
+index 77ef92f..778bc95 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -13,6 +13,7 @@
@@ -593,7 +828,24 @@ index 77ef92f..822a4ad 100644
  #include <vector>
  
  struct llama_model;
-@@ -69,6 +70,12 @@ struct llama_context {
+@@ -40,6 +41,16 @@ struct llama_memory_buffer {
+ 
+ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+ 
++struct llama_staged_layer {
++    int32_t layer = -1;
++    ggml_context_ptr ctx;
++    ggml_backend_buffer_ptr buf;
++    std::vector<ggml_tensor *> tensors;
++    std::map<std::string, ggml_tensor *> by_name;
++    size_t device_bytes = 0;
++    uint64_t graph_substitutions = 0;
++};
++
+ struct llama_context {
+     // init scheduler and compute buffers, reserve worst-case graphs
+     llama_context(
+@@ -69,6 +80,12 @@ struct llama_context {
      uint32_t n_ubatch()  const;
      uint32_t n_seq_max() const;
  
@@ -606,7 +858,30 @@ index 77ef92f..822a4ad 100644
      uint32_t n_threads()       const;
      uint32_t n_threads_batch() const;
  
-@@ -385,6 +392,13 @@ private:
+@@ -190,6 +207,12 @@ struct llama_context {
+ 
+     llama_memory_breakdown memory_breakdown() const;
+ 
++    // Independent layer storage for the graph-integration prototype.
++    int32_t stage_layer_cuda(int32_t layer);
++    int32_t staged_layer_info(int32_t layer, llama_staged_layer_info * out) const;
++    int32_t staged_tensor_count(int32_t layer) const;
++    int32_t staged_tensor_info(int32_t layer, int32_t index, llama_staged_tensor_info * out) const;
++
+     //
+     // training
+     //
+@@ -352,6 +375,9 @@ private:
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
++    std::vector<llama_staged_layer> staged_layers;
++    void apply_staged_layers(ggml_cgraph * gf);
++
+     // training
+     ggml_opt_context_t opt_ctx = nullptr;
+ 
+@@ -385,6 +411,13 @@ private:
      // env: LLAMA_GRAPH_REUSE_DISABLE
      bool graph_reuse_disable = false;
  

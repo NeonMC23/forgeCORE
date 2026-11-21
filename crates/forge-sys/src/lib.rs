@@ -299,6 +299,35 @@ impl Default for llama_tensor_storage_info {
     }
 }
 
+/// Independent staged layer storage descriptors.
+#[repr(C)]
+pub struct llama_staged_tensor_info {
+    pub name: [c_char; 160],
+    pub device_ptr: u64,
+    pub bytes: u64,
+    pub layer: i32,
+}
+
+impl Default for llama_staged_tensor_info {
+    fn default() -> Self {
+        Self {
+            name: [0; 160],
+            device_ptr: 0,
+            bytes: 0,
+            layer: -1,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct llama_staged_layer_info {
+    pub layer: i32,
+    pub tensor_count: i32,
+    pub device_bytes: u64,
+    pub graph_substitutions: u64,
+}
+
 /// `struct llama_model_params` (`llama.h`). Construct via
 /// [`llama_model_default_params`], never by hand.
 #[repr(C)]
@@ -928,6 +957,19 @@ unsafe extern "C" {
         model: *const llama_model,
         index: i32,
         out: *mut llama_buffer_memory_info,
+    ) -> i32;
+    pub fn llama_context_stage_layer_cuda(ctx: *mut llama_context, layer: i32) -> i32;
+    pub fn llama_context_staged_layer_info(
+        ctx: *const llama_context,
+        layer: i32,
+        out: *mut llama_staged_layer_info,
+    ) -> i32;
+    pub fn llama_context_staged_tensor_count(ctx: *const llama_context, layer: i32) -> i32;
+    pub fn llama_context_staged_tensor_info(
+        ctx: *const llama_context,
+        layer: i32,
+        index: i32,
+        out: *mut llama_staged_tensor_info,
     ) -> i32;
     pub fn llama_context_memory_breakdown_count(ctx: *const llama_context) -> i32;
     pub fn llama_context_memory_breakdown_entry(

@@ -34,6 +34,8 @@ struct CudaApi {
     CUresult (* driver_get_version)(int *) = nullptr;
     CUresult (* ctx_create)(CUcontext *, unsigned int, CUdevice) = nullptr;
     CUresult (* ctx_destroy)(CUcontext) = nullptr;
+    CUresult (* primary_ctx_retain)(CUcontext *, CUdevice) = nullptr;
+    CUresult (* primary_ctx_release)(CUdevice) = nullptr;
     CUresult (* ctx_push_current)(CUcontext) = nullptr;
     CUresult (* ctx_pop_current)(CUcontext *) = nullptr;
     CUresult (* mem_alloc)(CUdeviceptr *, size_t) = nullptr;
@@ -82,6 +84,8 @@ CudaApi & api() {
         load(a.driver_get_version, "cuDriverGetVersion");
         load(a.ctx_create, "cuCtxCreate_v2");
         load(a.ctx_destroy, "cuCtxDestroy_v2");
+        load(a.primary_ctx_retain, "cuDevicePrimaryCtxRetain");
+        load(a.primary_ctx_release, "cuDevicePrimaryCtxRelease");
         load(a.ctx_push_current, "cuCtxPushCurrent_v2");
         load(a.ctx_pop_current, "cuCtxPopCurrent_v2");
         load(a.mem_alloc, "cuMemAlloc_v2");
@@ -283,26 +287,34 @@ int32_t fstage_engine_create(uint32_t device_index, uint64_t * out_engine) {
         if (a.driver_get_version != nullptr) {
             a.driver_get_version(&engine.driver_version);
         }
-        rc = a.ctx_create(&engine.context, 0, engine.device);
+        rc = a.primary_ctx_retain(&engine.context, engine.device);
         if (rc != CUDA_SUCCESS) {
-            return cuda_fail(rc, "cuCtxCreate");
+            return cuda_fail(rc, "cuDevicePrimaryCtxRetain");
+        }
+        rc = a.ctx_push_current(engine.context);
+        if (rc != CUDA_SUCCESS) {
+            a.primary_ctx_release(engine.device);
+            return cuda_fail(rc, "cuCtxPushCurrent(primary)");
         }
         rc = a.stream_create(&engine.stream, 1 /* non-blocking */);
         if (rc != CUDA_SUCCESS) {
-            a.ctx_destroy(engine.context);
+            a.ctx_pop_current(&engine.context);
+            a.primary_ctx_release(engine.device);
             return cuda_fail(rc, "cuStreamCreate");
         }
         rc = a.event_create(&engine.start, 0);
         if (rc != CUDA_SUCCESS) {
             a.stream_destroy(engine.stream);
-            a.ctx_destroy(engine.context);
+            a.ctx_pop_current(&engine.context);
+            a.primary_ctx_release(engine.device);
             return cuda_fail(rc, "cuEventCreate(start)");
         }
         rc = a.event_create(&engine.end, 0);
         if (rc != CUDA_SUCCESS) {
             a.event_destroy(engine.start);
             a.stream_destroy(engine.stream);
-            a.ctx_destroy(engine.context);
+            a.ctx_pop_current(&engine.context);
+            a.primary_ctx_release(engine.device);
             return cuda_fail(rc, "cuEventCreate(end)");
         }
         CUcontext previous = nullptr;
@@ -665,6 +677,83 @@ int32_t fstage_transfer_submit(
         dst->inflight = true;
         update_buffer_state(*src);
         update_buffer_state(*dst);
+        return FSTAGE_OK;
+    } catch (const std::exception & error) {
+        return fail(FSTAGE_INTERNAL, error.what());
+    } catch (...) {
+        return fail(FSTAGE_INTERNAL, "unknown native exception");
+    }
+}
+
+int32_t fstage_transfer_submit_to_ptr(
+        uint64_t engine_handle, uint64_t src_handle, uint64_t src_offset,
+        uint64_t device_ptr, uint64_t bytes) {
+    if (bytes == 0 || device_ptr == 0) {
+        return fail(FSTAGE_INVALID_ARGUMENT, "device pointer and size must be non-zero");
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        Engine * engine = find_engine(engine_handle);
+        Buffer * src = find_buffer(src_handle);
+        if (engine == nullptr || src == nullptr) {
+            return fail(FSTAGE_INVALID_HANDLE, "engine or source buffer handle is unknown");
+        }
+        if (!engine->usable) {
+            return fail(FSTAGE_CUDA_ERROR, "engine is unusable after a prior failure");
+        }
+        if (engine->inflight) {
+            return fail(FSTAGE_BUSY, "engine already has an in-flight transfer");
+        }
+        if (src->engine != engine_handle) {
+            return fail(FSTAGE_INVALID_ARGUMENT, "source buffer belongs to a different engine");
+        }
+        if (src->state == FSTAGE_BUFFER_RELEASED || src->inflight) {
+            return fail(FSTAGE_BUSY, "source buffer is unavailable");
+        }
+        if (!buffer_is_host(*src)) {
+            return fail(FSTAGE_INVALID_ARGUMENT, "external device target requires a host source");
+        }
+        if (src_offset > src->capacity || bytes > src->capacity - src_offset) {
+            return fail(FSTAGE_INVALID_ARGUMENT, "source range exceeds capacity");
+        }
+        ContextGuard guard(*engine);
+        if (!guard.ok) {
+            return fail(FSTAGE_CUDA_ERROR, "cannot make the staging context current");
+        }
+        const uint64_t submit_started = now_ns();
+        CUresult rc = api().event_record(engine->start, engine->stream);
+        if (rc != CUDA_SUCCESS) {
+            engine->usable = false;
+            return cuda_fail(rc, "cuEventRecord(start)");
+        }
+        const char * source = static_cast<const char *>(src->host) + src_offset;
+        rc = api().memcpy_htod_async(
+                static_cast<CUdeviceptr>(device_ptr), source,
+                static_cast<size_t>(bytes), engine->stream);
+        if (rc != CUDA_SUCCESS) {
+            engine->stats.transfer_requests++;
+            engine->stats.transfer_failed++;
+            engine->usable = false;
+            return cuda_fail(rc, "external-pointer H2D submission");
+        }
+        rc = api().event_record(engine->end, engine->stream);
+        if (rc != CUDA_SUCCESS) {
+            engine->stats.transfer_requests++;
+            engine->stats.transfer_failed++;
+            engine->usable = false;
+            return cuda_fail(rc, "cuEventRecord(end)");
+        }
+        engine->stats.transfer_requests++;
+        engine->stats.transfer_bytes += bytes;
+        engine->last_submit_ns = now_ns() - submit_started;
+        engine->stats.submit_ns += engine->last_submit_ns;
+        engine->inflight = true;
+        engine->src = src_handle;
+        engine->dst = 0;
+        engine->bytes = bytes;
+        engine->direction = FSTAGE_DIRECTION_HOST_TO_DEVICE;
+        src->inflight = true;
+        update_buffer_state(*src);
         return FSTAGE_OK;
     } catch (const std::exception & error) {
         return fail(FSTAGE_INTERNAL, error.what());

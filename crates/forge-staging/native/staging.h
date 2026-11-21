@@ -106,6 +106,13 @@ FSTAGE_API int32_t fstage_transfer_submit(
         uint64_t src, uint64_t src_offset,
         uint64_t dst, uint64_t dst_offset,
         uint64_t bytes, uint32_t direction);
+/* Host-to-device copy into an externally owned CUDA device pointer. The
+ * pointer must belong to the same primary CUDA context/device. This is the
+ * graph-integration path used to populate independently allocated model
+ * tensors; it does not take ownership of the destination. */
+FSTAGE_API int32_t fstage_transfer_submit_to_ptr(
+        uint64_t engine, uint64_t src, uint64_t src_offset,
+        uint64_t device_ptr, uint64_t bytes);
 FSTAGE_API int32_t fstage_transfer_query(
         uint64_t engine, fstage_transfer_report * out);
 FSTAGE_API int32_t fstage_transfer_wait(

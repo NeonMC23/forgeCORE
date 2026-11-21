@@ -176,6 +176,13 @@ mod ffi {
             bytes: u64,
             direction: u32,
         ) -> c_int;
+        pub fn fstage_transfer_submit_to_ptr(
+            engine: u64,
+            src: u64,
+            src_offset: u64,
+            device_ptr: u64,
+            bytes: u64,
+        ) -> c_int;
         pub fn fstage_transfer_query(engine: u64, out: *mut TransferReport) -> c_int;
         pub fn fstage_transfer_wait(engine: u64, out: *mut TransferReport) -> c_int;
         pub fn fstage_transfer_cancel(engine: u64) -> c_int;
@@ -294,6 +301,26 @@ impl Engine {
                 destination_offset,
                 bytes,
                 direction as u32,
+            )
+        })
+    }
+
+    /// H2D copy into an externally owned CUDA device pointer. The pointer must
+    /// belong to the same primary context/device; ownership is not transferred.
+    pub fn submit_to_device_ptr(
+        &self,
+        source: &StagingBuffer,
+        source_offset: u64,
+        device_ptr: u64,
+        bytes: u64,
+    ) -> Result<(), StagingError> {
+        check(unsafe {
+            ffi::fstage_transfer_submit_to_ptr(
+                self.inner.handle,
+                source.handle,
+                source_offset,
+                device_ptr,
+                bytes,
             )
         })
     }

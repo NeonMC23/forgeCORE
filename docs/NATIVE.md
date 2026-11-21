@@ -173,6 +173,15 @@ sizes (`llama_context_memory_breakdown_count` /
 forgeCORE exposes it as `Context::memory_breakdown()` and
 `Model::memory_breakdown()` (model-only, before a context exists).
 
+Graph-integrated staging (`llama_context_stage_layer_cuda`) allocates every
+`blk.N` weight in an independent CUDA buffer through the context's CUDA backend,
+exposes each tensor's device pointer for a single-writer transfer, and rewrites
+graph-node weight sources after each new graph build but before scheduler
+allocation. `llama_context_staged_layer_info` reports tensor count, device bytes,
+and substitution count. No tensor/buffer pointer is rebound behind the
+scheduler; staged buffers live for the context lifetime. This is an explicit
+experimental mode and is not used by normal inference.
+
 Read-only tensor ownership introspection
 (`llama_model_tensor_storage_count/_entry`) adds tensor name, buffer type,
 device name, quantization type, parsed `blk.N` layer, stable first-seen buffer

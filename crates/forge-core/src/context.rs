@@ -1653,6 +1653,24 @@ impl Embeddings {
     }
 }
 
+/// Independent CUDA-resident layer storage installed in a context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedLayerInfo {
+    pub layer: u32,
+    pub tensor_count: u32,
+    pub device_bytes: u64,
+    pub graph_substitutions: u64,
+}
+
+/// One tensor in a staged layer and its device-visible byte range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedTensorInfo {
+    pub name: String,
+    pub device_ptr: u64,
+    pub bytes: u64,
+    pub layer: u32,
+}
+
 /// One buffer-type entry from the native context memory breakdown.
 ///
 /// `model_bytes`, `context_bytes`, and `compute_bytes` are disjoint within the
@@ -1900,6 +1918,73 @@ impl Context {
     /// padded by upstream).
     pub fn n_ctx_seq(&self) -> u32 {
         self.n_ctx_seq
+    }
+
+    /// Allocate independent CUDA-resident storage for all `blk.N` weights.
+    /// Must be called before the first graph build (native enforces no active
+    /// graph); the caller then fills the exposed device pointers.
+    pub fn stage_layer_cuda(&self, layer: u32) -> Result<()> {
+        let layer =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        // SAFETY: self.raw is a live context; native validates layer/graph state.
+        let rc = unsafe { forge_sys::llama_context_stage_layer_cuda(self.raw, layer) };
+        if rc != 0 {
+            return Err(Error::context(format!(
+                "native CUDA staging failed for layer {layer}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn staged_layer_info(&self, layer: u32) -> Result<StagedLayerInfo> {
+        let layer_i32 =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        let mut raw = forge_sys::llama_staged_layer_info::default();
+        // SAFETY: live context and writable out.
+        let rc =
+            unsafe { forge_sys::llama_context_staged_layer_info(self.raw, layer_i32, &mut raw) };
+        if rc != 0 {
+            return Err(Error::context(format!("layer {layer} is not staged")));
+        }
+        Ok(StagedLayerInfo {
+            layer: u32::try_from(raw.layer).unwrap_or(layer),
+            tensor_count: u32::try_from(raw.tensor_count).unwrap_or(0),
+            device_bytes: raw.device_bytes,
+            graph_substitutions: raw.graph_substitutions,
+        })
+    }
+
+    pub fn staged_tensor_count(&self, layer: u32) -> Result<u32> {
+        let layer =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        // SAFETY: live context; native validates.
+        let count = unsafe { forge_sys::llama_context_staged_tensor_count(self.raw, layer) };
+        u32::try_from(count).map_err(|_| Error::context(format!("layer {layer} is not staged")))
+    }
+
+    pub fn staged_tensor_info(&self, layer: u32, index: u32) -> Result<StagedTensorInfo> {
+        let layer_i32 =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        let index_i32 =
+            i32::try_from(index).map_err(|_| Error::invalid("tensor index exceeds i32::MAX"))?;
+        let mut raw = forge_sys::llama_staged_tensor_info::default();
+        // SAFETY: live context, valid index, writable out.
+        let rc = unsafe {
+            forge_sys::llama_context_staged_tensor_info(self.raw, layer_i32, index_i32, &mut raw)
+        };
+        if rc != 0 {
+            return Err(Error::context(format!(
+                "staged tensor {index} in layer {layer} is unavailable"
+            )));
+        }
+        Ok(StagedTensorInfo {
+            name: unsafe { CStr::from_ptr(raw.name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
+            device_ptr: raw.device_ptr,
+            bytes: raw.bytes,
+            layer,
+        })
     }
 
     /// Native model/context/compute byte breakdown grouped by backend buffer
