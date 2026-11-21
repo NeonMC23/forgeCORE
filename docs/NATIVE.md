@@ -132,11 +132,27 @@ proof of usable offload; check `registered_backends()`, device enumeration,
 and the effective-placement readback after loading with a non-zero
 `GpuLayers` request.
 
+Prepare and build the separate CUDA tree with:
+
+```sh
+sh scripts/setup-native-cuda.sh --check            # driver/toolkit preflight
+sh scripts/setup-native-cuda.sh --configure-only   # CMake configure only
+sh scripts/setup-native-cuda.sh                    # configure + build
+export FORGE_LLAMA_BUILD_DIR=build-cuda
+```
+
+The script preserves the pin and the residency patch, keeps `GGML_CPU=ON` and
+`GGML_CPU_REPACK=ON`, disables NCCL (single-GPU), and verifies that
+`libggml-cuda.so` exports `ggml_backend_cuda_reg`. It refuses to run when
+`nvidia-smi` or `nvcc` is unusable.
+
 ## Runtime loader path
 
 `crates/forge-core/build.rs` records an rpath to
-`$FORGE_LLAMA_DIR/build/bin`, so `cargo test` binaries find
-`libggml`/`libllama` without extra setup. (`cargo:rustc-link-arg` does
+`$FORGE_LLAMA_DIR/$FORGE_LLAMA_BUILD_DIR/bin` (default `build`), so `cargo test`
+binaries find `libggml`/`libllama` without extra setup. Set
+`FORGE_LLAMA_BUILD_DIR=build-cuda` to test a CUDA build without replacing the
+CPU build tree. (`cargo:rustc-link-arg` does
 not propagate across crates, which is why the rpath lives in
 `forge-core`'s build script rather than only in `forge-sys`.)
 

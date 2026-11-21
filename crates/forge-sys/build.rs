@@ -12,7 +12,8 @@ use std::path::PathBuf;
 
 fn main() {
     let root = env::var("FORGE_LLAMA_DIR").unwrap_or_else(|_| "/var/tmp/forge-native".to_string());
-    let lib_dir = PathBuf::from(&root).join("build").join("bin");
+    let build_dir = env::var("FORGE_LLAMA_BUILD_DIR").unwrap_or_else(|_| "build".to_string());
+    let lib_dir = PathBuf::from(&root).join(&build_dir).join("bin");
 
     for soname in ["libggml.so", "libllama.so"] {
         if !lib_dir.join(soname).exists() {
@@ -61,4 +62,5 @@ fn main() {
     }
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
     println!("cargo:rerun-if-env-changed=FORGE_LLAMA_DIR");
+    println!("cargo:rerun-if-env-changed=FORGE_LLAMA_BUILD_DIR");
 }

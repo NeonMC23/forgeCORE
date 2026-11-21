@@ -35,6 +35,9 @@ export PATH="$CARGO_HOME/bin:$PATH"
 
 FORGE_LLAMA_DIR="${FORGE_LLAMA_DIR:-/var/tmp/forge-native}"
 export FORGE_LLAMA_DIR
+# "build" by default; set to "build-cuda" to test the CUDA tree.
+FORGE_LLAMA_BUILD_DIR="${FORGE_LLAMA_BUILD_DIR:-build}"
+export FORGE_LLAMA_BUILD_DIR
 
 # cmake from a previous native setup, if present (ephemeral by design).
 if [ -d "$FORGE_LLAMA_DIR/tools" ]; then

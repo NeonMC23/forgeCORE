@@ -10,6 +10,8 @@ use std::env;
 
 fn main() {
     let root = env::var("FORGE_LLAMA_DIR").unwrap_or_else(|_| "/var/tmp/forge-native".to_string());
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{root}/build/bin");
+    let build_dir = env::var("FORGE_LLAMA_BUILD_DIR").unwrap_or_else(|_| "build".to_string());
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{root}/{build_dir}/bin");
     println!("cargo:rerun-if-env-changed=FORGE_LLAMA_DIR");
+    println!("cargo:rerun-if-env-changed=FORGE_LLAMA_BUILD_DIR");
 }
