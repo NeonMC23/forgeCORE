@@ -170,7 +170,8 @@ The pinned native context already computes model, KV/context, and compute byte
 totals per backend buffer type. A minimal read-only C bridge copies names and
 sizes (`llama_context_memory_breakdown_count` /
 `llama_context_memory_breakdown_entry`); no C++ container or pointer escapes.
-forgeCORE exposes it as `Context::memory_breakdown()`.
+forgeCORE exposes it as `Context::memory_breakdown()` and
+`Model::memory_breakdown()` (model-only, before a context exists).
 
 Example on the RTX 3050 with one offloaded layer, 128 context:
 

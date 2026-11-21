@@ -891,6 +891,45 @@ impl Model {
         Ok(crate::device::DeviceType::from_ggml(kind))
     }
 
+    /// Native model-only allocation breakdown grouped by backend buffer
+    /// type. Context and compute fields are zero; use
+    /// [`Context::memory_breakdown`](crate::Context::memory_breakdown) once a
+    /// context exists.
+    pub fn memory_breakdown(&self) -> Result<Vec<crate::context::BufferMemory>> {
+        // SAFETY: raw is a live model; pure snapshot.
+        let count = unsafe { forge_sys::llama_model_memory_breakdown_count(self.inner.raw) };
+        if count < 0 {
+            return Err(Error::model("native model memory breakdown count failed"));
+        }
+        let mut entries = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut raw = forge_sys::llama_buffer_memory_info::default();
+            // SAFETY: index is in range and raw is writable.
+            let rc = unsafe {
+                forge_sys::llama_model_memory_breakdown_entry(self.inner.raw, index, &mut raw)
+            };
+            if rc != 0 {
+                return Err(Error::model(format!(
+                    "native model memory breakdown entry {index} failed"
+                )));
+            }
+            entries.push(crate::context::BufferMemory {
+                // SAFETY: the bridge NUL-terminates both fixed arrays.
+                buffer_type: unsafe { CStr::from_ptr(raw.buffer_type.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned(),
+                // SAFETY: same as above.
+                device_name: unsafe { CStr::from_ptr(raw.device_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned(),
+                model_bytes: u64::try_from(raw.model_bytes).unwrap_or(u64::MAX),
+                context_bytes: u64::try_from(raw.context_bytes).unwrap_or(u64::MAX),
+                compute_bytes: u64::try_from(raw.compute_bytes).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(entries)
+    }
+
     /// Number of attention heads.
     pub fn n_head(&self) -> Result<u32> {
         // SAFETY: raw is a live model; pure getter.

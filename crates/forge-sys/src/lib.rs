@@ -875,6 +875,12 @@ unsafe extern "C" {
         params: llama_context_params,
     ) -> *mut llama_context;
     pub fn llama_free(ctx: *mut llama_context);
+    pub fn llama_model_memory_breakdown_count(model: *const llama_model) -> i32;
+    pub fn llama_model_memory_breakdown_entry(
+        model: *const llama_model,
+        index: i32,
+        out: *mut llama_buffer_memory_info,
+    ) -> i32;
     pub fn llama_context_memory_breakdown_count(ctx: *const llama_context) -> i32;
     pub fn llama_context_memory_breakdown_entry(
         ctx: *const llama_context,
