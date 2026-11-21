@@ -49,10 +49,15 @@ configures with `BUILD_SHARED_LIBS=ON` and tests/examples/tools off, and
 builds with all cores. Re-running it reuses the checkout, skips an
 already-applied patch, and rebuilds incrementally.
 
-The patch adds two narrow capabilities:
+The patch adds several narrow capabilities:
 
 - `LLAMA_LOAD_MODE_MMAP_NO_PREFETCH = 5`, which passes `prefetch=false` to the
   existing `init_mappings` path.
+- Read-only effective placement (`llama_model_effective_gpu_layers`,
+  `llama_model_layer_device_type`, `llama_model_output_device_type`). It
+  reports the devices assigned by the loader after initialization; it does
+  not prove allocation, residency, or actual execution. A CPU-only load
+  reports zero offloaded layers and CPU layer devices.
 - `llama_model_release_pages()`, which walks only that model's own
   file-backed mappings and calls Linux `madvise(MADV_DONTNEED)` on their
   mapped fragments. It does not unmap memory or invalidate tensor pointers.
@@ -112,12 +117,20 @@ The pin is `LLAMA_TAG`/`LLAMA_SHA` at the top of
 
 ## Backend selection
 
-The Rust API enumerates whatever the native build registered. This
-environment builds CPU-only (no GPU present). To enable accelerators,
+The Rust API enumerates whatever the native build registered.
+`registered_backends()` reports backend names and device counts;
+`enumerate_devices()` reports individual devices. This environment builds
+CPU-only (no GPU device is currently usable). To enable accelerators,
 reconfigure the native tree with the ggml backend flags, e.g.
 `-DGGML_CUDA=ON` (see upstream `ggml/CMakeLists.txt` for the full list),
-rebuild, and re-run the suite — `enumerate_devices` and the GPU probe
-test pick new backends up with no Rust changes.
+rebuild, and re-run the suite — `enumerate_devices`, `registered_backends`,
+and the GPU probe test pick new backends up with no Rust changes.
+
+A CUDA build additionally requires a driver/kernel-module match, the CUDA
+toolkit (`nvcc`), and compatible host compilers. Device discovery alone is not
+proof of usable offload; check `registered_backends()`, device enumeration,
+and the effective-placement readback after loading with a non-zero
+`GpuLayers` request.
 
 ## Runtime loader path
 

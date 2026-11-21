@@ -46,8 +46,8 @@ pub use context::{
     MAX_NODE_DISPATCH_SAMPLE_PAGES,
 };
 pub use device::{
-    enumerate_devices, max_devices, supports_gpu_offload, supports_mlock, supports_mmap,
-    DeviceCaps, DeviceInfo, DeviceProps, DeviceType, OpSpec,
+    enumerate_devices, max_devices, registered_backends, supports_gpu_offload, supports_mlock,
+    supports_mmap, BackendRegistration, DeviceCaps, DeviceInfo, DeviceProps, DeviceType, OpSpec,
 };
 pub use dtype::DType;
 pub use error::{Error, Result};

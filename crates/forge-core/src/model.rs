@@ -858,6 +858,39 @@ impl Model {
         u32_from_upstream("n_layer", n)
     }
 
+    /// Number of transformer layers plus the output layer that the native
+    /// loader assigned to a non-CPU device.
+    ///
+    /// This is model-load placement readback, not proof that a device was
+    /// initialized, that inference ran there, or that the allocation is
+    /// resident. CPU-only loads return zero.
+    pub fn effective_gpu_layers(&self) -> Result<u32> {
+        // SAFETY: raw is a live model; pure getter.
+        let count = unsafe { forge_sys::llama_model_effective_gpu_layers(self.inner.raw) };
+        u32_from_upstream("effective_gpu_layers", count)
+    }
+
+    /// Native device type assigned to transformer layer `il` after load.
+    pub fn layer_device_type(&self, il: u32) -> Result<crate::device::DeviceType> {
+        let il = i32::try_from(il).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        // SAFETY: raw is a live model; the native side bounds-checks `il`.
+        let kind = unsafe { forge_sys::llama_model_layer_device_type(self.inner.raw, il) };
+        if kind < 0 {
+            return Err(Error::invalid(format!("layer index {il} is out of range")));
+        }
+        Ok(crate::device::DeviceType::from_ggml(kind))
+    }
+
+    /// Native device type assigned to the output layer after load.
+    pub fn output_device_type(&self) -> Result<crate::device::DeviceType> {
+        // SAFETY: raw is a live model; pure getter.
+        let kind = unsafe { forge_sys::llama_model_output_device_type(self.inner.raw) };
+        if kind < 0 {
+            return Err(Error::model("native output device is unavailable"));
+        }
+        Ok(crate::device::DeviceType::from_ggml(kind))
+    }
+
     /// Number of attention heads.
     pub fn n_head(&self) -> Result<u32> {
         // SAFETY: raw is a live model; pure getter.

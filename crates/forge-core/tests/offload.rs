@@ -9,8 +9,8 @@
 
 use forge_core::model::set_log_quiet;
 use forge_core::{
-    enumerate_devices, max_devices, supports_gpu_offload, supports_mlock, supports_mmap,
-    DeviceType, GpuLayers, Model, ModelLoadMode, ModelOptions, SplitMode,
+    enumerate_devices, max_devices, registered_backends, supports_gpu_offload, supports_mlock,
+    supports_mmap, DeviceType, GpuLayers, Model, ModelLoadMode, ModelOptions, SplitMode,
 };
 use std::path::PathBuf;
 
@@ -63,6 +63,19 @@ fn offload_flag_consistent_with_enumeration() {
 }
 
 #[test]
+fn registered_backends_are_visible() {
+    let backends = registered_backends();
+    assert!(
+        !backends.is_empty(),
+        "expected at least one registered backend"
+    );
+    assert!(
+        backends.iter().any(|backend| backend.device_count > 0),
+        "expected at least one backend with a device: {backends:?}"
+    );
+}
+
+#[test]
 fn registry_holds_cpu() {
     let devices = enumerate_devices();
     assert!(
@@ -102,6 +115,27 @@ fn explicit_cpu_options_load() {
     options.load_mode = ModelLoadMode::Auto;
     let model = Model::load_with_options(&path, &options).expect("explicit CPU options load");
     assert_eq!(model.n_params(), 1176);
+    assert_eq!(model.effective_gpu_layers().expect("readback"), 0);
+    assert_eq!(
+        model.output_device_type().expect("output placement"),
+        DeviceType::Cpu
+    );
+}
+
+#[test]
+fn cpu_load_reports_cpu_layer_placement() {
+    let Some(path) = fixture() else { return };
+    let model = Model::load(&path).expect("fixture model must load");
+    assert_eq!(model.effective_gpu_layers().expect("readback"), 0);
+    let layers = model.n_layer().expect("layer count");
+    for il in 0..layers {
+        assert_eq!(
+            model.layer_device_type(il).expect("layer placement"),
+            DeviceType::Cpu,
+            "layer {il} should be CPU without offload"
+        );
+    }
+    assert!(model.layer_device_type(layers).is_err());
 }
 
 #[test]

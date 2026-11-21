@@ -32,6 +32,7 @@ opaque! {
     ggml_tensor,
     ggml_cgraph,
     ggml_backend,
+    ggml_backend_reg,
     ggml_backend_dev,
     ggml_backend_buffer,
     ggml_backend_buffer_type,
@@ -44,6 +45,8 @@ opaque! {
 
 /// `ggml_backend_t` — pointer to an opaque backend instance.
 pub type ggml_backend_t = *mut ggml_backend;
+/// `ggml_backend_reg_t` — pointer to an opaque backend registration.
+pub type ggml_backend_reg_t = *mut ggml_backend_reg;
 /// `ggml_backend_dev_t` — pointer to an opaque backend device.
 pub type ggml_backend_dev_t = *mut ggml_backend_dev;
 /// `ggml_backend_buffer_type_t` — borrowed buffer-type handle (owned by
@@ -663,6 +666,10 @@ unsafe extern "C" {
 
     // -- ggml-backend.h: devices / buffers / execution ----------------------
     pub fn ggml_backend_load_all();
+    pub fn ggml_backend_reg_count() -> usize;
+    pub fn ggml_backend_reg_get(index: usize) -> ggml_backend_reg_t;
+    pub fn ggml_backend_reg_name(reg: ggml_backend_reg_t) -> *const c_char;
+    pub fn ggml_backend_reg_dev_count(reg: ggml_backend_reg_t) -> usize;
     pub fn ggml_backend_dev_count() -> usize;
     pub fn ggml_backend_dev_get(index: usize) -> ggml_backend_dev_t;
     pub fn ggml_backend_dev_name(device: ggml_backend_dev_t) -> *const c_char;
@@ -981,6 +988,9 @@ unsafe extern "C" {
         buf_size: usize,
     ) -> c_int;
     pub fn llama_model_n_layer(model: *const llama_model) -> c_int;
+    pub fn llama_model_effective_gpu_layers(model: *const llama_model) -> c_int;
+    pub fn llama_model_layer_device_type(model: *const llama_model, il: i32) -> c_int;
+    pub fn llama_model_output_device_type(model: *const llama_model) -> c_int;
     pub fn llama_model_n_head(model: *const llama_model) -> c_int;
     pub fn llama_model_n_head_kv(model: *const llama_model) -> c_int;
 

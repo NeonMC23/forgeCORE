@@ -43,6 +43,9 @@ fn main() {
             || !text.contains("llama_context_set_node_dispatch_observer")
             || !text.contains("llama_model_sample_tensor_pages")
             || !text.contains("llama_model_sample_mapping_pages")
+            || !text.contains("llama_model_effective_gpu_layers")
+            || !text.contains("llama_model_layer_device_type")
+            || !text.contains("llama_model_output_device_type")
         {
             panic!(
                 "forge-sys: {} lacks the required native residency patch. Re-run `sh scripts/setup-native.sh` to apply patches/llama-model-residency.patch.",

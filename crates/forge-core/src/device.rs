@@ -21,7 +21,7 @@ pub enum DeviceType {
 }
 
 impl DeviceType {
-    fn from_ggml(id: i32) -> Self {
+    pub(crate) fn from_ggml(id: i32) -> Self {
         match id {
             forge_sys::dev_type::CPU => Self::Cpu,
             forge_sys::dev_type::GPU => Self::Gpu,
@@ -53,6 +53,38 @@ pub(crate) fn ensure_registry() {
         // registers the statically linked backends; idempotent.
         unsafe { forge_sys::ggml_backend_load_all() };
     });
+}
+
+/// One registered ggml backend and the number of devices it exposes.
+///
+/// Registration is build/runtime evidence only: a registered backend may
+/// still have no usable physical device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendRegistration {
+    pub name: String,
+    pub device_count: usize,
+}
+
+/// Snapshot the registered ggml backends (for example `CPU`, `CUDA`,
+/// `Vulkan`). Empty device counts are preserved rather than hidden.
+pub fn registered_backends() -> Vec<BackendRegistration> {
+    ensure_registry();
+    // SAFETY: no arguments; the registry is process-wide and loaded above.
+    let count = unsafe { forge_sys::ggml_backend_reg_count() };
+    let mut backends = Vec::with_capacity(count);
+    for index in 0..count {
+        // SAFETY: index < reg_count; a vanished registration is skipped.
+        unsafe {
+            let reg = forge_sys::ggml_backend_reg_get(index);
+            if reg.is_null() {
+                continue;
+            }
+            let name = optional_str(forge_sys::ggml_backend_reg_name(reg));
+            let device_count = forge_sys::ggml_backend_reg_dev_count(reg);
+            backends.push(BackendRegistration { name, device_count });
+        }
+    }
+    backends
 }
 
 /// Number of devices currently in the ggml backend registry.
