@@ -179,8 +179,29 @@ exposes each tensor's device pointer for a single-writer transfer, and rewrites
 graph-node weight sources after each new graph build but before scheduler
 allocation. `llama_context_staged_layer_info` reports tensor count, device bytes,
 and substitution count. No tensor/buffer pointer is rebound behind the
-scheduler; staged buffers live for the context lifetime. This is an explicit
-experimental mode and is not used by normal inference.
+scheduler.
+
+Staged sources are mutable only between executions through an explicit
+lifecycle contract:
+
+- `llama_context_invalidate_graph()` synchronizes scheduler backends, releases
+  the execution gate, clears the reusable graph marker, calls
+  `llm_graph_result::reset()` on every cached graph (destroying all nodes and
+  substituted `src` pointers), and calls `ggml_backend_sched_reset()`.
+- `llama_context_evict_layer_cuda(layer)` releases one staged buffer only after
+  invalidation and returns typed `busy`/`not_staged` errors otherwise.
+- `llama_context_staging_state()` reports graph phase, invalidation state,
+  resident layers/bytes, allocation/release/reuse counts, invalidation, rebuild
+  and scheduler-reset counts, quiescence and graph-build durations, and
+  capability flags. `llama_context_staged_layer_count/_at()` enumerate resident
+  layers without exposing pointers.
+
+forgeCORE exposes these as `Context::invalidate_graph()`,
+`Context::evict_layer_cuda()`, `Context::staging_state()`,
+`Context::staged_layer_count()` and `Context::staged_layer_at()`. Allocation
+capacity reuse is not implemented (`reuse_count` is always zero); eviction frees
+the buffer and later staging creates a new allocation. This remains an explicit
+staging mode and is not used by normal inference.
 
 Read-only tensor ownership introspection
 (`llama_model_tensor_storage_count/_entry`) adds tensor name, buffer type,
