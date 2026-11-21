@@ -173,6 +173,13 @@ sizes (`llama_context_memory_breakdown_count` /
 forgeCORE exposes it as `Context::memory_breakdown()` and
 `Model::memory_breakdown()` (model-only, before a context exists).
 
+Read-only tensor ownership introspection
+(`llama_model_tensor_storage_count/_entry`) adds tensor name, buffer type,
+device name, quantization type, parsed `blk.N` layer, stable first-seen buffer
+index, host/file-backed flags, tensor bytes, offset, and containing buffer
+size. It never exposes a pointer. forgeCORE exposes it as
+`Model::tensor_storage()`.
+
 Example on the RTX 3050 with one offloaded layer, 128 context:
 
 ```text

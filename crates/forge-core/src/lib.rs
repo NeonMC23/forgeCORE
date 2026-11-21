@@ -60,7 +60,7 @@ pub use graph::{Graph, NodeInfo, Plan, DEFAULT_GRAPH_CAPACITY};
 pub use memory::{Memory, SeqState, State};
 pub use model::{
     GpuLayers, Model, ModelLoadMode, ModelOptions, PageReleaseResult, PageSample, PageSampleStatus,
-    SplitMode, TensorMappingInfo,
+    SplitMode, TensorMappingInfo, TensorStorageInfo,
 };
 pub use quant::{block_spec, row_bytes, tensor_bytes, BlockSpec, QuantFormat};
 pub use residency::{

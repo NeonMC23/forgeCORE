@@ -348,6 +348,25 @@ impl ModelOptions {
     }
 }
 
+/// One model tensor and the backend buffer that owns it.
+///
+/// Names and buffer identity are copied values. `buffer_index` is stable for
+/// this loaded model and groups tensors sharing one native allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorStorageInfo {
+    pub name: String,
+    pub buffer_type: String,
+    pub device_name: String,
+    pub type_name: String,
+    pub layer: Option<u32>,
+    pub buffer_index: u32,
+    pub is_host: bool,
+    pub file_backed: bool,
+    pub tensor_bytes: u64,
+    pub tensor_offset: Option<u64>,
+    pub buffer_bytes: u64,
+}
+
 /// An owned libllama model (`.gguf` weights + metadata).
 ///
 /// Cheap to clone (shares the native model); `!Send + !Sync` like all
@@ -925,6 +944,51 @@ impl Model {
                 model_bytes: u64::try_from(raw.model_bytes).unwrap_or(u64::MAX),
                 context_bytes: u64::try_from(raw.context_bytes).unwrap_or(u64::MAX),
                 compute_bytes: u64::try_from(raw.compute_bytes).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Read-only tensor-to-buffer ownership metadata for every model tensor.
+    pub fn tensor_storage(&self) -> Result<Vec<TensorStorageInfo>> {
+        // SAFETY: raw is a live model; pure snapshot.
+        let count = unsafe { forge_sys::llama_model_tensor_storage_count(self.inner.raw) };
+        if count < 0 {
+            return Err(Error::model("native tensor storage count failed"));
+        }
+        let mut entries = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut raw = forge_sys::llama_tensor_storage_info::default();
+            // SAFETY: index is in range and raw is writable.
+            let rc = unsafe {
+                forge_sys::llama_model_tensor_storage_entry(self.inner.raw, index, &mut raw)
+            };
+            if rc != 0 {
+                return Err(Error::model(format!(
+                    "native tensor storage entry {index} failed"
+                )));
+            }
+            entries.push(TensorStorageInfo {
+                // SAFETY: the native bridge NUL-terminates all fixed arrays.
+                name: unsafe { CStr::from_ptr(raw.name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned(),
+                buffer_type: unsafe { CStr::from_ptr(raw.buffer_type.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned(),
+                device_name: unsafe { CStr::from_ptr(raw.device_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned(),
+                type_name: unsafe { CStr::from_ptr(raw.type_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned(),
+                layer: u32::try_from(raw.layer).ok(),
+                buffer_index: u32::try_from(raw.buffer_index).unwrap_or(u32::MAX),
+                is_host: raw.is_host != 0,
+                file_backed: raw.file_backed != 0,
+                tensor_bytes: raw.tensor_bytes,
+                tensor_offset: (raw.tensor_offset != u64::MAX).then_some(raw.tensor_offset),
+                buffer_bytes: raw.buffer_bytes,
             });
         }
         Ok(entries)

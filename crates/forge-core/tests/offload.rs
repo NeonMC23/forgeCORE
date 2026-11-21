@@ -399,6 +399,29 @@ fn gpu_effective_placement_readback_real_model() {
     println!(
         "GPU placement: effective={effective}, transformer_gpu={gpu_transformer}, transformer_total={layers}"
     );
+    let storage = model.tensor_storage().expect("tensor storage");
+    assert!(!storage.is_empty());
+    assert!(storage.iter().any(|entry| entry.file_backed));
+    assert!(storage
+        .iter()
+        .any(|entry| entry.device_name.contains("CUDA0") && entry.tensor_bytes > 0));
+    assert!(storage.iter().any(|entry| entry.layer == Some(0)));
+    let mut buffers = std::collections::BTreeSet::new();
+    for entry in &storage {
+        buffers.insert(entry.buffer_index);
+    }
+    let total_tensor_bytes: u64 = storage.iter().map(|entry| entry.tensor_bytes).sum();
+    println!(
+        "tensor storage: tensors={} buffers={} tensor_bytes={} layer0_bytes={}",
+        storage.len(),
+        buffers.len(),
+        total_tensor_bytes,
+        storage
+            .iter()
+            .filter(|entry| entry.layer == Some(0))
+            .map(|entry| entry.tensor_bytes)
+            .sum::<u64>()
+    );
     let mut context_options = ContextOptions::default();
     context_options.n_ctx = 128;
     let context = Context::open(&model, &context_options).expect("GPU context");

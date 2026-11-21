@@ -264,6 +264,41 @@ impl Default for llama_buffer_memory_info {
     }
 }
 
+/// `struct llama_tensor_storage_info` from the pinned read-only
+/// tensor-to-buffer introspection bridge.
+#[repr(C)]
+pub struct llama_tensor_storage_info {
+    pub name: [c_char; 160],
+    pub buffer_type: [c_char; 128],
+    pub device_name: [c_char; 128],
+    pub type_name: [c_char; 32],
+    pub layer: i32,
+    pub buffer_index: i32,
+    pub is_host: u8,
+    pub file_backed: u8,
+    pub tensor_bytes: u64,
+    pub tensor_offset: u64,
+    pub buffer_bytes: u64,
+}
+
+impl Default for llama_tensor_storage_info {
+    fn default() -> Self {
+        Self {
+            name: [0; 160],
+            buffer_type: [0; 128],
+            device_name: [0; 128],
+            type_name: [0; 32],
+            layer: -1,
+            buffer_index: -1,
+            is_host: 0,
+            file_backed: 0,
+            tensor_bytes: 0,
+            tensor_offset: u64::MAX,
+            buffer_bytes: 0,
+        }
+    }
+}
+
 /// `struct llama_model_params` (`llama.h`). Construct via
 /// [`llama_model_default_params`], never by hand.
 #[repr(C)]
@@ -875,6 +910,12 @@ unsafe extern "C" {
         params: llama_context_params,
     ) -> *mut llama_context;
     pub fn llama_free(ctx: *mut llama_context);
+    pub fn llama_model_tensor_storage_count(model: *const llama_model) -> i32;
+    pub fn llama_model_tensor_storage_entry(
+        model: *const llama_model,
+        index: i32,
+        out: *mut llama_tensor_storage_info,
+    ) -> i32;
     pub fn llama_model_memory_breakdown_count(model: *const llama_model) -> i32;
     pub fn llama_model_memory_breakdown_entry(
         model: *const llama_model,
