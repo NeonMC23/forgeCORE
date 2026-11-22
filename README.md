@@ -172,6 +172,15 @@ private low-priority stream. Allocation reuse, double buffering and overlap were
 physically validated; overlap did not improve end-to-end throughput on the RTX
 3050. See `docs/NATIVE.md`.
 
+## Host staging
+
+`forge-staging` supports direct positional reads from a caller-owned descriptor
+into pinned staging buffers, avoiding the pageable intermediate copy. Bounded
+pinned pools, async batch H2D and CUDA start/completion events remain available.
+RAMforge measured Qwen four-layer host preparation falling from 276 ms to
+178 ms with direct coalesced reads, and about 7% lower end-to-end latency with
+asynchronous host reads. See `docs/NATIVE.md`.
+
 ## Controlled residency validation
 
 `forge_core::residency_experiment` provides an isolated Linux validation

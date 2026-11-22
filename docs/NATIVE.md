@@ -214,6 +214,12 @@ in-flight execution; it recycles the old active buffers and activates the
 pending selection. `llama_context_discard_pending_cuda()` preserves the active
 selection.
 
+Direct host staging reads are available through
+`fstage_buffer_read_fd()`: positional reads into a pinned buffer with EINTR and
+short-read handling. This avoids the pageable intermediate copy used by the
+legacy path and works with split GGUF files when driven by native tensor
+mappings.
+
 forge-staging adds one coarse async batch API
 (`fstage_transfer_submit_batch_to_ptr`) that enqueues all tensor copies on a
 private low-priority stream, plus `fstage_transfer_wait_started` for the start

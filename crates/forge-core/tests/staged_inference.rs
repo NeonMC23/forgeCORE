@@ -601,3 +601,71 @@ fn committed_pending_layer_is_consumed_corruption_control() {
         "corrupting the committed pending layer did not change logits; staged data may be ignored"
     );
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn direct_fd_read_matches_model_tensor_bytes_for_split_files() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(reason)) => {
+            eprintln!("SKIP: CUDA unavailable: {reason}");
+            return;
+        }
+        Err(error) => panic!("staging engine: {error}"),
+    };
+    let model = staging_model(&path).expect("model");
+    let mappings = model.tensor_mappings().expect("mappings");
+    let mut seen_paths = std::collections::BTreeSet::new();
+    let mut checked = 0;
+    for mapping in mappings.iter().filter(|mapping| {
+        mapping.file_backed
+            && mapping.file_path.is_some()
+            && mapping.size > 0
+            && mapping.size <= 4 * 1024 * 1024
+    }) {
+        let path = mapping.file_path.as_ref().unwrap();
+        if seen_paths.contains(path) {
+            continue;
+        }
+        seen_paths.insert(path.clone());
+        let mut file = std::fs::File::open(path).expect("open mapping file");
+        let mut host = engine
+            .allocate(MemoryType::PinnedHost, mapping.size)
+            .expect("pinned");
+        host.read_fd(0, file.as_raw_fd(), mapping.offset, mapping.size)
+            .expect("direct read");
+        let mut direct = vec![0u8; mapping.size as usize];
+        host.read_host(0, &mut direct).expect("read_host");
+        let mut expected = vec![0u8; mapping.size as usize];
+        model
+            .read_tensor_bytes(&mapping.name, 0, &mut expected)
+            .expect("model read");
+        assert_eq!(direct, expected, "direct read differs for {}", mapping.name);
+        let mut scratch = [0u8; 16];
+        let _ = file.read(&mut scratch);
+        host.release().unwrap();
+        checked += 1;
+        if seen_paths.len() >= 2 {
+            break;
+        }
+    }
+    eprintln!(
+        "direct reads verified for {} file(s): {}",
+        seen_paths.len(),
+        checked
+    );
+    assert!(checked >= 1, "no file-backed tensor was verified");
+    if seen_paths.len() > 1 {
+        eprintln!(
+            "split-file direct reads verified across {} files",
+            seen_paths.len()
+        );
+    }
+}
