@@ -198,10 +198,28 @@ lifecycle contract:
 
 forgeCORE exposes these as `Context::invalidate_graph()`,
 `Context::evict_layer_cuda()`, `Context::staging_state()`,
-`Context::staged_layer_count()` and `Context::staged_layer_at()`. Allocation
-capacity reuse is not implemented (`reuse_count` is always zero); eviction frees
-the buffer and later staging creates a new allocation. This remains an explicit
-staging mode and is not used by normal inference.
+`Context::staged_layer_count()` and `Context::staged_layer_at()`.
+
+Bounded allocation reuse is implemented
+(`llama_context_set_staging_pool_limit`). Eviction moves a buffer into a
+best-fit pool; new staging recreates tensor metadata over a pooled buffer when
+capacity is sufficient. The pool never exceeds its limit and reports bytes,
+buffer count and `reuse_count`.
+
+Pending double buffering (`llama_context_stage_layer_pending_cuda`) allocates a
+complete next selection in a slot that active graphs do not reference, so it may
+be filled while the active selection executes.
+`llama_context_commit_pending_cuda()` requires successful invalidation and no
+in-flight execution; it recycles the old active buffers and activates the
+pending selection. `llama_context_discard_pending_cuda()` preserves the active
+selection.
+
+forge-staging adds one coarse async batch API
+(`fstage_transfer_submit_batch_to_ptr`) that enqueues all tensor copies on a
+private low-priority stream, plus `fstage_transfer_wait_started` for the start
+event. `query`/`wait` report event-measured duration and host wait time.
+
+This remains an explicit staging mode and is not used by normal inference.
 
 Read-only tensor ownership introspection
 (`llama_model_tensor_storage_count/_entry`) adds tensor name, buffer type,

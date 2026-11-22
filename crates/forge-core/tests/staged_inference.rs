@@ -399,6 +399,7 @@ fn fill_pending_layer(
     context: &Context,
     engine: &Engine,
     layer: u32,
+    corrupt_name: Option<&str>,
 ) -> Result<(), String> {
     let count = context
         .pending_tensor_count(layer)
@@ -418,12 +419,17 @@ fn fill_pending_layer(
     let mut offset = 0u64;
     for tensor in &tensors {
         let length = usize::try_from(tensor.bytes).map_err(|error| error.to_string())?;
-        let mut bytes = vec![0u8; length];
-        model
-            .read_tensor_bytes(&tensor.name, 0, &mut bytes)
-            .map_err(|error| error.to_string())?;
-        host.write_host(offset, &bytes)
-            .map_err(|error| error.to_string())?;
+        if corrupt_name == Some(tensor.name.as_str()) {
+            host.write_host(offset, &vec![0u8; length])
+                .map_err(|error| error.to_string())?;
+        } else {
+            let mut bytes = vec![0u8; length];
+            model
+                .read_tensor_bytes(&tensor.name, 0, &mut bytes)
+                .map_err(|error| error.to_string())?;
+            host.write_host(offset, &bytes)
+                .map_err(|error| error.to_string())?;
+        }
         engine
             .submit_to_device_ptr(&host, offset, tensor.device_ptr, tensor.bytes)
             .map_err(|error| error.to_string())?;
@@ -518,7 +524,7 @@ fn pending_double_buffer_commits_after_invalidation() {
     context
         .stage_layer_pending_cuda(1)
         .expect("stage pending layer 1");
-    fill_pending_layer(&model, &context, &engine, 1).expect("fill pending layer 1");
+    fill_pending_layer(&model, &context, &engine, 1, None).expect("fill pending layer 1");
     let pending = context.staging_state().expect("pending state");
     assert_eq!(pending.resident_layers, 1);
     assert_eq!(pending.pending_layers, 1);
@@ -543,4 +549,55 @@ fn pending_double_buffer_commits_after_invalidation() {
     let info = context.staged_layer_info(1).expect("layer 1 info");
     assert!(info.graph_substitutions > 0);
     assert!(context.staged_layer_info(0).is_err());
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn committed_pending_layer_is_consumed_corruption_control() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(reason)) => {
+            eprintln!("SKIP: CUDA unavailable: {reason}");
+            return;
+        }
+        Err(error) => panic!("staging engine: {error}"),
+    };
+    let model = staging_model(&path).expect("CUDA device");
+    let mut options = ContextOptions::default();
+    options.n_ctx = 128;
+
+    let mut reference = Context::open(&model, &options).expect("reference context");
+    fill_staged_layer(&model, &reference, &engine, 1, None).expect("stage reference layer 1");
+    reference.decode(&batch()).expect("reference decode");
+    let reference_logits = logits(&mut reference);
+
+    let mut context = Context::open(&model, &options).expect("context");
+    fill_staged_layer(&model, &context, &engine, 0, None).expect("stage active layer 0");
+    context
+        .stage_layer_pending_cuda(1)
+        .expect("stage pending layer 1");
+    fill_pending_layer(&model, &context, &engine, 1, Some("blk.1.attn_q.weight"))
+        .expect("fill corrupted pending layer 1");
+    context.invalidate_graph().expect("invalidate");
+    context
+        .commit_pending_cuda()
+        .expect("commit corrupted pending selection");
+    context.memory().expect("kv memory").clear(true);
+    context.decode(&batch()).expect("decode committed layer 1");
+    let corrupted_logits = logits(&mut context);
+    let info = context.staged_layer_info(1).expect("layer 1 info");
+    let difference = max_abs_diff(&reference_logits, &corrupted_logits);
+    eprintln!(
+        "pending corruption logit difference: {difference}, substitutions={}",
+        info.graph_substitutions
+    );
+    assert!(info.graph_substitutions > 0);
+    assert!(
+        difference > 1.0,
+        "corrupting the committed pending layer did not change logits; staged data may be ignored"
+    );
 }

@@ -161,6 +161,17 @@ skips are reported as `skipped_pages`, and budget-excluded pages are separate
 from unsampled and unknown pages. Dropped/truncated/unknown pages are
 explicit; a budget-excluded sample is partial, not a mapping census.
 
+## Staged layer pipeline
+
+The pinned native context now supports bounded reusable CUDA staging buffers, a
+pending double-buffered layer slot, and explicit graph/scheduler invalidation.
+Pending layers can be filled while the active selection executes and are
+committed only after invalidation and quiescence. `forge-staging` adds a
+coarse-grained asynchronous H2D batch API with CUDA start/completion events on a
+private low-priority stream. Allocation reuse, double buffering and overlap were
+physically validated; overlap did not improve end-to-end throughput on the RTX
+3050. See `docs/NATIVE.md`.
+
 ## Controlled residency validation
 
 `forge_core::residency_experiment` provides an isolated Linux validation

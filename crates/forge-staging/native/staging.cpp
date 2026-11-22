@@ -45,6 +45,8 @@ struct CudaApi {
     CUresult (* memcpy_htod_async)(CUdeviceptr, const void *, size_t, CUstream) = nullptr;
     CUresult (* memcpy_dtoh_async)(void *, CUdeviceptr, size_t, CUstream) = nullptr;
     CUresult (* stream_create)(CUstream *, unsigned int) = nullptr;
+    CUresult (* stream_create_with_priority)(CUstream *, unsigned int, int) = nullptr;
+    CUresult (* ctx_get_stream_priority_range)(int *, int *) = nullptr;
     CUresult (* stream_destroy)(CUstream) = nullptr;
     CUresult (* stream_synchronize)(CUstream) = nullptr;
     CUresult (* event_create)(CUevent *, unsigned int) = nullptr;
@@ -95,6 +97,8 @@ CudaApi & api() {
         load(a.memcpy_htod_async, "cuMemcpyHtoDAsync_v2");
         load(a.memcpy_dtoh_async, "cuMemcpyDtoHAsync_v2");
         load(a.stream_create, "cuStreamCreate");
+        load(a.stream_create_with_priority, "cuStreamCreateWithPriority");
+        load(a.ctx_get_stream_priority_range, "cuCtxGetStreamPriorityRange");
         load(a.stream_destroy, "cuStreamDestroy_v2");
         load(a.stream_synchronize, "cuStreamSynchronize");
         load(a.event_create, "cuEventCreate");
@@ -296,7 +300,21 @@ int32_t fstage_engine_create(uint32_t device_index, uint64_t * out_engine) {
             a.primary_ctx_release(engine.device);
             return cuda_fail(rc, "cuCtxPushCurrent(primary)");
         }
-        rc = a.stream_create(&engine.stream, 1 /* non-blocking */);
+        if (a.stream_create_with_priority != nullptr &&
+            a.ctx_get_stream_priority_range != nullptr) {
+            int least_priority = 0;
+            int greatest_priority = 0;
+            if (a.ctx_get_stream_priority_range(&least_priority, &greatest_priority) ==
+                    CUDA_SUCCESS) {
+                // Lowest-priority staging stream: compute kernels on the default
+                // stream take precedence over copy work where the driver honors it.
+                rc = a.stream_create_with_priority(&engine.stream, 1, least_priority);
+            } else {
+                rc = a.stream_create(&engine.stream, 1 /* non-blocking */);
+            }
+        } else {
+            rc = a.stream_create(&engine.stream, 1 /* non-blocking */);
+        }
         if (rc != CUDA_SUCCESS) {
             a.ctx_pop_current(&engine.context);
             a.primary_ctx_release(engine.device);
