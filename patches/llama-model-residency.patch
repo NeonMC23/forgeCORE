@@ -545,7 +545,7 @@ index 31bbf8b..8b3dfd6 100644
      LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fcd4dfb..be95c7d 100644
+index fcd4dfb..5f107d1 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -1147,7 +1147,7 @@ index fcd4dfb..be95c7d 100644
 +    out->quiescence_wait_ns = quiescence_wait_ns;
 +    out->last_quiescence_wait_ns = last_quiescence_wait_ns;
 +    out->eviction_supported = 1;
-+    out->allocation_reuse_supported = 0;
++    out->allocation_reuse_supported = 1;
 +    out->transfer_compute_overlap_supported = 0;
 +    return 0;
 +}

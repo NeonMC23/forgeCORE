@@ -317,7 +317,7 @@ fn staged_layer_eviction_requires_invalidation_and_supports_replacement() {
     assert!(lifecycle.graph_rebuild_count >= 2);
     assert_eq!(lifecycle.reuse_count, 0);
     assert!(lifecycle.eviction_supported);
-    assert!(!lifecycle.allocation_reuse_supported);
+    assert!(lifecycle.allocation_reuse_supported);
     assert!(!lifecycle.transfer_compute_overlap_supported);
 
     let info = context.staged_layer_info(1).expect("layer 1 info");
