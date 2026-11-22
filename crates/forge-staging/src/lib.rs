@@ -34,6 +34,7 @@ pub enum StagingError {
     NoOperation(String),
     Cuda(String),
     AlreadyReleased(String),
+    Io(String),
     Internal(String),
 }
 
@@ -48,6 +49,7 @@ impl fmt::Display for StagingError {
             | Self::NoOperation(message)
             | Self::Cuda(message)
             | Self::AlreadyReleased(message)
+            | Self::Io(message)
             | Self::Internal(message) => formatter.write_str(message),
         }
     }
@@ -97,6 +99,9 @@ pub struct Stats {
     pub total_duration_ns: u64,
     pub in_flight_operations: u64,
     pub cancellation_requests: u64,
+    pub read_requests: u64,
+    pub read_bytes: u64,
+    pub read_ns: u64,
 }
 
 #[repr(C)]
@@ -168,6 +173,13 @@ mod ffi {
             out: *mut std::ffi::c_void,
             size: u64,
         ) -> c_int;
+        pub fn fstage_buffer_read_fd(
+            buffer: u64,
+            buffer_offset: u64,
+            fd: c_int,
+            file_offset: u64,
+            size: u64,
+        ) -> c_int;
         pub fn fstage_transfer_submit(
             engine: u64,
             src: u64,
@@ -221,6 +233,7 @@ fn map_error(code: i32) -> StagingError {
         6 => StagingError::NoOperation(message),
         7 => StagingError::Cuda(message),
         9 => StagingError::AlreadyReleased(message),
+        10 => StagingError::Io(message),
         _ => StagingError::Internal(message),
     }
 }
@@ -418,6 +431,21 @@ impl StagingBuffer {
     pub fn write_host(&self, offset: u64, data: &[u8]) -> Result<(), StagingError> {
         check(unsafe {
             ffi::fstage_buffer_write(self.handle, offset, data.as_ptr().cast(), data.len() as u64)
+        })
+    }
+
+    /// Read a file range directly into this host-accessible buffer with
+    /// positional reads. The caller owns the descriptor and remains
+    /// responsible for keeping it open for the duration of the call.
+    pub fn read_fd(
+        &self,
+        buffer_offset: u64,
+        fd: std::os::raw::c_int,
+        file_offset: u64,
+        size: u64,
+    ) -> Result<(), StagingError> {
+        check(unsafe {
+            ffi::fstage_buffer_read_fd(self.handle, buffer_offset, fd, file_offset, size)
         })
     }
 
@@ -775,4 +803,43 @@ fn batch_submission_starts_and_completes_with_external_pointers() {
     host.release().unwrap();
     device.release().unwrap();
     readback.release().unwrap();
+}
+
+#[test]
+fn direct_fd_read_fills_pinned_buffer_and_rejects_short_reads() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(_)) => {
+            println!("SKIP: CUDA driver unavailable");
+            return;
+        }
+        Err(error) => panic!("unexpected engine error: {error}"),
+    };
+    let path =
+        std::env::temp_dir().join(format!("forge-staging-read-fd-{}.bin", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    let payload: Vec<u8> = (0..65536u64)
+        .map(|i| (i.wrapping_mul(13) & 0xff) as u8)
+        .collect();
+    file.write_all(&payload).unwrap();
+    file.flush().unwrap();
+    let mut host = engine.allocate(MemoryType::PinnedHost, 65536).unwrap();
+    if let Err(error) = host.read_fd(0, file.as_raw_fd(), 0, 65536) {
+        panic!("direct read failed: {error:?}");
+    }
+    let mut out = vec![0u8; 65536];
+    host.read_host(0, &mut out).unwrap();
+    assert_eq!(out, payload);
+    assert!(host.read_fd(0, file.as_raw_fd(), 0, 65537).is_err());
+    host.release().unwrap();
+    let _ = std::fs::remove_file(path);
 }

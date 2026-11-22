@@ -39,6 +39,7 @@ typedef enum fstage_error {
     FSTAGE_CUDA_ERROR = 7,
     FSTAGE_INTERNAL = 8,
     FSTAGE_ALREADY_RELEASED = 9,
+    FSTAGE_IO_ERROR = 10,
 } fstage_error;
 
 typedef struct fstage_engine_info {
@@ -77,6 +78,9 @@ typedef struct fstage_stats {
     uint64_t total_duration_ns;
     uint64_t in_flight_operations;
     uint64_t cancellation_requests;
+    uint64_t read_requests;
+    uint64_t read_bytes;
+    uint64_t read_ns;
 } fstage_stats;
 
 typedef struct fstage_transfer_report {
@@ -101,6 +105,11 @@ FSTAGE_API int32_t fstage_buffer_write(
         uint64_t buffer, uint64_t offset, const void * data, uint64_t size);
 FSTAGE_API int32_t fstage_buffer_read(
         uint64_t buffer, uint64_t offset, void * out, uint64_t size);
+/* Read a file range directly into a host-accessible staging buffer using
+ * pread(2). Retries EINTR and rejects short reads. The caller owns the fd. */
+FSTAGE_API int32_t fstage_buffer_read_fd(
+        uint64_t buffer, uint64_t buffer_offset,
+        int32_t fd, uint64_t file_offset, uint64_t size);
 
 FSTAGE_API int32_t fstage_transfer_submit(
         uint64_t engine,

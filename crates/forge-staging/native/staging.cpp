@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <errno.h>
+#include <unistd.h>
 #include <mutex>
 #include <string>
 #include <type_traits>
@@ -600,6 +602,65 @@ int32_t fstage_buffer_read(
     }
     std::memcpy(out, static_cast<const char *>(buffer->host) + offset, static_cast<size_t>(size));
     return FSTAGE_OK;
+}
+
+int32_t fstage_buffer_read_fd(
+        uint64_t buffer_handle, uint64_t buffer_offset,
+        int32_t fd, uint64_t file_offset, uint64_t size) {
+    if (fd < 0 || size == 0) {
+        return fail(FSTAGE_INVALID_ARGUMENT, "fd and size must be valid");
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        Buffer * buffer = find_buffer(buffer_handle);
+        if (buffer == nullptr) {
+            return fail(FSTAGE_INVALID_HANDLE, "buffer handle is unknown");
+        }
+        if (buffer->state == FSTAGE_BUFFER_RELEASED) {
+            return fail(FSTAGE_ALREADY_RELEASED, "buffer was released");
+        }
+        if (buffer->inflight) {
+            return fail(FSTAGE_BUSY, "buffer is in flight");
+        }
+        if (!buffer_is_host(*buffer)) {
+            return fail(FSTAGE_INVALID_ARGUMENT, "buffer is not host-accessible");
+        }
+        if (buffer_offset > buffer->capacity || size > buffer->capacity - buffer_offset) {
+            return fail(FSTAGE_INVALID_ARGUMENT, "read exceeds buffer capacity");
+        }
+        Engine * engine = find_engine(buffer->engine);
+        if (engine == nullptr) {
+            return fail(FSTAGE_INVALID_HANDLE, "owning engine is not live");
+        }
+        char * destination = static_cast<char *>(buffer->host) + buffer_offset;
+        uint64_t done = 0;
+        const uint64_t started = now_ns();
+        while (done < size) {
+            const ssize_t rc = pread(
+                    fd, destination + done, static_cast<size_t>(size - done),
+                    static_cast<off_t>(file_offset + done));
+            if (rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                engine->stats.read_requests++;
+                return fail(FSTAGE_IO_ERROR, std::string("pread failed: ") + std::strerror(errno));
+            }
+            if (rc == 0) {
+                engine->stats.read_requests++;
+                return fail(FSTAGE_IO_ERROR, "pread reached unexpected end of file");
+            }
+            done += static_cast<uint64_t>(rc);
+        }
+        engine->stats.read_requests++;
+        engine->stats.read_bytes += size;
+        engine->stats.read_ns += now_ns() - started;
+        return FSTAGE_OK;
+    } catch (const std::exception & error) {
+        return fail(FSTAGE_INTERNAL, error.what());
+    } catch (...) {
+        return fail(FSTAGE_INTERNAL, "unknown native exception");
+    }
 }
 
 int32_t fstage_transfer_submit(
