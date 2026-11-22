@@ -1731,7 +1731,13 @@ pub struct StagingLifecycleState {
     pub graph_phase: GraphPhase,
     pub graph_invalidated: bool,
     pub resident_layers: u32,
+    pub pending_layers: u32,
     pub resident_bytes: u64,
+    pub pending_bytes: u64,
+    pub pool_bytes: u64,
+    pub pool_limit_bytes: u64,
+    pub pool_buffers: u64,
+    pub commit_count: u64,
     pub allocation_count: u64,
     pub release_count: u64,
     pub reuse_count: u64,
@@ -2140,7 +2146,13 @@ impl Context {
             graph_phase: GraphPhase::from_raw(raw.graph_phase),
             graph_invalidated: raw.graph_invalidated != 0,
             resident_layers: raw.resident_layers,
+            pending_layers: raw.pending_layers,
             resident_bytes: raw.resident_bytes,
+            pending_bytes: raw.pending_bytes,
+            pool_bytes: raw.pool_bytes,
+            pool_limit_bytes: raw.pool_limit_bytes,
+            pool_buffers: raw.pool_buffers,
+            commit_count: raw.commit_count,
             allocation_count: raw.allocation_count,
             release_count: raw.release_count,
             reuse_count: raw.reuse_count,
@@ -2182,6 +2194,103 @@ impl Context {
             device_bytes: raw.device_bytes,
             graph_substitutions: raw.graph_substitutions,
         })
+    }
+
+    /// Allocate a layer into the pending double-buffered slot. Pending tensors
+    /// are not substituted into an active graph, so this is allowed while the
+    /// active selection executes.
+    pub fn stage_layer_pending_cuda(&self, layer: u32) -> Result<()> {
+        let layer =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        // SAFETY: live context; native validates layer and slot state.
+        let rc = unsafe { forge_sys::llama_context_stage_layer_pending_cuda(self.raw, layer) };
+        if rc != 0 {
+            return Err(staging_error(
+                "stage_layer_pending_cuda",
+                Some(layer as u32),
+                rc,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn pending_layer_info(&self, layer: u32) -> Result<StagedLayerInfo> {
+        let layer_i32 =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        let mut raw = forge_sys::llama_staged_layer_info::default();
+        // SAFETY: live context and writable out.
+        let rc =
+            unsafe { forge_sys::llama_context_pending_layer_info(self.raw, layer_i32, &mut raw) };
+        if rc != 0 {
+            return Err(Error::context(format!("layer {layer} is not pending")));
+        }
+        Ok(StagedLayerInfo {
+            layer,
+            tensor_count: u32::try_from(raw.tensor_count).unwrap_or(0),
+            device_bytes: raw.device_bytes,
+            graph_substitutions: 0,
+        })
+    }
+
+    pub fn pending_tensor_count(&self, layer: u32) -> Result<u32> {
+        let layer =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        // SAFETY: live context; native validates.
+        let count = unsafe { forge_sys::llama_context_pending_tensor_count(self.raw, layer) };
+        u32::try_from(count).map_err(|_| Error::context(format!("layer {layer} is not pending")))
+    }
+
+    pub fn pending_tensor_info(&self, layer: u32, index: u32) -> Result<StagedTensorInfo> {
+        let layer_i32 =
+            i32::try_from(layer).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        let index_i32 =
+            i32::try_from(index).map_err(|_| Error::invalid("tensor index exceeds i32::MAX"))?;
+        let mut raw = forge_sys::llama_staged_tensor_info::default();
+        // SAFETY: live context, valid index, writable out.
+        let rc = unsafe {
+            forge_sys::llama_context_pending_tensor_info(self.raw, layer_i32, index_i32, &mut raw)
+        };
+        if rc != 0 {
+            return Err(Error::context(format!(
+                "pending tensor {index} in layer {layer} is unavailable"
+            )));
+        }
+        Ok(StagedTensorInfo {
+            name: unsafe { CStr::from_ptr(raw.name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
+            device_ptr: raw.device_ptr,
+            bytes: raw.bytes,
+            layer,
+        })
+    }
+
+    /// Activate the pending selection. Requires a successfully invalidated graph.
+    pub fn commit_pending_cuda(&self) -> Result<()> {
+        // SAFETY: live context; native enforces invalidation and quiescence.
+        let rc = unsafe { forge_sys::llama_context_commit_pending_cuda(self.raw) };
+        if rc != 0 {
+            return Err(staging_error("commit_pending_cuda", None, rc));
+        }
+        Ok(())
+    }
+
+    pub fn discard_pending_cuda(&self) -> Result<()> {
+        // SAFETY: live context; pending buffers are not graph-referenced.
+        let rc = unsafe { forge_sys::llama_context_discard_pending_cuda(self.raw) };
+        if rc != 0 {
+            return Err(staging_error("discard_pending_cuda", None, rc));
+        }
+        Ok(())
+    }
+
+    pub fn set_staging_pool_limit(&self, bytes: u64) -> Result<()> {
+        // SAFETY: live context; native trims retained buffers.
+        let rc = unsafe { forge_sys::llama_context_set_staging_pool_limit(self.raw, bytes) };
+        if rc != 0 {
+            return Err(staging_error("set_staging_pool_limit", None, rc));
+        }
+        Ok(())
     }
 
     /// Native model/context/compute byte breakdown grouped by backend buffer

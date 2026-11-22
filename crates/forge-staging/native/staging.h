@@ -57,6 +57,7 @@ typedef struct fstage_buffer_info {
     uint8_t in_flight;
     uint8_t host_pinned;
     uint32_t device_index;
+    uint64_t device_ptr;
 } fstage_buffer_info;
 
 typedef struct fstage_stats {
@@ -113,6 +114,16 @@ FSTAGE_API int32_t fstage_transfer_submit(
 FSTAGE_API int32_t fstage_transfer_submit_to_ptr(
         uint64_t engine, uint64_t src, uint64_t src_offset,
         uint64_t device_ptr, uint64_t bytes);
+/* Submit one H2D batch into externally owned CUDA device pointers on the
+ * engine's private stream. All copies are enqueued before returning; the
+ * caller must use query/wait before reusing the source buffer. */
+FSTAGE_API int32_t fstage_transfer_submit_batch_to_ptr(
+        uint64_t engine, uint64_t src,
+        const uint64_t * src_offsets, const uint64_t * device_ptrs,
+        const uint64_t * sizes, uint64_t count);
+/* Wait until the first operation of the current batch has started on the
+ * device. Does not wait for completion. */
+FSTAGE_API int32_t fstage_transfer_wait_started(uint64_t engine);
 FSTAGE_API int32_t fstage_transfer_query(
         uint64_t engine, fstage_transfer_report * out);
 FSTAGE_API int32_t fstage_transfer_wait(

@@ -57,6 +57,8 @@ fn main() {
             || !text.contains("llama_context_invalidate_graph")
             || !text.contains("llama_context_evict_layer_cuda")
             || !text.contains("llama_context_staging_state")
+            || !text.contains("llama_context_stage_layer_pending_cuda")
+            || !text.contains("llama_context_commit_pending_cuda")
             || !text.contains("llama_context_memory_breakdown_count")
             || !text.contains("llama_context_memory_breakdown_entry")
         {

@@ -75,6 +75,7 @@ pub struct BufferInfo {
     pub in_flight: u8,
     pub host_pinned: u8,
     pub device_index: u32,
+    pub device_ptr: u64,
 }
 
 #[repr(C)]
@@ -183,6 +184,15 @@ mod ffi {
             device_ptr: u64,
             bytes: u64,
         ) -> c_int;
+        pub fn fstage_transfer_submit_batch_to_ptr(
+            engine: u64,
+            src: u64,
+            src_offsets: *const u64,
+            device_ptrs: *const u64,
+            sizes: *const u64,
+            count: u64,
+        ) -> c_int;
+        pub fn fstage_transfer_wait_started(engine: u64) -> c_int;
         pub fn fstage_transfer_query(engine: u64, out: *mut TransferReport) -> c_int;
         pub fn fstage_transfer_wait(engine: u64, out: *mut TransferReport) -> c_int;
         pub fn fstage_transfer_cancel(engine: u64) -> c_int;
@@ -323,6 +333,38 @@ impl Engine {
                 bytes,
             )
         })
+    }
+
+    /// Submit a batch of H2D copies into externally owned CUDA device pointers
+    /// on one private stream. Returns after all copies are enqueued; use
+    /// [`wait`](Engine::wait) before reusing the source buffer.
+    pub fn submit_batch_to_device_ptrs(
+        &self,
+        source: &StagingBuffer,
+        source_offsets: &[u64],
+        device_ptrs: &[u64],
+        sizes: &[u64],
+    ) -> Result<(), StagingError> {
+        if source_offsets.len() != device_ptrs.len() || sizes.len() != device_ptrs.len() {
+            return Err(StagingError::InvalidArgument(
+                "batch arrays have different lengths".to_string(),
+            ));
+        }
+        check(unsafe {
+            ffi::fstage_transfer_submit_batch_to_ptr(
+                self.inner.handle,
+                source.handle,
+                source_offsets.as_ptr(),
+                device_ptrs.as_ptr(),
+                sizes.as_ptr(),
+                device_ptrs.len() as u64,
+            )
+        })
+    }
+
+    /// Block until the first copy of the current batch has started on device.
+    pub fn wait_started(&self) -> Result<(), StagingError> {
+        check(unsafe { ffi::fstage_transfer_wait_started(self.inner.handle) })
     }
 
     pub fn query(&self) -> Result<Option<TransferReport>, StagingError> {
@@ -688,4 +730,49 @@ mod benchmarks {
         }
         println!("snapshot_overhead_1000_ns={}", started.elapsed().as_nanos());
     }
+}
+
+#[test]
+fn batch_submission_starts_and_completes_with_external_pointers() {
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(_)) => {
+            println!("SKIP: CUDA driver unavailable");
+            return;
+        }
+        Err(error) => panic!("unexpected engine error: {error}"),
+    };
+    let region = 256 * 1024u64;
+    let count = 3u64;
+    let total = region * count;
+    let mut host = engine.allocate(MemoryType::PinnedHost, total).unwrap();
+    let bytes: Vec<u8> = (0..total)
+        .map(|i| (i.wrapping_mul(17) & 0xff) as u8)
+        .collect();
+    host.write_host(0, &bytes).unwrap();
+    let mut device = engine.allocate(MemoryType::Device, total).unwrap();
+    let base = device.info().unwrap().device_ptr;
+    assert_ne!(base, 0);
+    let offsets: Vec<u64> = (0..count).map(|i| i * region).collect();
+    let ptrs: Vec<u64> = (0..count).map(|i| base + i * region).collect();
+    let sizes = vec![region; count as usize];
+    engine
+        .submit_batch_to_device_ptrs(&host, &offsets, &ptrs, &sizes)
+        .unwrap();
+    engine.wait_started().unwrap();
+    let report = engine.wait().unwrap();
+    assert_eq!(report.bytes, total);
+    assert!(report.duration_ns > 0);
+
+    let mut readback = engine.allocate(MemoryType::PinnedHost, total).unwrap();
+    engine
+        .submit(&device, 0, &readback, 0, total, Direction::DeviceToHost)
+        .unwrap();
+    engine.wait().unwrap();
+    let mut output = vec![0u8; total as usize];
+    readback.read_host(0, &mut output).unwrap();
+    assert_eq!(output, bytes);
+    host.release().unwrap();
+    device.release().unwrap();
+    readback.release().unwrap();
 }

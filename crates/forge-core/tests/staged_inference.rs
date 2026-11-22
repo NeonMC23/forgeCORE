@@ -393,3 +393,154 @@ fn replacement_layer_is_consumed_corruption_control() {
     assert_eq!(lifecycle.release_count, 2);
     assert_eq!(lifecycle.reuse_count, 0);
 }
+
+fn fill_pending_layer(
+    model: &Model,
+    context: &Context,
+    engine: &Engine,
+    layer: u32,
+) -> Result<(), String> {
+    let count = context
+        .pending_tensor_count(layer)
+        .map_err(|error| error.to_string())?;
+    let mut tensors = Vec::new();
+    for index in 0..count {
+        tensors.push(
+            context
+                .pending_tensor_info(layer, index)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let total: u64 = tensors.iter().map(|tensor| tensor.bytes).sum();
+    let mut host = engine
+        .allocate(MemoryType::PinnedHost, total)
+        .map_err(|error| error.to_string())?;
+    let mut offset = 0u64;
+    for tensor in &tensors {
+        let length = usize::try_from(tensor.bytes).map_err(|error| error.to_string())?;
+        let mut bytes = vec![0u8; length];
+        model
+            .read_tensor_bytes(&tensor.name, 0, &mut bytes)
+            .map_err(|error| error.to_string())?;
+        host.write_host(offset, &bytes)
+            .map_err(|error| error.to_string())?;
+        engine
+            .submit_to_device_ptr(&host, offset, tensor.device_ptr, tensor.bytes)
+            .map_err(|error| error.to_string())?;
+        engine.wait().map_err(|error| error.to_string())?;
+        offset += tensor.bytes;
+    }
+    host.release().map_err(|error| error.to_string())?;
+    context
+        .pending_layer_info(layer)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn evicted_layer_buffer_is_reused_from_the_bounded_pool() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(reason)) => {
+            eprintln!("SKIP: CUDA unavailable: {reason}");
+            return;
+        }
+        Err(error) => panic!("staging engine: {error}"),
+    };
+    let model = staging_model(&path).expect("CUDA device");
+    let mut options = ContextOptions::default();
+    options.n_ctx = 128;
+    let mut context = Context::open(&model, &options).expect("context");
+    context
+        .set_staging_pool_limit(32 * 1024 * 1024)
+        .expect("pool limit");
+
+    fill_staged_layer(&model, &context, &engine, 0, None).expect("stage layer 0");
+    let before = context.staging_state().expect("state before");
+    assert_eq!(before.allocation_count, 1);
+    assert_eq!(before.reuse_count, 0);
+
+    context.invalidate_graph().expect("invalidate");
+    context.evict_layer_cuda(0).expect("evict layer 0");
+    let pooled = context.staging_state().expect("state pooled");
+    assert!(pooled.pool_bytes > 0);
+    assert_eq!(pooled.pool_buffers, 1);
+
+    fill_staged_layer(&model, &context, &engine, 1, None).expect("stage layer 1");
+    let reused = context.staging_state().expect("state reused");
+    assert_eq!(reused.reuse_count, 1);
+    assert_eq!(reused.allocation_count, 1);
+    assert_eq!(reused.pool_bytes, 0);
+    assert_eq!(reused.pool_buffers, 0);
+
+    context.decode(&batch()).expect("decode layer 1");
+    assert!(
+        context
+            .staged_layer_info(1)
+            .expect("layer 1")
+            .graph_substitutions
+            > 0
+    );
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn pending_double_buffer_commits_after_invalidation() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(reason)) => {
+            eprintln!("SKIP: CUDA unavailable: {reason}");
+            return;
+        }
+        Err(error) => panic!("staging engine: {error}"),
+    };
+    let model = staging_model(&path).expect("CUDA device");
+    let mut options = ContextOptions::default();
+    options.n_ctx = 128;
+    let mut context = Context::open(&model, &options).expect("context");
+    context
+        .set_staging_pool_limit(32 * 1024 * 1024)
+        .expect("pool limit");
+
+    fill_staged_layer(&model, &context, &engine, 0, None).expect("stage layer 0");
+    context.decode(&batch()).expect("decode layer 0");
+
+    // Pending staging is allowed while the active graph exists.
+    context
+        .stage_layer_pending_cuda(1)
+        .expect("stage pending layer 1");
+    fill_pending_layer(&model, &context, &engine, 1).expect("fill pending layer 1");
+    let pending = context.staging_state().expect("pending state");
+    assert_eq!(pending.resident_layers, 1);
+    assert_eq!(pending.pending_layers, 1);
+    assert!(pending.pending_bytes > 0);
+
+    // Active eviction and commit both require invalidation.
+    assert!(context.evict_layer_cuda(0).is_err());
+    assert!(context.commit_pending_cuda().is_err());
+    context.invalidate_graph().expect("invalidate");
+    context
+        .commit_pending_cuda()
+        .expect("commit pending selection");
+
+    let committed = context.staging_state().expect("committed state");
+    assert_eq!(committed.resident_layers, 1);
+    assert_eq!(committed.pending_layers, 0);
+    assert_eq!(committed.commit_count, 1);
+    assert!(committed.pool_bytes > 0);
+
+    context.memory().expect("kv memory").clear(true);
+    context.decode(&batch()).expect("decode committed layer 1");
+    let info = context.staged_layer_info(1).expect("layer 1 info");
+    assert!(info.graph_substitutions > 0);
+    assert!(context.staged_layer_info(0).is_err());
+}

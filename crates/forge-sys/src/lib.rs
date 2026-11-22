@@ -325,8 +325,13 @@ pub struct llama_staging_state {
     pub graph_phase: u32,
     pub graph_invalidated: u32,
     pub resident_layers: u32,
-    pub reserved: u32,
+    pub pending_layers: u32,
     pub resident_bytes: u64,
+    pub pending_bytes: u64,
+    pub pool_bytes: u64,
+    pub pool_limit_bytes: u64,
+    pub pool_buffers: u64,
+    pub commit_count: u64,
     pub allocation_count: u64,
     pub release_count: u64,
     pub reuse_count: u64,
@@ -1014,6 +1019,22 @@ unsafe extern "C" {
         index: i32,
         out: *mut llama_staged_layer_info,
     ) -> i32;
+    pub fn llama_context_stage_layer_pending_cuda(ctx: *mut llama_context, layer: i32) -> i32;
+    pub fn llama_context_pending_layer_info(
+        ctx: *const llama_context,
+        layer: i32,
+        out: *mut llama_staged_layer_info,
+    ) -> i32;
+    pub fn llama_context_pending_tensor_count(ctx: *const llama_context, layer: i32) -> i32;
+    pub fn llama_context_pending_tensor_info(
+        ctx: *const llama_context,
+        layer: i32,
+        index: i32,
+        out: *mut llama_staged_tensor_info,
+    ) -> i32;
+    pub fn llama_context_commit_pending_cuda(ctx: *mut llama_context) -> i32;
+    pub fn llama_context_discard_pending_cuda(ctx: *mut llama_context) -> i32;
+    pub fn llama_context_set_staging_pool_limit(ctx: *mut llama_context, bytes: u64) -> i32;
     pub fn llama_context_memory_breakdown_count(ctx: *const llama_context) -> i32;
     pub fn llama_context_memory_breakdown_entry(
         ctx: *const llama_context,

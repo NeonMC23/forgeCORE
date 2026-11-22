@@ -528,6 +528,7 @@ int32_t fstage_buffer_get_info(uint64_t buffer_handle, fstage_buffer_info * out)
     out->in_flight = buffer->inflight ? 1 : 0;
     out->host_pinned = buffer->host_pinned ? 1 : 0;
     out->device_index = buffer->device_index;
+    out->device_ptr = static_cast<uint64_t>(buffer->device);
     return FSTAGE_OK;
 }
 
@@ -760,6 +761,116 @@ int32_t fstage_transfer_submit_to_ptr(
     } catch (...) {
         return fail(FSTAGE_INTERNAL, "unknown native exception");
     }
+}
+
+int32_t fstage_transfer_submit_batch_to_ptr(
+        uint64_t engine_handle, uint64_t src_handle,
+        const uint64_t * src_offsets, const uint64_t * device_ptrs,
+        const uint64_t * sizes, uint64_t count) {
+    if (count == 0 || src_offsets == nullptr || device_ptrs == nullptr || sizes == nullptr) {
+        return fail(FSTAGE_INVALID_ARGUMENT, "batch arrays and count must be non-zero");
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        Engine * engine = find_engine(engine_handle);
+        Buffer * src = find_buffer(src_handle);
+        if (engine == nullptr || src == nullptr) {
+            return fail(FSTAGE_INVALID_HANDLE, "engine or source buffer handle is unknown");
+        }
+        if (!engine->usable) {
+            return fail(FSTAGE_CUDA_ERROR, "engine is unusable after a prior failure");
+        }
+        if (engine->inflight) {
+            return fail(FSTAGE_BUSY, "engine already has an in-flight transfer");
+        }
+        if (src->engine != engine_handle) {
+            return fail(FSTAGE_INVALID_ARGUMENT, "source buffer belongs to a different engine");
+        }
+        if (src->state == FSTAGE_BUFFER_RELEASED || src->inflight) {
+            return fail(FSTAGE_BUSY, "source buffer is unavailable");
+        }
+        if (!buffer_is_host(*src)) {
+            return fail(FSTAGE_INVALID_ARGUMENT, "batch target requires a host source");
+        }
+        uint64_t total = 0;
+        for (uint64_t i = 0; i < count; ++i) {
+            if (device_ptrs[i] == 0 || sizes[i] == 0) {
+                return fail(FSTAGE_INVALID_ARGUMENT, "batch entry has zero pointer or size");
+            }
+            if (src_offsets[i] > src->capacity || sizes[i] > src->capacity - src_offsets[i]) {
+                return fail(FSTAGE_INVALID_ARGUMENT, "batch entry exceeds source capacity");
+            }
+            if (total > UINT64_MAX - sizes[i]) {
+                return fail(FSTAGE_INVALID_ARGUMENT, "batch byte count overflows");
+            }
+            total += sizes[i];
+        }
+        ContextGuard guard(*engine);
+        if (!guard.ok) {
+            return fail(FSTAGE_CUDA_ERROR, "cannot make the staging context current");
+        }
+        const uint64_t submit_started = now_ns();
+        CUresult rc = api().event_record(engine->start, engine->stream);
+        if (rc != CUDA_SUCCESS) {
+            engine->usable = false;
+            return cuda_fail(rc, "cuEventRecord(start)");
+        }
+        for (uint64_t i = 0; i < count; ++i) {
+            const char * source = static_cast<const char *>(src->host) + src_offsets[i];
+            rc = api().memcpy_htod_async(
+                    static_cast<CUdeviceptr>(device_ptrs[i]), source,
+                    static_cast<size_t>(sizes[i]), engine->stream);
+            if (rc != CUDA_SUCCESS) {
+                engine->stats.transfer_requests++;
+                engine->stats.transfer_failed++;
+                engine->usable = false;
+                return cuda_fail(rc, "batch H2D submission");
+            }
+        }
+        rc = api().event_record(engine->end, engine->stream);
+        if (rc != CUDA_SUCCESS) {
+            engine->stats.transfer_requests++;
+            engine->stats.transfer_failed++;
+            engine->usable = false;
+            return cuda_fail(rc, "cuEventRecord(end)");
+        }
+        engine->stats.transfer_requests += count;
+        engine->stats.transfer_bytes += total;
+        engine->last_submit_ns = now_ns() - submit_started;
+        engine->stats.submit_ns += engine->last_submit_ns;
+        engine->inflight = true;
+        engine->src = src_handle;
+        engine->dst = 0;
+        engine->bytes = total;
+        engine->direction = FSTAGE_DIRECTION_HOST_TO_DEVICE;
+        src->inflight = true;
+        update_buffer_state(*src);
+        return FSTAGE_OK;
+    } catch (const std::exception & error) {
+        return fail(FSTAGE_INTERNAL, error.what());
+    } catch (...) {
+        return fail(FSTAGE_INTERNAL, "unknown native exception");
+    }
+}
+
+int32_t fstage_transfer_wait_started(uint64_t engine_handle) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Engine * engine = find_engine(engine_handle);
+    if (engine == nullptr) {
+        return fail(FSTAGE_INVALID_HANDLE, "engine handle is not live");
+    }
+    if (!engine->inflight) {
+        return fail(FSTAGE_NO_OPERATION, "no transfer is in flight");
+    }
+    ContextGuard guard(*engine);
+    if (!guard.ok) {
+        return fail(FSTAGE_CUDA_ERROR, "cannot make the staging context current");
+    }
+    CUresult rc = api().event_synchronize(engine->start);
+    if (rc != CUDA_SUCCESS) {
+        return cuda_fail(rc, "cuEventSynchronize(start)");
+    }
+    return FSTAGE_OK;
 }
 
 int32_t fstage_transfer_query(uint64_t engine_handle, fstage_transfer_report * out) {
