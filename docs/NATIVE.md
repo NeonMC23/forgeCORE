@@ -206,6 +206,13 @@ best-fit pool; new staging recreates tensor metadata over a pooled buffer when
 capacity is sufficient. The pool never exceeds its limit and reports bytes,
 buffer count and `reuse_count`.
 
+Partial transactions use
+`llama_context_commit_pending_delta_cuda(remove_layers, n_remove)`. It validates
+the complete delta before mutation, recycles only removed active layers and
+appends pending layers, preserving shared active layer metadata and device
+pointers. It requires the same invalidation and quiescence contract as the full
+pending commit.
+
 Pending double buffering (`llama_context_stage_layer_pending_cuda`) allocates a
 complete next selection in a slot that active graphs do not reference, so it may
 be filled while the active selection executes.
