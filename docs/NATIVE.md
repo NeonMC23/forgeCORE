@@ -206,6 +206,11 @@ best-fit pool; new staging recreates tensor metadata over a pooled buffer when
 capacity is sufficient. The pool never exceeds its limit and reports bytes,
 buffer count and `reuse_count`.
 
+A bounded VRAM standby cache retains removed layers:
+`llama_context_set_staging_standby_limit`, `standby_layer_count/at`, and a
+`promoted_from_standby` flag. Staging a layer that exists in standby moves its
+metadata and allocation into pending without a new allocation or transfer.
+
 Partial transactions use
 `llama_context_commit_pending_delta_cuda(remove_layers, n_remove)`. It validates
 the complete delta before mutation, recycles only removed active layers and
