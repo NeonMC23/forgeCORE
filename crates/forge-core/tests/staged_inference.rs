@@ -736,3 +736,69 @@ fn delta_commit_preserves_shared_layer_and_stages_only_new_layers() {
             > 0
     );
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn standby_layer_is_promoted_without_new_allocation() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(reason)) => {
+            eprintln!("SKIP: CUDA unavailable: {reason}");
+            return;
+        }
+        Err(error) => panic!("staging engine: {error}"),
+    };
+    let model = staging_model(&path).expect("CUDA device");
+    let mut options = ContextOptions::default();
+    options.n_ctx = 128;
+    let mut context = Context::open(&model, &options).expect("context");
+    context
+        .set_staging_standby_limit(32 * 1024 * 1024)
+        .expect("standby limit");
+    context
+        .set_staging_pool_limit(32 * 1024 * 1024)
+        .expect("pool limit");
+
+    fill_staged_layer(&model, &context, &engine, 0, None).expect("stage layer 0");
+    fill_staged_layer(&model, &context, &engine, 1, None).expect("stage layer 1");
+    let original = context.staged_tensor_info(0, 0).expect("layer 0 tensor");
+    context.decode(&batch()).expect("decode");
+
+    context
+        .stage_layer_pending_cuda(2)
+        .expect("stage pending 2");
+    fill_pending_layer(&model, &context, &engine, 2, None).expect("fill 2");
+    context.invalidate_graph().expect("invalidate");
+    context.commit_pending_delta_cuda(&[0]).expect("remove 0");
+
+    let state = context.staging_state().expect("state");
+    assert_eq!(state.standby_layers, 1);
+    assert!(state.standby_bytes > 0);
+    assert!(context.staged_layer_info(0).is_err());
+
+    context
+        .stage_layer_pending_cuda(0)
+        .expect("promote standby 0");
+    let pending = context.pending_layer_info(0).expect("pending 0");
+    assert!(pending.promoted_from_standby);
+    let promoted = context.pending_tensor_info(0, 0).expect("pending tensor");
+    assert_eq!(promoted.device_ptr, original.device_ptr);
+    let state = context.staging_state().expect("state promoted");
+    assert_eq!(state.standby_hits, 1);
+
+    context.invalidate_graph().expect("invalidate");
+    context.commit_pending_delta_cuda(&[2]).expect("remove 2");
+    context.memory().expect("kv memory").clear(true);
+    context.decode(&batch()).expect("decode promoted layer");
+    assert!(
+        context
+            .staged_layer_info(0)
+            .expect("layer 0")
+            .graph_substitutions
+            > 0
+    );
+}

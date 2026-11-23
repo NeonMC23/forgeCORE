@@ -332,6 +332,10 @@ pub struct llama_staging_state {
     pub pool_limit_bytes: u64,
     pub pool_buffers: u64,
     pub commit_count: u64,
+    pub standby_bytes: u64,
+    pub standby_limit_bytes: u64,
+    pub standby_layers: u64,
+    pub standby_hits: u64,
     pub allocation_count: u64,
     pub release_count: u64,
     pub reuse_count: u64,
@@ -357,6 +361,8 @@ pub struct llama_staged_layer_info {
     pub tensor_count: i32,
     pub device_bytes: u64,
     pub graph_substitutions: u64,
+    pub promoted_from_standby: u32,
+    pub reserved: u32,
 }
 
 /// `struct llama_model_params` (`llama.h`). Construct via
@@ -1040,6 +1046,13 @@ unsafe extern "C" {
     ) -> i32;
     pub fn llama_context_discard_pending_cuda(ctx: *mut llama_context) -> i32;
     pub fn llama_context_set_staging_pool_limit(ctx: *mut llama_context, bytes: u64) -> i32;
+    pub fn llama_context_set_staging_standby_limit(ctx: *mut llama_context, bytes: u64) -> i32;
+    pub fn llama_context_standby_layer_count(ctx: *const llama_context) -> i32;
+    pub fn llama_context_standby_layer_at(
+        ctx: *const llama_context,
+        index: i32,
+        out: *mut llama_staged_layer_info,
+    ) -> i32;
     pub fn llama_context_memory_breakdown_count(ctx: *const llama_context) -> i32;
     pub fn llama_context_memory_breakdown_entry(
         ctx: *const llama_context,

@@ -60,6 +60,7 @@ fn main() {
             || !text.contains("llama_context_stage_layer_pending_cuda")
             || !text.contains("llama_context_commit_pending_cuda")
             || !text.contains("llama_context_commit_pending_delta_cuda")
+            || !text.contains("llama_context_set_staging_standby_limit")
             || !text.contains("llama_context_memory_breakdown_count")
             || !text.contains("llama_context_memory_breakdown_entry")
         {

@@ -1660,6 +1660,7 @@ pub struct StagedLayerInfo {
     pub tensor_count: u32,
     pub device_bytes: u64,
     pub graph_substitutions: u64,
+    pub promoted_from_standby: bool,
 }
 
 /// One tensor in a staged layer and its device-visible byte range.
@@ -1738,6 +1739,10 @@ pub struct StagingLifecycleState {
     pub pool_limit_bytes: u64,
     pub pool_buffers: u64,
     pub commit_count: u64,
+    pub standby_bytes: u64,
+    pub standby_limit_bytes: u64,
+    pub standby_layers: u64,
+    pub standby_hits: u64,
     pub allocation_count: u64,
     pub release_count: u64,
     pub reuse_count: u64,
@@ -2070,6 +2075,7 @@ impl Context {
             tensor_count: u32::try_from(raw.tensor_count).unwrap_or(0),
             device_bytes: raw.device_bytes,
             graph_substitutions: raw.graph_substitutions,
+            promoted_from_standby: raw.promoted_from_standby != 0,
         })
     }
 
@@ -2153,6 +2159,10 @@ impl Context {
             pool_limit_bytes: raw.pool_limit_bytes,
             pool_buffers: raw.pool_buffers,
             commit_count: raw.commit_count,
+            standby_bytes: raw.standby_bytes,
+            standby_limit_bytes: raw.standby_limit_bytes,
+            standby_layers: raw.standby_layers,
+            standby_hits: raw.standby_hits,
             allocation_count: raw.allocation_count,
             release_count: raw.release_count,
             reuse_count: raw.reuse_count,
@@ -2193,6 +2203,7 @@ impl Context {
             tensor_count: u32::try_from(raw.tensor_count).unwrap_or(0),
             device_bytes: raw.device_bytes,
             graph_substitutions: raw.graph_substitutions,
+            promoted_from_standby: raw.promoted_from_standby != 0,
         })
     }
 
@@ -2228,7 +2239,8 @@ impl Context {
             layer,
             tensor_count: u32::try_from(raw.tensor_count).unwrap_or(0),
             device_bytes: raw.device_bytes,
-            graph_substitutions: 0,
+            graph_substitutions: raw.graph_substitutions,
+            promoted_from_standby: raw.promoted_from_standby != 0,
         })
     }
 
@@ -2293,6 +2305,42 @@ impl Context {
             return Err(staging_error("commit_pending_delta_cuda", None, rc));
         }
         Ok(())
+    }
+
+    pub fn set_staging_standby_limit(&self, bytes: u64) -> Result<()> {
+        // SAFETY: live context; native trims standby layers.
+        let rc = unsafe { forge_sys::llama_context_set_staging_standby_limit(self.raw, bytes) };
+        if rc != 0 {
+            return Err(staging_error("set_staging_standby_limit", None, rc));
+        }
+        Ok(())
+    }
+
+    pub fn standby_layer_count(&self) -> Result<u32> {
+        // SAFETY: live context.
+        let count = unsafe { forge_sys::llama_context_standby_layer_count(self.raw) };
+        u32::try_from(count).map_err(|_| Error::context("native standby layer count failed"))
+    }
+
+    pub fn standby_layer_at(&self, index: u32) -> Result<StagedLayerInfo> {
+        let index_i32 =
+            i32::try_from(index).map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?;
+        let mut raw = forge_sys::llama_staged_layer_info::default();
+        // SAFETY: live context, native validates index, writable out.
+        let rc =
+            unsafe { forge_sys::llama_context_standby_layer_at(self.raw, index_i32, &mut raw) };
+        if rc != 0 {
+            return Err(Error::context(format!(
+                "standby layer at index {index} is unavailable"
+            )));
+        }
+        Ok(StagedLayerInfo {
+            layer: u32::try_from(raw.layer).unwrap_or(0),
+            tensor_count: u32::try_from(raw.tensor_count).unwrap_or(0),
+            device_bytes: raw.device_bytes,
+            graph_substitutions: raw.graph_substitutions,
+            promoted_from_standby: raw.promoted_from_standby != 0,
+        })
     }
 
     pub fn discard_pending_cuda(&self) -> Result<()> {
