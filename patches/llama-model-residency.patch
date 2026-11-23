@@ -134,7 +134,7 @@ index 1df0f2b..0ed23e1 100644
          return (void *)ggml_numa_init;
      }
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b..8b3dfd6 100644
+index 31bbf8b..c42f23f 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -210,6 +210,7 @@ extern "C" {
@@ -324,7 +324,7 @@ index 31bbf8b..8b3dfd6 100644
      LLAMA_API struct llama_context * llama_init_from_model(
                       struct llama_model * model,
              struct llama_context_params   params);
-@@ -594,6 +767,219 @@ extern "C" {
+@@ -594,6 +767,226 @@ extern "C" {
      LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
@@ -534,6 +534,13 @@ index 31bbf8b..8b3dfd6 100644
 +    // and no in-flight execution. The previous active layers are recycled into
 +    // the bounded pool (or freed). Returns 0, a positive staging error, or -1.
 +    LLAMA_API int32_t llama_context_commit_pending_cuda(struct llama_context * ctx);
++    // Atomic partial-residency commit: remove `remove_layers` from the active
++    // selection (recycling their buffers), keep all other active layers, and
++    // append the pending selection. Requires successful invalidation and no
++    // in-flight execution. All removals are validated before mutation.
++    LLAMA_API int32_t llama_context_commit_pending_delta_cuda(
++            struct llama_context * ctx,
++            const int32_t * remove_layers, size_t n_remove);
 +    // Release the pending selection without changing the active selection.
 +    LLAMA_API int32_t llama_context_discard_pending_cuda(struct llama_context * ctx);
 +    // Bound retained evicted buffers. 0 disables pooling. Reducing the limit
@@ -545,7 +552,7 @@ index 31bbf8b..8b3dfd6 100644
      LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
      LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fcd4dfb..5f107d1 100644
+index fcd4dfb..a2f3320 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -713,7 +720,7 @@ index fcd4dfb..5f107d1 100644
      }
  
      // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
-@@ -3433,6 +3515,483 @@ void llama_context::perf_reset() {
+@@ -3433,6 +3515,555 @@ void llama_context::perf_reset() {
      n_reused    = 0;
  }
  
@@ -908,6 +915,78 @@ index fcd4dfb..5f107d1 100644
 +    }
 +    staged_layers.clear();
 +    staged_layers = std::move(pending_staged_layers);
++    pending_staged_layers.clear();
++    staged_graph_invalidated = true;
++    graph_phase = LLAMA_CONTEXT_GRAPH_INVALIDATED;
++    ++staged_commit_count;
++    return LLAMA_CONTEXT_STAGING_OK;
++}
++
++int32_t llama_context::commit_pending_delta_cuda(
++        const int32_t * remove_layers, size_t n_remove) {
++    if (n_remove > 0 && remove_layers == nullptr) {
++        return LLAMA_CONTEXT_STAGING_INVALID_ARGUMENT;
++    }
++    if (pending_staged_layers.empty() && n_remove == 0) {
++        return LLAMA_CONTEXT_STAGING_NOT_STAGED;
++    }
++    if (!staged_graph_invalidated || has_inflight_execution() ||
++        gf_res_prev_active != nullptr ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_BUILDING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_EXECUTING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_COMPLETION_PENDING ||
++        graph_phase == LLAMA_CONTEXT_GRAPH_INVALIDATING) {
++        return LLAMA_CONTEXT_STAGING_BUSY;
++    }
++
++    // Validate the complete delta before mutating anything.
++    std::vector<std::pair<size_t, int32_t>> removals;
++    removals.reserve(n_remove);
++    for (size_t i = 0; i < n_remove; ++i) {
++        const int32_t layer = remove_layers[i];
++        bool found = false;
++        for (size_t index = 0; index < staged_layers.size(); ++index) {
++            if (staged_layers[index].layer == layer) {
++                if (found) {
++                    return LLAMA_CONTEXT_STAGING_INVALID_STATE;
++                }
++                found = true;
++                removals.emplace_back(index, layer);
++            }
++        }
++        if (!found) {
++            return LLAMA_CONTEXT_STAGING_NOT_STAGED;
++        }
++    }
++    for (const auto & pending : pending_staged_layers) {
++        for (const auto & active : staged_layers) {
++            if (active.layer != pending.layer) {
++                continue;
++            }
++            bool removed = false;
++            for (const auto & removal : removals) {
++                if (removal.second == pending.layer) {
++                    removed = true;
++                    break;
++                }
++            }
++            if (!removed) {
++                return LLAMA_CONTEXT_STAGING_INVALID_STATE;
++            }
++        }
++    }
++
++    // Remove in descending index order so indices remain stable.
++    std::sort(removals.begin(), removals.end(),
++            [](const auto & a, const auto & b) { return a.first > b.first; });
++    for (const auto & removal : removals) {
++        recycle_staged_layer(staged_layers[removal.first]);
++        staged_layers.erase(staged_layers.begin() + static_cast<std::ptrdiff_t>(removal.first));
++        ++staged_release_count;
++    }
++    for (auto & staged : pending_staged_layers) {
++        staged_layers.push_back(std::move(staged));
++    }
 +    pending_staged_layers.clear();
 +    staged_graph_invalidated = true;
 +    graph_phase = LLAMA_CONTEXT_GRAPH_INVALIDATED;
@@ -1197,7 +1276,7 @@ index fcd4dfb..5f107d1 100644
  llama_memory_breakdown llama_context::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
      for (const auto & [buft, size] : model.memory_breakdown()) {
-@@ -4406,6 +4965,149 @@ void llama_opt_epoch(
+@@ -4406,6 +5037,156 @@ void llama_opt_epoch(
  llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
      return ctx->memory_breakdown();
  }
@@ -1276,6 +1355,13 @@ index fcd4dfb..5f107d1 100644
 +                          : ctx->commit_pending_cuda();
 +}
 +
++int32_t llama_context_commit_pending_delta_cuda(
++        struct llama_context * ctx,
++        const int32_t * remove_layers, size_t n_remove) {
++    return ctx == nullptr ? LLAMA_CONTEXT_STAGING_INVALID_ARGUMENT
++                          : ctx->commit_pending_delta_cuda(remove_layers, n_remove);
++}
++
 +int32_t llama_context_discard_pending_cuda(struct llama_context * ctx) {
 +    return ctx == nullptr ? LLAMA_CONTEXT_STAGING_INVALID_ARGUMENT
 +                          : ctx->discard_pending_cuda();
@@ -1348,7 +1434,7 @@ index fcd4dfb..5f107d1 100644
  llama_context * llama_get_ctx_other(struct llama_context * ctx) {
      return ctx->get_cparams().ctx_other;
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 77ef92f..306d098 100644
+index 77ef92f..a144895 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -13,6 +13,7 @@
@@ -1394,7 +1480,7 @@ index 77ef92f..306d098 100644
      uint32_t n_threads()       const;
      uint32_t n_threads_batch() const;
  
-@@ -190,6 +212,29 @@ struct llama_context {
+@@ -190,6 +212,30 @@ struct llama_context {
  
      llama_memory_breakdown memory_breakdown() const;
  
@@ -1418,13 +1504,14 @@ index 77ef92f..306d098 100644
 +    int32_t pending_tensor_count(int32_t layer) const;
 +    int32_t pending_tensor_info(int32_t layer, int32_t index, llama_staged_tensor_info * out) const;
 +    int32_t commit_pending_cuda();
++    int32_t commit_pending_delta_cuda(const int32_t * remove_layers, size_t n_remove);
 +    int32_t discard_pending_cuda();
 +    int32_t set_staging_pool_limit(uint64_t bytes);
 +
      //
      // training
      //
-@@ -352,6 +397,34 @@ private:
+@@ -352,6 +398,34 @@ private:
      ggml_backend_t backend_cpu = nullptr;
      std::vector<ggml_backend_ptr> backends;
  
@@ -1459,7 +1546,7 @@ index 77ef92f..306d098 100644
      // training
      ggml_opt_context_t opt_ctx = nullptr;
  
-@@ -385,6 +458,13 @@ private:
+@@ -385,6 +459,13 @@ private:
      // env: LLAMA_GRAPH_REUSE_DISABLE
      bool graph_reuse_disable = false;
  

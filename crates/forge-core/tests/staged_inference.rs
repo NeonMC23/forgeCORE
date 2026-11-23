@@ -669,3 +669,70 @@ fn direct_fd_read_matches_model_tensor_bytes_for_split_files() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn delta_commit_preserves_shared_layer_and_stages_only_new_layers() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let engine = match Engine::new(0) {
+        Ok(engine) => engine,
+        Err(StagingError::Unsupported(reason)) => {
+            eprintln!("SKIP: CUDA unavailable: {reason}");
+            return;
+        }
+        Err(error) => panic!("staging engine: {error}"),
+    };
+    let model = staging_model(&path).expect("CUDA device");
+    let mut options = ContextOptions::default();
+    options.n_ctx = 128;
+    let mut context = Context::open(&model, &options).expect("context");
+    context
+        .set_staging_pool_limit(32 * 1024 * 1024)
+        .expect("pool limit");
+
+    fill_staged_layer(&model, &context, &engine, 0, None).expect("stage layer 0");
+    fill_staged_layer(&model, &context, &engine, 1, None).expect("stage layer 1");
+    let shared_before = context.staged_tensor_info(1, 0).expect("shared tensor");
+    context.decode(&batch()).expect("decode active");
+
+    context
+        .stage_layer_pending_cuda(2)
+        .expect("stage pending layer 2");
+    fill_pending_layer(&model, &context, &engine, 2, None).expect("fill pending layer 2");
+    let pending = context.staging_state().expect("state");
+    assert_eq!(pending.resident_layers, 2);
+    assert_eq!(pending.pending_layers, 1);
+
+    context.invalidate_graph().expect("invalidate");
+    context
+        .commit_pending_delta_cuda(&[0])
+        .expect("delta commit");
+
+    let state = context.staging_state().expect("state after delta");
+    assert_eq!(state.resident_layers, 2);
+    assert_eq!(state.pending_layers, 0);
+    assert_eq!(state.commit_count, 1);
+    assert_eq!(state.release_count, 1);
+    let shared_after = context
+        .staged_tensor_info(1, 0)
+        .expect("shared tensor after");
+    assert_eq!(
+        shared_before.device_ptr, shared_after.device_ptr,
+        "shared layer allocation was not preserved"
+    );
+    assert!(context.staged_layer_info(0).is_err());
+    assert!(context.staged_layer_info(2).is_ok());
+
+    context.memory().expect("kv memory").clear(true);
+    context.decode(&batch()).expect("decode after delta");
+    assert!(
+        context
+            .staged_layer_info(2)
+            .expect("layer 2")
+            .graph_substitutions
+            > 0
+    );
+}

@@ -1033,6 +1033,11 @@ unsafe extern "C" {
         out: *mut llama_staged_tensor_info,
     ) -> i32;
     pub fn llama_context_commit_pending_cuda(ctx: *mut llama_context) -> i32;
+    pub fn llama_context_commit_pending_delta_cuda(
+        ctx: *mut llama_context,
+        remove_layers: *const i32,
+        n_remove: usize,
+    ) -> i32;
     pub fn llama_context_discard_pending_cuda(ctx: *mut llama_context) -> i32;
     pub fn llama_context_set_staging_pool_limit(ctx: *mut llama_context, bytes: u64) -> i32;
     pub fn llama_context_memory_breakdown_count(ctx: *const llama_context) -> i32;

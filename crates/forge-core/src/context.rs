@@ -2275,6 +2275,26 @@ impl Context {
         Ok(())
     }
 
+    /// Atomically remove obsolete active layers, preserve all other active
+    /// layers, and append the pending selection. Requires invalidation.
+    pub fn commit_pending_delta_cuda(&self, remove_layers: &[u32]) -> Result<()> {
+        let mut raw = Vec::with_capacity(remove_layers.len());
+        for layer in remove_layers {
+            raw.push(
+                i32::try_from(*layer)
+                    .map_err(|_| Error::invalid("layer index exceeds i32::MAX"))?,
+            );
+        }
+        // SAFETY: live context; native validates the complete delta before mutation.
+        let rc = unsafe {
+            forge_sys::llama_context_commit_pending_delta_cuda(self.raw, raw.as_ptr(), raw.len())
+        };
+        if rc != 0 {
+            return Err(staging_error("commit_pending_delta_cuda", None, rc));
+        }
+        Ok(())
+    }
+
     pub fn discard_pending_cuda(&self) -> Result<()> {
         // SAFETY: live context; pending buffers are not graph-referenced.
         let rc = unsafe { forge_sys::llama_context_discard_pending_cuda(self.raw) };
