@@ -41,7 +41,7 @@ fn routing_observation_records_valid_first_token_indices() {
     options.n_ubatch = 64;
     options.n_threads = 4;
     options.n_threads_batch = 4;
-    let mut context = Context::open(&model, &options).expect("plain context");
+    let context = Context::open(&model, &options).expect("plain context");
     assert!(context.routing_observations().is_empty());
     assert!(context.routing_summary().is_none());
 

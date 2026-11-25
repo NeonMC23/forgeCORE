@@ -1662,7 +1662,7 @@ impl RoutingBuffer {
         let layer = layer_from_node_name(&node_name);
         if node_name.starts_with("ffn_moe_weights") {
             let row = u64::from(self.options.expert_used_count).saturating_mul(4);
-            if row > 0 && bytes % row == 0 {
+            if row > 0 && bytes.is_multiple_of(row) {
                 let tokens = u32::try_from(bytes / row).unwrap_or(u32::MAX);
                 if let Some(layer) = layer {
                     // Only the current execution's token counts are needed;
@@ -1706,7 +1706,7 @@ impl RoutingBuffer {
         }
         let mut selected_experts = Vec::with_capacity(self.options.expert_used_count as usize);
         let mut invalid_indices = 0u32;
-        for chunk in raw.chunks_exact(4) {
+        for chunk in raw.as_chunks::<4>().0 {
             let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             if value < 0 || value as u32 >= self.options.expert_count {
                 invalid_indices += 1;
