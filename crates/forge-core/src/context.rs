@@ -206,6 +206,84 @@ pub struct TraceEvent {
     pub completion: TraceCompletion,
 }
 
+/// Opt-in, read-only expert-routing observation.
+///
+/// The pinned native graph names the selected-expert tensor
+/// `ffn_moe_topk-<layer>` and completes it on CPU before dependent MoE
+/// operations run. ForgeCore can copy that tensor's host-visible data in the
+/// existing scheduler callback without changing native execution.
+///
+/// Only the first token row is copied. That is the complete selection for a
+/// single-token decode; for prompt batches it is explicitly partial and is
+/// labeled using the observed `ffn_moe_weights` shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertRoutingOptions {
+    /// Maximum retained observations. Must be in `1..=65536`.
+    pub max_observations: usize,
+    /// Total routed experts in the model (for validation/reporting).
+    pub expert_count: u32,
+    /// Routed experts selected per token (top-k).
+    pub expert_used_count: u32,
+}
+
+impl ExpertRoutingOptions {
+    pub fn validate(self) -> Result<()> {
+        if self.max_observations == 0 || self.max_observations > 65_536 {
+            return Err(Error::invalid(
+                "expert routing max_observations must be in 1..=65536",
+            ));
+        }
+        if self.expert_count == 0 || self.expert_count > 65_536 {
+            return Err(Error::invalid(
+                "expert routing expert_count must be in 1..=65536",
+            ));
+        }
+        if self.expert_used_count == 0 || self.expert_used_count > self.expert_count {
+            return Err(Error::invalid(
+                "expert routing expert_used_count must be in 1..=expert_count",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertRoutingObservation {
+    pub execution_id: u64,
+    pub sequence: u64,
+    /// Transformer layer parsed from the native node name, when available.
+    pub layer: Option<i32>,
+    pub node_name: String,
+    pub expert_count: u32,
+    pub expert_used_count: u32,
+    /// Native tensor byte span, which may include view stride for batched
+    /// prompts. The copied values always come from the first token row.
+    pub topk_bytes: u64,
+    /// First-token selected expert ids copied from the native tensor.
+    pub selected_experts: Vec<u32>,
+    /// Number of copied ids outside `0..expert_count`.
+    pub invalid_indices: u32,
+    /// Token row copied. Always 0 in the current prototype.
+    pub token_index: u32,
+    /// Total tokens in the graph, inferred from `ffn_moe_weights` when present.
+    pub tokens_in_graph: Option<u32>,
+    /// True only when the graph had one token, so the copied row is the whole
+    /// selection. Prompt/prefill observations are partial.
+    pub complete_for_token: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpertRoutingSummary {
+    pub executions: u64,
+    pub observations: u64,
+    pub dropped_observations: u64,
+    pub max_observations: usize,
+    pub retained_observations: usize,
+    pub complete_decode_observations: u64,
+    pub partial_observations: u64,
+    pub invalid_indices: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TraceSummary {
     pub executions: u64,
@@ -1369,12 +1447,38 @@ struct TraceBuffer {
     events: VecDeque<TraceEvent>,
 }
 
+struct RoutingBuffer {
+    options: ExpertRoutingOptions,
+    execution_id: u64,
+    sequence: u64,
+    dropped_observations: u64,
+    observations: VecDeque<ExpertRoutingObservation>,
+    /// Tokens per `(execution_id, layer)`, inferred from `ffn_moe_weights`.
+    layer_tokens: BTreeMap<(u64, i32), u32>,
+}
+
 struct TraceState {
     buffer: RefCell<TraceBuffer>,
+    trace_enabled: bool,
+    routing: Option<RefCell<RoutingBuffer>>,
 }
 
 impl TraceState {
-    fn new(max_events: usize) -> Self {
+    fn new(
+        max_events: usize,
+        trace_enabled: bool,
+        routing: Option<ExpertRoutingOptions>,
+    ) -> Self {
+        let routing = routing.map(|options| {
+            RefCell::new(RoutingBuffer {
+                options,
+                execution_id: 0,
+                sequence: 0,
+                dropped_observations: 0,
+                observations: VecDeque::new(),
+                layer_tokens: BTreeMap::new(),
+            })
+        });
         Self {
             buffer: RefCell::new(TraceBuffer {
                 max_events: max_events.max(1),
@@ -1385,11 +1489,16 @@ impl TraceState {
                 dropped_events: 0,
                 events: VecDeque::new(),
             }),
+            trace_enabled,
+            routing,
         }
     }
 
     fn begin_execution(&self) {
         self.buffer.borrow_mut().execution_id += 1;
+        if let Some(routing) = &self.routing {
+            routing.borrow_mut().execution_id += 1;
+        }
     }
 
     fn record(&self, tensor: *mut forge_sys::ggml_tensor, ask: bool) {
@@ -1399,8 +1508,25 @@ impl TraceState {
         // SAFETY: the scheduler owns the tensor for the duration of the
         // callback; names and sizes are copied immediately.
         let node_name = unsafe { name_of(forge_sys::ggml_get_name(tensor)) };
-        let op_name = unsafe { name_of(forge_sys::llama_tensor_op_name(tensor)) };
         let bytes = unsafe { forge_sys::ggml_nbytes(tensor) as u64 };
+        if self.trace_enabled {
+            self.record_trace(tensor, ask, node_name.clone(), bytes);
+        }
+        if !ask {
+            if let Some(routing) = &self.routing {
+                routing.borrow_mut().record(tensor, node_name, bytes);
+            }
+        }
+    }
+
+    fn record_trace(
+        &self,
+        tensor: *mut forge_sys::ggml_tensor,
+        ask: bool,
+        node_name: Option<String>,
+        bytes: u64,
+    ) {
+        let op_name = unsafe { name_of(forge_sys::llama_tensor_op_name(tensor)) };
         let node_id = tensor as usize as u64;
         let mut dependencies = Vec::new();
         let mut dependency_ids = Vec::new();
@@ -1474,6 +1600,146 @@ impl TraceState {
             retained_events: buffer.events.len(),
         }
     }
+
+    fn routing_observations(&self) -> Vec<ExpertRoutingObservation> {
+        self.routing
+            .as_ref()
+            .map(|routing| routing.borrow().observations.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn take_routing_observations(&self) -> Vec<ExpertRoutingObservation> {
+        self.routing
+            .as_ref()
+            .map(|routing| routing.borrow_mut().observations.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    fn clear_routing_observations(&self) {
+        if let Some(routing) = &self.routing {
+            let mut routing = routing.borrow_mut();
+            routing.observations.clear();
+            routing.dropped_observations = 0;
+            routing.layer_tokens.clear();
+        }
+    }
+
+    fn routing_summary(&self) -> Option<ExpertRoutingSummary> {
+        let routing = self.routing.as_ref()?.borrow();
+        let mut summary = ExpertRoutingSummary {
+            executions: routing.execution_id,
+            observations: (routing.observations.len() as u64)
+                .saturating_add(routing.dropped_observations),
+            dropped_observations: routing.dropped_observations,
+            max_observations: routing.options.max_observations,
+            retained_observations: routing.observations.len(),
+            ..ExpertRoutingSummary::default()
+        };
+        for observation in &routing.observations {
+            summary.invalid_indices = summary
+                .invalid_indices
+                .saturating_add(u64::from(observation.invalid_indices));
+            if observation.complete_for_token {
+                summary.complete_decode_observations += 1;
+            } else {
+                summary.partial_observations += 1;
+            }
+        }
+        Some(summary)
+    }
+}
+
+impl RoutingBuffer {
+    fn record(
+        &mut self,
+        tensor: *mut forge_sys::ggml_tensor,
+        node_name: Option<String>,
+        bytes: u64,
+    ) {
+        let Some(node_name) = node_name else {
+            return;
+        };
+        let layer = layer_from_node_name(&node_name);
+        if node_name.starts_with("ffn_moe_weights") {
+            let row = u64::from(self.options.expert_used_count).saturating_mul(4);
+            if row > 0 && bytes % row == 0 {
+                let tokens = u32::try_from(bytes / row).unwrap_or(u32::MAX);
+                if let Some(layer) = layer {
+                    // Only the current execution's token counts are needed;
+                    // observations from older executions are already complete.
+                    self.layer_tokens
+                        .retain(|(execution, _), _| *execution == self.execution_id);
+                    self.layer_tokens.insert((self.execution_id, layer), tokens);
+                    for observation in self.observations.iter_mut() {
+                        if observation.execution_id == self.execution_id
+                            && observation.layer == Some(layer)
+                        {
+                            observation.tokens_in_graph = Some(tokens);
+                            observation.complete_for_token = tokens == 1;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if !node_name.starts_with("ffn_moe_topk") {
+            return;
+        }
+        let needed = usize::try_from(self.options.expert_used_count)
+            .ok()
+            .and_then(|count| count.checked_mul(4))
+            .unwrap_or(0);
+        if needed == 0 || bytes < needed as u64 {
+            return;
+        }
+        let mut raw = vec![0u8; needed];
+        // SAFETY: the callback runs after this CPU node completed. The tensor
+        // is CPU-resident because routing observation is rejected for GPU
+        // model execution at context open. The copy is bounded by top-k width.
+        unsafe {
+            forge_sys::ggml_backend_tensor_get(
+                tensor,
+                raw.as_mut_ptr().cast::<c_void>(),
+                0,
+                needed,
+            );
+        }
+        let mut selected_experts = Vec::with_capacity(self.options.expert_used_count as usize);
+        let mut invalid_indices = 0u32;
+        for chunk in raw.chunks_exact(4) {
+            let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if value < 0 || value as u32 >= self.options.expert_count {
+                invalid_indices += 1;
+            }
+            selected_experts.push(value as u32);
+        }
+        let tokens_in_graph = layer
+            .and_then(|layer| self.layer_tokens.get(&(self.execution_id, layer)).copied());
+        let observation = ExpertRoutingObservation {
+            execution_id: self.execution_id,
+            sequence: self.sequence,
+            layer,
+            node_name,
+            expert_count: self.options.expert_count,
+            expert_used_count: self.options.expert_used_count,
+            topk_bytes: bytes,
+            selected_experts,
+            invalid_indices,
+            token_index: 0,
+            tokens_in_graph,
+            complete_for_token: tokens_in_graph == Some(1),
+        };
+        self.sequence += 1;
+        if self.observations.len() >= self.options.max_observations {
+            self.observations.pop_front();
+            self.dropped_observations += 1;
+        }
+        self.observations.push_back(observation);
+    }
+}
+
+fn layer_from_node_name(name: &str) -> Option<i32> {
+    name.rsplit_once('-')?.1.parse::<i32>().ok()
 }
 
 unsafe extern "C" fn trace_callback(
@@ -1579,6 +1845,9 @@ pub struct ContextOptions {
     /// Opt-in bounded graph eval tracing. `None` preserves the original
     /// execution path with no callback installed.
     pub trace: Option<ContextTraceOptions>,
+    /// Opt-in read-only expert-routing observation. CPU model execution only;
+    /// see [`ExpertRoutingOptions`].
+    pub routing: Option<ExpertRoutingOptions>,
 }
 
 impl Default for ContextOptions {
@@ -1604,6 +1873,7 @@ impl Default for ContextOptions {
             type_k: DType::F16,
             type_v: DType::F16,
             trace: None,
+            routing: None,
         }
     }
 }
@@ -1889,9 +2159,23 @@ impl Context {
         };
         let n_threads_batch = c_int::try_from(threads_batch)
             .map_err(|_| Error::invalid("context n_threads_batch too large"))?;
-        let trace_state = options
-            .trace
-            .map(|trace| Box::new(TraceState::new(trace.max_events)));
+        if let Some(routing) = options.routing {
+            routing.validate()?;
+            if model.effective_gpu_layers()? > 0 {
+                return Err(Error::invalid(
+                    "expert routing observation currently requires CPU model execution",
+                ));
+            }
+        }
+        let trace_enabled = options.trace.is_some();
+        let max_events = options.trace.map(|trace| trace.max_events).unwrap_or(1);
+        let trace_state = (trace_enabled || options.routing.is_some()).then(|| {
+            Box::new(TraceState::new(
+                max_events,
+                trace_enabled,
+                options.routing,
+            ))
+        });
         let trace_ptr = trace_state
             .as_deref()
             .map_or(std::ptr::null_mut(), |state| {
@@ -2604,7 +2888,10 @@ impl Context {
 
     /// Bounded graph trace summary, or `None` when tracing was not enabled.
     pub fn trace_summary(&self) -> Option<TraceSummary> {
-        self.trace.as_ref().map(|trace| trace.summary())
+        self.trace
+            .as_ref()
+            .filter(|trace| trace.trace_enabled)
+            .map(|trace| trace.summary())
     }
 
     /// Copy retained trace events. Empty when tracing was not enabled.
@@ -2628,6 +2915,35 @@ impl Context {
         if let Some(trace) = &self.trace {
             trace.clear();
         }
+    }
+
+    /// Copy retained expert-routing observations. Empty when routing
+    /// observation was not enabled.
+    pub fn routing_observations(&self) -> Vec<ExpertRoutingObservation> {
+        self.trace
+            .as_ref()
+            .map(|trace| trace.routing_observations())
+            .unwrap_or_default()
+    }
+
+    /// Drain retained expert-routing observations.
+    pub fn take_routing_observations(&self) -> Vec<ExpertRoutingObservation> {
+        self.trace
+            .as_ref()
+            .map(|trace| trace.take_routing_observations())
+            .unwrap_or_default()
+    }
+
+    /// Clear routing observations and their dropped counter.
+    pub fn clear_routing_observations(&self) {
+        if let Some(trace) = &self.trace {
+            trace.clear_routing_observations();
+        }
+    }
+
+    /// Bounded summary of the routing observation buffer.
+    pub fn routing_summary(&self) -> Option<ExpertRoutingSummary> {
+        self.trace.as_ref().and_then(|trace| trace.routing_summary())
     }
 
     /// Decode one [`Batch`], advancing this context's KV state.
@@ -2985,6 +3301,43 @@ mod tests {
         let options = ContextOptions::default();
         assert_eq!(options.n_ctx, 0);
         assert_eq!(options.n_threads, 1);
+        assert!(options.routing.is_none());
+    }
+
+    #[test]
+    fn expert_routing_options_validate_bounds() {
+        let valid = ExpertRoutingOptions {
+            max_observations: 16,
+            expert_count: 64,
+            expert_used_count: 6,
+        };
+        assert!(valid.validate().is_ok());
+        assert!(ExpertRoutingOptions {
+            max_observations: 0,
+            ..valid
+        }
+        .validate()
+        .is_err());
+        assert!(ExpertRoutingOptions {
+            expert_count: 0,
+            ..valid
+        }
+        .validate()
+        .is_err());
+        assert!(ExpertRoutingOptions {
+            expert_used_count: 65,
+            ..valid
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn routing_layer_names_parse_without_guessing() {
+        assert_eq!(layer_from_node_name("ffn_moe_topk-12"), Some(12));
+        assert_eq!(layer_from_node_name("ffn_moe_topk"), None);
+        assert_eq!(layer_from_node_name("ffn_moe_weights-3"), Some(3));
+        assert_eq!(layer_from_node_name("ffn_moe_topk-bad"), None);
     }
 
     #[test]
